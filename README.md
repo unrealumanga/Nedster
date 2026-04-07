@@ -84,3 +84,9 @@ Nedster solves the "Tool Amnesia" problem inherent in mid-size LLMs (where they 
 - It dynamically strips "I am an AI" refusal language from its own memory stream.
 
 Enjoy your new local, unstoppable AI engineer.
+
+### 📦 Where are the model weights?
+
+This repository contains the **core Nedster agent application code** (the orchestrator, RAG system, tools, and UI). It does **not** contain the raw `.gguf` weight files for the `qwen3.5:9b` model, as they are over 6.6 GB in size and are downloaded dynamically by Ollama.
+
+When you run `./start.sh`, Nedster automatically triggers Ollama to pull the required base weights from its registry and dynamically compiles them using the `Modelfile` stored in this repository to create the specialized `aria-qwen` agent.
