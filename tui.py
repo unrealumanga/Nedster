@@ -56,14 +56,15 @@ class NedsterTUI:
             )
         )
 
-    def print_tool_call(self, tool_name: str, args: dict) -> None:
+    def print_tool_call(self, name, args, result=None, valid=True):
         """Print tool call in one line, dim."""
-        args_str = " ".join(str(v) for v in args.values()) if args else ""
-        if len(args_str) > 60:
-            args_str = args_str[:57] + "..."
-        self.console.print(
-            f"  • [{self.COLORS['tool']}]Calling {tool_name} with {args_str}[/]"
-        )
+        path = args.get("path", args.get("cmd", ""))[:40]
+        self.console.print(f"  [→ {name}] {path}", style=self.COLORS["tool"])
+        if result:
+            # Show first line of result immediately
+            first_line = str(result).split("\n")[0][:60]
+            status = "✓" if "ERROR" not in str(result) else "✗"
+            self.console.print(f"  [{status}] {first_line}", style=self.COLORS["tool"])
 
     def print_tool_result(
         self, tool_name: str, result: str, verbose: bool = False

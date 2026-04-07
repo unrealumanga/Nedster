@@ -15,22 +15,27 @@ from tools import TOOL_REGISTRY, parse_tool_calls, WATCHDOG
 from tui import NedsterTUI
 
 
-
 def _build_verification_injection(tool_results_str: str) -> str:
     """
     Scan tool results for errors/warnings.
     Build an explicit verification directive for the model.
     """
     import re
-    
-    has_error = bool(re.search(
-        r'ERROR|error|No such file|not found|failed|WARN.*Unknown tool',
-        tool_results_str, re.IGNORECASE))
-    
-    has_success = bool(re.search(
-        r'Written:|Created:|bytes\)|Successfully|PONG|total \d+',
-        tool_results_str))
-    
+
+    has_error = bool(
+        re.search(
+            r"ERROR|error|No such file|not found|failed|WARN.*Unknown tool",
+            tool_results_str,
+            re.IGNORECASE,
+        )
+    )
+
+    has_success = bool(
+        re.search(
+            r"Written:|Created:|bytes\)|Successfully|PONG|total \d+", tool_results_str
+        )
+    )
+
     if has_error and not has_success:
         return (
             "\n[EXECUTION RESULT: ALL TOOLS FAILED]\n"
@@ -53,24 +58,25 @@ def _build_verification_injection(tool_results_str: str) -> str:
             "Include file paths and sizes from the tool results.\n"
         )
 
+
 def _verify_task_completion(user_input: str, tool_results: str) -> str | None:
     """
     For tasks that create files/dirs, verify they actually exist.
     Returns a warning string if verification fails, None if OK.
     """
     import os, re
-    
+
     # Detect "create project/bot/folder" intent
     CREATE_INTENT = re.compile(
-        r'create|build|make|scaffold|new\s+(?:bot|project|folder|app)',
-        re.IGNORECASE)
+        r"create|build|make|scaffold|new\s+(?:bot|project|folder|app)", re.IGNORECASE
+    )
     if not CREATE_INTENT.search(user_input):
         return None
-    
+
     # Extract paths mentioned in tool results
-    PATH_RE = re.compile(r'(/home/\S+|~/\S+)')
+    PATH_RE = re.compile(r"(/home/\S+|~/\S+)")
     paths_mentioned = PATH_RE.findall(tool_results)
-    
+
     for path in paths_mentioned:
         path = os.path.expanduser(path.rstrip("/.,)"))
         if os.path.isdir(path):
@@ -88,6 +94,31 @@ def _verify_task_completion(user_input: str, tool_results: str) -> str | None:
                     f"Expected more for a complete project.\n"
                 )
     return None
+
+
+TOOL_REFUSAL_PATTERNS = [
+    r"I cannot (?:directly )?create files",
+    r"I don't have (?:direct )?(?:filesystem|file system|shell|file) (?:access|tools)",
+    r"I'?m an AI (?:assistant )?without",
+    r"I can'?t (?:actually )?(?:create|write|access|execute)",
+    r"I don'?t have the ability to",
+    r"without (?:direct )?(?:API|filesystem) access",
+    r"I'?m unable to (?:directly )?(?:create|write|access)",
+    r"I don'?t have (?:direct )?access to your",
+    r"as an AI(?:,| I)",
+    r"I cannot directly read or write files",
+    r"I don't have direct file system tools",
+    r"not a local agent",
+    r"If you have a shell tool available",
+    r"You can create the file manually"
+]
+
+
+def _detect_tool_refusal(response: str) -> bool:
+    for pat in TOOL_REFUSAL_PATTERNS:
+        if re.search(pat, response, re.IGNORECASE):
+            return True
+    return False
 
 
 class NedsterAgent:
@@ -188,6 +219,7 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
 
     def __init__(self, project_dir: str, auto: bool = False, think: bool = False):
         from tools import SESSION
+
         SESSION.set_project(project_dir)
         self.project_dir = project_dir
         self.auto = auto
@@ -348,6 +380,7 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
                     new_proj = pathlib.Path(expanded).resolve()
                     if str(new_proj) != str(self.project_dir):
                         from tools import SESSION
+
                         SESSION.set_project(str(new_proj))
                         self.project_dir = str(new_proj)
                         self.context_loader.project_root = new_proj
@@ -494,18 +527,99 @@ POWER TOOLS — use these before brute-force exploration:
             user_msg = user_msg_raw
             if context_block:
                 user_msg = f"{context_block}\n\n{user_msg_raw}"
+
+            total_chars = sum(len(m.get("content", "")) for m in messages)
+            ctx_pct = min(
+                100, int((total_chars / 16384) * 100)
+            )  # roughly 4096 tokens * 4
+
+            FILE_OP_PATTERNS = re.compile(
+                r"\b(create|write|make|build|generate|scaffold|copy|move)\b"
+                r".{0,30}\b(file|folder|directory|project|script)\b",
+                re.IGNORECASE,
+            )
+
+            if FILE_OP_PATTERNS.search(user_input) and ctx_pct < 70:
+                # Append a kickstart to user message
+                kickstart = (
+                    "\n\n[Execute this task using tools. "
+                    "Start your response with the tool call. "
+                    "Example format:\n"
+                    '<tool name="write_file">'
+                    '{"path": "/absolute/path", "content": "..."}'
+                    "</tool>]"
+                )
+                user_msg = user_msg + kickstart
+
+            TOOL_CAPABILITY_ANCHOR = (
+                "[YOU ARE NEDSTER. You have write_file, run_bash, "
+                "read_file, list_dir, scaffold_project, glob_search, "
+                "grep_search, edit_file, web_fetch, todowrite tools. "
+                'Use <tool name="X">{json}</tool> format. '
+                "EXECUTE tasks directly. Never say you lack filesystem access.]"
+            )
+            messages.append({"role": "user", "content": TOOL_CAPABILITY_ANCHOR})
+            messages.append({"role": "assistant", "content": "Ready. Executing."})
             messages.append({"role": "user", "content": user_msg})
 
             # Phase 4 - GENERATE (streaming)
             full_response = self._stream_generate(messages, think=think_enabled)
 
+            if _detect_tool_refusal(full_response):
+                self.tui.print_status(
+                    "⚠️ Tool amnesia detected — intercepting and retrying", "bold red"
+                )
+                # Replace the response entirely
+                # Build a correction message
+                correction_messages = messages.copy()
+                correction_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": full_response,  # the wrong response
+                    }
+                )
+                correction_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "[SYSTEM CORRECTION]\n"
+                            "Your previous response was WRONG.\n"
+                            "You DO have filesystem access. You ARE running locally.\n"
+                            "You have write_file, run_bash, scaffold_project tools.\n"
+                            "The user asked you to create a file. DO IT NOW.\n"
+                            'Use: <tool name="run_bash">'
+                            '{"cmd": "echo \'content\' > /path/file"}</tool>\n'
+                            'Or: <tool name="write_file">'
+                            '{"path": "/path/file", "content": "content"}</tool>\n'
+                            "Execute immediately. No explanation needed."
+                        ),
+                    }
+                )
+                # Retry generation once
+                retry_response = ollama.chat(
+                    model=self.model,
+                    messages=correction_messages[-6:],  # last 6 only — keep ctx low
+                    stream=False,
+                    options={"num_ctx": 2048, "temperature": 0.05, "think": False},
+                )
+                retry_text = retry_response["message"]["content"]
+
+                # Print the retry (clear the wrong output first)
+                print("\r" + " " * 80 + "\r", end="")  # clear last line
+                print(f"\n{retry_text}")
+                full_response = retry_text
+
             # Phase 5 - PARSE & EXECUTE (tool loop, max 5 iterations)
             self.memory._in_tool_loop = True
             applied_edits = []
             try:
-                full_response, applied_edits = self._execute_response(
-                    full_response, messages, think_enabled
-                )
+                if not getattr(self, "tool_use_enabled", True):
+                    # Skip tool parsing entirely for chat-only models
+                    pass
+                else:
+                    full_response, applied_edits = self._execute_response(
+                        full_response, messages, think_enabled, user_input
+                    )
             finally:
                 self.memory._in_tool_loop = False
 
@@ -588,10 +702,52 @@ POWER TOOLS — use these before brute-force exploration:
             project_name = (
                 os.path.basename(os.path.abspath(self.project_dir)) or "project"
             )
-            total_chars = sum(len(m.get("content", "")) for m in messages)
-            ctx_pct = min(
-                100, int((total_chars / 16384) * 100)
-            )  # roughly 4096 tokens * 4
+
+            CTX_EMERGENCY_THRESHOLD = 85
+            if ctx_pct >= CTX_EMERGENCY_THRESHOLD:
+                self.tui.print_status(
+                    f"⚠️ Context {ctx_pct}% — auto-compacting to preserve tool access",
+                    "bold yellow",
+                )
+                self.memory._compress_session()
+
+                TOOL_EMERGENCY_REMINDER = """
+[CRITICAL SYSTEM REMINDER — YOU ARE NEDSTER]
+You are a LOCAL CODING AGENT with FULL filesystem access.
+You HAVE these working tools RIGHT NOW:
+
+write_file(path, content)  → CREATE any file on disk
+run_bash(cmd)              → EXECUTE any shell command
+read_file(path)            → READ any file
+list_dir(path)             → LIST directory contents
+scaffold_project(path, files) → CREATE entire project
+glob_search(pattern)       → SEARCH files by pattern
+grep_search(pattern)       → SEARCH content in files
+edit_file(path, old, new)  → EDIT existing file
+web_fetch(url)             → FETCH url
+todowrite(todos)           → TRACK tasks
+
+To create /home/mnm/Downloads/hello.txt:
+<tool name="run_bash">{"cmd": "echo 'Hello!' > /home/mnm/Downloads/hello.txt"}</tool>
+
+DO NOT say "I cannot create files."
+DO NOT say "I am an AI without filesystem access."
+EXECUTE using the tool format above. RIGHT NOW.
+"""
+                messages.insert(
+                    -1, {"role": "user", "content": TOOL_EMERGENCY_REMINDER}
+                )
+                messages.insert(
+                    -1,
+                    {
+                        "role": "assistant",
+                        "content": "Understood. I will use my tools to execute this task directly.",
+                    },
+                )
+                self.tui.print_status(
+                    "⚠️ HIGH CONTEXT — suggest /clear after this response", "bold yellow"
+                )
+
             self.tui.print_status_bar(
                 project_name,
                 self.model,
@@ -601,6 +757,16 @@ POWER TOOLS — use these before brute-force exploration:
                 self.tool_stats["edits"],
                 think_enabled,
             )
+            self._last_ctx_pct = ctx_pct
+
+            if ctx_pct >= 95:
+                print("\n⚠️ Context at 95% — auto-clearing to restore tool access")
+                self.memory.clear()
+                self.memory.session_summary = ""
+                _seen_this_iteration = set()
+                print(
+                    "[Memory cleared automatically. Use /compact to summarize first next time.]"
+                )
 
         finally:
             pass
@@ -785,6 +951,21 @@ POWER TOOLS — use these before brute-force exploration:
             return error_msg
 
         print()  # Newline after streaming
+
+        CORRUPTION_TELLS = [
+            "as an AI",
+            "I'm an AI",
+            "I cannot access",
+            "without filesystem",
+            "I don't have the ability",
+            "I'm just",
+            "I'm unable to",
+            "You would need to",
+        ]
+        if any(t.lower() in full_response.lower() for t in CORRUPTION_TELLS):
+            print("\n[Nedster] ⚠️ Context corruption detected.")
+            print("[Nedster] Run /clear then retry your request.")
+
         size_gb = self._get_model_size(self.model)
         if size_gb > 0:
             self.model_size_gb = size_gb
@@ -792,13 +973,13 @@ POWER TOOLS — use these before brute-force exploration:
         return full_response
 
     def _execute_response(
-        self, response: str, messages: List[dict], think: bool
+        self, response: str, messages: List[dict], think: bool, user_input: str
     ) -> tuple[str, list]:
         """
         Parse and execute tool calls and edit blocks.
         Max 3 iterations.
         """
-        max_iterations = 3
+        max_iterations = 15
         iteration = 0
         final_response = response
         seen_tool_calls = set()
@@ -854,6 +1035,9 @@ POWER TOOLS — use these before brute-force exploration:
                     "duckduckgo_search",
                     "smart_search",
                     "tavily_search",
+                    "glob_search",
+                    "grep_search",
+                    "web_fetch",
                 }
 
                 # Process sequentially but track safe calls for parallel execution
@@ -867,32 +1051,38 @@ POWER TOOLS — use these before brute-force exploration:
                     args = normalize_tool_args(tool_name, tool_call.get("args", {}))
 
                     from tools import TOOL_REGISTRY, TOOL_NAME_ALIASES
+
                     raw_name = tool_name
                     # Normalize tool name
                     t_name = raw_name.strip().lower().replace("-", "_")
                     if t_name not in TOOL_REGISTRY:
                         aliased = TOOL_NAME_ALIASES.get(t_name)
                         if aliased is None and t_name in TOOL_NAME_ALIASES:
-                            continue # explicitly discarded
+                            continue  # explicitly discarded
                         if aliased and aliased in TOOL_REGISTRY:
                             t_name = aliased
                         else:
-                            self.tui.print_status(f"[BLOCKED] '{raw_name}' not a valid tool", "bold red")
+                            self.tui.print_status(
+                                f"[BLOCKED] '{raw_name}' not a valid tool", "bold red"
+                            )
                             tool_msg_accumulator += f"[ERROR: '{raw_name}' unknown. Use write_file to create files.]\n"
                             continue
-                            
-                    tool_name = t_name # use normalized name
+
+                    tool_name = t_name  # use normalized name
 
                     call_hash = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
-                    
+
                     NEVER_DEDUP = {"list_dir", "git_status", "run_bash", "read_file"}
                     if tool_name not in NEVER_DEDUP:
                         if call_hash in _seen_this_iteration:
-                            self.tui.print_status(f"[SKIP] Identical call in same batch: {tool_name}", "dim")
+                            self.tui.print_status(
+                                f"[SKIP] Identical call in same batch: {tool_name}",
+                                "dim",
+                            )
                             continue
                         _seen_this_iteration.add(call_hash)
 
-                    self.tui.print_tool_call(tool_name, args)
+                    self.tui.print_tool_call(name=tool_name, args=args)
 
                     if tool_name in TOOL_REGISTRY:
                         # Inject cwd if not provided
@@ -932,16 +1122,30 @@ POWER TOOLS — use these before brute-force exploration:
                                 tool_msg_accumulator += (
                                     f"[Tool result: {tool_name}]\n{result}\n\n"
                                 )
-                                
-                                VERIFY_AFTER = {"write_file", "write", "create_file", "create file", "_create_file", "multi_edit"}
-                                if tool_name in VERIFY_AFTER or raw_name in VERIFY_AFTER:
+
+                                VERIFY_AFTER = {
+                                    "write_file",
+                                    "write",
+                                    "create_file",
+                                    "create file",
+                                    "_create_file",
+                                    "edit_file",
+                                    "multi_edit",
+                                }
+                                if (
+                                    tool_name in VERIFY_AFTER
+                                    or raw_name in VERIFY_AFTER
+                                ):
                                     import os
                                     from tools import SESSION
+
                                     written_path = args.get("path", "")
                                     if written_path:
                                         written_path = os.path.expanduser(written_path)
                                         if not os.path.isabs(written_path):
-                                            written_path = os.path.join(SESSION.active_project_dir, written_path)
+                                            written_path = os.path.join(
+                                                SESSION.active_project_dir, written_path
+                                            )
                                         if os.path.exists(written_path):
                                             size = os.path.getsize(written_path)
                                             tool_msg_accumulator += f"\n[AUTO-VERIFY] ✓ {written_path} exists ({size} bytes)\n"
@@ -993,7 +1197,9 @@ POWER TOOLS — use these before brute-force exploration:
                     elif total_chars > 12000:
                         tool_msg_accumulator += "\n[CONTEXT LIMIT WARNING. Stop calling tools. Summarize and answer directly.]"
                     else:
-                        tool_msg_accumulator += _build_verification_injection(tool_msg_accumulator)
+                        tool_msg_accumulator += _build_verification_injection(
+                            tool_msg_accumulator
+                        )
                         tool_msg_accumulator += "\nContinue."
 
                     messages.append({"role": "assistant", "content": response})
@@ -1025,18 +1231,18 @@ POWER TOOLS — use these before brute-force exploration:
 
         finally:
             WATCHDOG.stop()
-            
+
         verification_warning = _verify_task_completion(user_input, final_response)
         if verification_warning:
             print(verification_warning)
-            messages.append({
-                "role": "assistant", 
-                "content": final_response
-            })
-            messages.append({
-                "role": "user",
-                "content": verification_warning + "\nDo NOT confirm success. Fix the incomplete task now."
-            })
+            messages.append({"role": "assistant", "content": final_response})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": verification_warning
+                    + "\nDo NOT confirm success. Fix the incomplete task now.",
+                }
+            )
             final_response += "\n\n" + self._stream_generate(messages, think=think)
 
         return final_response, applied_edits

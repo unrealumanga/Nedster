@@ -3,6 +3,29 @@ import ollama
 import uuid
 import os
 
+POISON_PHRASES = [
+    "cannot create files",
+    "don't have filesystem",
+    "can't access",
+    "without shell execution",
+    "AI assistant without",
+    "no filesystem access",
+    "I'm an AI",
+    "as an AI",
+    "I cannot directly",
+    "I don't have the ability",
+]
+
+
+def _strip_poison(summary: str) -> str:
+    """Remove lines containing tool-limitation hallucinations."""
+    lines = summary.split("\n")
+    clean = []
+    for line in lines:
+        if not any(p.lower() in line.lower() for p in POISON_PHRASES):
+            clean.append(line)
+    return "\n".join(clean)
+
 
 class MemoryManager:
     def __init__(self, llm_model_name: str):
@@ -44,18 +67,22 @@ class MemoryManager:
             f"Prior summary: {self.session_summary}\n\n" if self.session_summary else ""
         )
 
-        prompt = (
+        compress_prompt = (
             f"{prior}"
-            f"Summarize the following conversation turns into 3-5 bullet points.\n"
-            f"Capture: key facts discussed, decisions made, topics covered.\n"
-            f"Be concise. No preamble. Just bullet points.\n\n"
+            "Summarize the following conversation into 3-5 bullet points.\n"
+            "Capture: key facts, decisions, what was accomplished.\n"
+            "EXCLUDE any statements about 'I cannot create files' or\n"
+            "'I don't have filesystem access' — these are wrong.\n"
+            "EXCLUDE any statements about AI limitations.\n"
+            "Include: file paths created, tools used, tasks completed.\n"
+            "Be concise. No preamble.\n\n"
             f"{history_text}\nSummary:"
         )
 
         try:
             response = ollama.generate(
                 model=self.model,
-                prompt=prompt,
+                prompt=compress_prompt,
                 options={
                     "num_ctx": 1024,
                     "num_predict": 100,
@@ -64,7 +91,7 @@ class MemoryManager:
                 },
             )
             new_summary = response["response"].strip()
-            self.session_summary = new_summary
+            self.session_summary = _strip_poison(new_summary)
             self.short_term = keep
             print(
                 f"  • [\x1b[38;5;245mSession compressed: {len(to_compress)} msgs → summary\x1b[0m]"

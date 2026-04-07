@@ -21,6 +21,7 @@ import subprocess
 from pathlib import Path
 
 from tui import NedsterTUI
+from direct_executor import _try_direct_execute
 
 
 _KEEP_VRAM = False
@@ -208,6 +209,39 @@ def setup_readline():
         pass
 
 
+MODEL_CAPABILITY = {
+    # Full tool use — trained on Nedster Modelfile
+    "aria-qwen": "full",
+    "claude-code": "full",
+    # Good tool use — understands XML format
+    "qwen3.5:9b": "tools",
+    "qwen3.5-9b-local": "tools",
+    "mistral-7b": "tools",
+    "qwen2.5-coder:7b": "tools",
+    "ministral-14b": "tools",
+    "qwen3-4b": "tools",
+    # Chat only — cannot reliably use tools
+    "lfm2": "chat",
+    "LFM2.5": "chat",
+    "qwen2.5:1.5b": "chat",
+    "qwen2.5-coder:1.5b": "chat",
+    "qwen3.5-2b": "chat",
+    "qwen3.5-1b": "chat",
+    "llama3.2": "chat",  # 2B
+    "qwen-long": "chat",
+    "qwen-general": "chat",
+    "qwen-coder": "chat",  # alias for 1.5b
+}
+
+
+def _get_model_capability(model_name: str) -> str:
+    for key, cap in MODEL_CAPABILITY.items():
+        if key.lower() in model_name.lower():
+            return cap
+    # Default: assume tools for unknown models > 4GB
+    return "tools"
+
+
 def cmd_repl(project_dir: str, auto: bool, think: bool):
     """Interactive REPL loop."""
     from agent import NedsterAgent
@@ -220,6 +254,23 @@ def cmd_repl(project_dir: str, auto: bool, think: bool):
 
     # Create agent
     agent = NedsterAgent(project_dir, auto=auto, think=think)
+
+    # Quick tool health check
+    import tempfile, os
+
+    test_path = os.path.join(tempfile.gettempdir(), "nedster_boot_test.txt")
+    try:
+        with open(test_path, "w") as f:
+            f.write("Nedster boot test")
+        if os.path.exists(test_path):
+            os.remove(test_path)
+            tool_access = "✓ read/write verified"
+        else:
+            tool_access = "✗ write FAILED"
+    except Exception as e:
+        tool_access = f"✗ {e}"
+
+    tui.print_status(f"File access: {tool_access}")
 
     print("\nSlash commands:")
     print("  /add <file>   - manually add file to context")
@@ -251,11 +302,41 @@ def cmd_repl(project_dir: str, auto: bool, think: bool):
                 status_flags.append("think")
             status_str = f" [{', '.join(status_flags)}]" if status_flags else ""
 
-            user_input = input(f"\nNedster{status_str}> ").strip()
+            ctx_warn = " ⚠️" if getattr(agent, "_last_ctx_pct", 0) > 80 else ""
+            think_str = " [think]" if agent.think else ""
+            auto_str = " [auto]" if agent.auto else ""
+            prompt = f"Nedster{think_str}{auto_str}{ctx_warn}> "
+
+            user_input = input(f"\n{prompt}").strip()
             _ctrlc_count = 0  # reset on successful input
 
             if not user_input:
                 continue
+
+            direct_result = _try_direct_execute(user_input)
+            if direct_result:
+                print(direct_result)
+                # Also verify with actual disk check
+                import re, os
+
+                path_m = re.search(
+                    r"(/home/\S+|~/\S+|[a-zA-Z0-9_\-./]+\.\w+)", user_input
+                )
+                if path_m:
+                    path = os.path.expanduser(path_m.group(1))
+                    if not os.path.isabs(path):
+                        from tools import SESSION
+
+                        path = os.path.join(SESSION.active_project_dir, path)
+
+                    if os.path.exists(path):
+                        print(f"[Verified ✓] {path} exists on disk")
+                    else:
+                        print(
+                            f"[Verified ✗] {path} not found on disk after direct execution."
+                        )
+
+                continue  # Skip agent.generate() entirely
 
             # Handle slash commands or paths
             if user_input.startswith("/") and os.path.exists(user_input.strip()):
@@ -361,7 +442,20 @@ def handle_slash_command(cmd: str, agent, project_dir: str, auto: bool, think: b
 
     elif command == "/clear":
         agent.memory.clear()
-        tui.print_success("Short-term memory cleared")
+        agent.memory.session_summary = ""  # CLEAR POISON
+        agent.tool_stats = {"calls": 0, "loops": 0, "edits": 0}
+        # Reset project to Nedster home
+        from tools import SESSION
+
+        SESSION.set_project(str(project_dir))
+        agent.project_dir = str(project_dir)
+        agent.tool_use_enabled = True  # re-enable tools
+        tui.print_success("[Memory cleared. Tool access restored. Fresh start.]")
+
+    elif command == "/fresh":
+        # Full restart without quitting
+        agent.__init__(str(project_dir), agent.auto, agent.think)
+        tui.print_success("[Full reset — agent reinitialized. All context cleared.]")
 
     elif command == "/models":
         try:
@@ -374,8 +468,10 @@ def handle_slash_command(cmd: str, agent, project_dir: str, auto: bool, think: b
                 if len(parts) >= 2:
                     name = parts[0]
                     size = parts[1] + " " + parts[2]
-                    active = " [ACTIVE]" if name == agent.model else ""
-                    print(f"  {name.ljust(20)} {size.ljust(8)} {active}")
+                    cap = _get_model_capability(name)
+                    cap_icon = {"full": "★★★", "tools": "★★☆", "chat": "★☆☆"}[cap]
+                    active = " ← ACTIVE" if name.startswith(agent.model) else ""
+                    print(f"  {name:<42} {size:<8} {cap_icon}{active}")
             print("Use /switch <model> to change active model.")
         except Exception:
             tui.print_error("Ollama not running or not found.")
@@ -390,6 +486,23 @@ def handle_slash_command(cmd: str, agent, project_dir: str, auto: bool, think: b
                 agent.model = arg
                 global _ACTIVE_MODEL
                 _ACTIVE_MODEL = arg
+                cap = _get_model_capability(arg)
+                agent.tool_use_enabled = cap != "chat"
+
+                if cap == "chat":
+                    tui.print_status(
+                        f"⚠️ {arg} is chat-only (<3B).\n"
+                        f"  Tool execution DISABLED for this model.\n"
+                        f"  Q&A and code explanation work fine.\n"
+                        f"  For file operations: /switch aria-qwen:latest",
+                        "bold yellow",
+                    )
+                elif cap == "tools":
+                    tui.print_status(
+                        f"[OK] {arg} — tool-capable (simplified prompt)", "dim green"
+                    )
+                else:
+                    tui.print_status(f"[OK] {arg} — full Nedster mode", "dim green")
                 tui.print_status(f"Switched to {arg}. VRAM reloading...")
                 # trigger load
                 subprocess.run(["ollama", "run", arg, ""], capture_output=True)
@@ -443,6 +556,7 @@ def handle_slash_command(cmd: str, agent, project_dir: str, auto: bool, think: b
             new_proj = Path(os.path.expanduser(arg)).resolve()
             if new_proj.is_dir():
                 from tools import SESSION
+
                 SESSION.set_project(str(new_proj))
                 agent.project_dir = str(new_proj)
                 agent.context_loader.project_root = new_proj
@@ -470,8 +584,66 @@ def handle_slash_command(cmd: str, agent, project_dir: str, auto: bool, think: b
         except Exception:
             tui.print_error("nvidia-smi not available.")
 
+    elif command == "/quicktest":
+        import os, time
+
+        results = []
+
+        # Test 1: write_file
+        from tools import write_file, read_file, list_dir, run_bash
+
+        t = f"/tmp/nedster_qt_{int(time.time())}.txt"
+        r = write_file(t, "test content")
+        results.append(f"write_file: {'✓' if os.path.exists(t) else '✗'} {r[:40]}")
+
+        # Test 2: read_file
+        if os.path.exists(t):
+            r2 = read_file(t)
+            results.append(f"read_file:  {'✓' if 'test' in r2 else '✗'}")
+            os.remove(t)
+
+        # Test 3: run_bash
+        r3 = run_bash("echo 'bash_works' && pwd")
+        results.append(f"run_bash:   {'✓' if 'bash_works' in r3 else '✗'}")
+
+        # Test 4: list_dir
+        r4 = list_dir("/tmp")
+        results.append(f"list_dir:   {'✓' if r4 and 'Error' not in r4 else '✗'}")
+
+        # Test 5: DuckDuckGo
+        from tools import duckduckgo_search
+
+        r5 = duckduckgo_search("test")
+        results.append(
+            f"duckduckgo: {'✓' if r5 and len(r5) > 10 else '✗ (may be rate-limited)'}"
+        )
+
+        print("\nTool Quick Test:")
+        for r in results:
+            print(f"  {r}")
+        print()
+
+    elif command == "/prove":
+        import os, time
+
+        test_file = f"/tmp/nedster_prove_{int(time.time())}.txt"
+        with open(test_file, "w") as f:
+            f.write(
+                "Nedster has write access. Timestamp: "
+                + time.strftime("%Y-%m-%d %H:%M:%S")
+            )
+        if os.path.exists(test_file):
+            print(f"[PROVED] Created {test_file}")
+            print(f"Content: {open(test_file).read()}")
+            content = open(test_file).read()
+            os.remove(test_file)
+            print(f"[PROVED] Deleted {test_file}")
+            print("[Tool access is working. If model refuses, use /clear then retry.]")
+        else:
+            print("[FAIL] Could not create test file")
+
     elif command == "/tools":
-        from tools import TOOL_REGISTRY, probe_tools
+        from tools import TOOL_REGISTRY, probe_tools, SESSION
 
         status = probe_tools()
         tui.print_status("Tools:")
@@ -482,6 +654,20 @@ def handle_slash_command(cmd: str, agent, project_dir: str, auto: bool, think: b
                 else "OK"
             )
             print(f"  {t.ljust(15)} {st}")
+
+        import tempfile, os
+
+        test = tempfile.mktemp(suffix=".nedster_test")
+        try:
+            with open(test, "w") as f:
+                f.write("x")
+            os.remove(test)
+            write_status = "✓ VERIFIED (file write works)"
+        except Exception as e:
+            write_status = f"✗ BROKEN: {e}"
+
+        print(f"\nFilesystem access: {write_status}")
+        print(f"Active project:    {SESSION.active_project_dir}")
 
     elif command == "/journal":
         tui.print_status("Not implemented yet.")
