@@ -446,6 +446,26 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
             # Phase 3 - PROMPT ASSEMBLY
             system_prompt = self.NEDSTER_SYSTEM_PROMPT
 
+            # Load Global Skills (Self-Taught)
+            skills_dir = os.path.expanduser("~/.agents/skills/")
+            global_skills = ""
+            if os.path.exists(skills_dir):
+                import glob
+                skill_files = glob.glob(os.path.join(skills_dir, "**/*.md"), recursive=True)
+                for sf in skill_files:
+                    try:
+                        with open(sf, "r") as f:
+                            content = f.read().strip()
+                            if content:
+                                skill_name = os.path.basename(os.path.dirname(sf))
+                                if skill_name == "user" or skill_name == "skills":
+                                    skill_name = os.path.basename(sf).replace(".md", "")
+                                global_skills += f"\n--- SKILL: {skill_name} ---\n{content[:1500]}\n"
+                    except Exception:
+                        pass
+            if global_skills:
+                system_prompt += f"\n\n## Global Skills (Learned Capabilities):\n{global_skills}"
+
             # Add NEDSTER.md content
             nedster_md = self.context_loader.read_nedster_md()
             if nedster_md:
