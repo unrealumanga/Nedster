@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+venv/
+.venv/
+*.pyc
+
+# Database
+chroma_db/
+
+# Logs & Session Data
+*.log
+session_memory.md
+.nedster_task.md
+
+# OS-specific
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Temp
+*.bak
+patch_*.py
+fix_*.py
+test_*.py

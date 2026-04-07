@@ -1,0 +1,2861 @@
+================================================================================
+FILE: main.py
+================================================================================
+# File: main.py
+import argparse
+import os
+import sys
+import shutil
+import psutil
+import subprocess
+import chromadb
+
+
+def print_stats():
+    import torch
+
+    # CPU RAM: X.X GB used / 64.0 GB total
+    cpu_ram = psutil.virtual_memory()
+    used_gb = cpu_ram.used / (1024**3)
+    total_gb = cpu_ram.total / (1024**3)
+    print(f"CPU RAM: {used_gb:.1f} GB used / {total_gb:.1f} GB total")
+
+    # GPU VRAM: X.X GB used / 8.0 GB total
+    try:
+        vram = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.total",
+                "--format=csv,noheader",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if vram.returncode == 0:
+            lines = vram.stdout.strip().split("\n")
+            for line in lines:
+                parts = line.split(",")
+                if len(parts) == 2:
+                    used = float(parts[0].replace("MiB", "").strip()) / 1024
+                    total = float(parts[1].replace("MiB", "").strip()) / 1024
+                    print(f"GPU VRAM: {used:.1f} GB used / {total:.1f} GB total")
+
+                    if used > (total * 0.95):
+                        print("Warning: VRAM OOM risk detected!")
+                        print("Suggest: ollama stop && ollama pull qwen3.5:9b-q3_k_m")
+    except FileNotFoundError:
+        print("GPU VRAM: nvidia-smi not found")
+
+    # ChromaDB vectors
+    try:
+        client = chromadb.PersistentClient(path="./chroma_db")
+        collection = client.get_collection(name="rag_docs")
+        print(f"ChromaDB: {collection.count()} vectors stored")
+    except Exception:
+        print("ChromaDB: 0 vectors stored (or not initialized)")
+
+    print("\n[Speed Tips]")
+    print(
+        "  Flash Attention:",
+        os.environ.get("OLLAMA_FLASH_ATTENTION", "NOT SET (run start.sh)"),
+    )
+    print(
+        "  KV Cache Type: ",
+        os.environ.get("OLLAMA_KV_CACHE_TYPE", "NOT SET (run start.sh)"),
+    )
+    print("  CPU Threads:   ", torch.get_num_threads())
+    print("  Model:          aria-qwen (Modelfile-optimized)")
+
+
+def check_ollama():
+    try:
+        import ollama
+
+        ollama.list()
+    except Exception:
+        print("Error: Ollama not running. Run: ollama serve")
+        sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Local RAG Stack for RTX 3060 Ti")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # ingest
+    ingest_parser = subparsers.add_parser("ingest")
+    ingest_parser.add_argument(
+        "--folder", type=str, required=True, help="Folder to ingest"
+    )
+
+    # chat
+    chat_parser = subparsers.add_parser("chat")
+    chat_parser.add_argument(
+        "--think", action="store_true", help="Enable thinking mode"
+    )
+
+    # query
+    query_parser = subparsers.add_parser("query")
+    query_parser.add_argument("text", type=str, help="Question text")
+    query_parser.add_argument(
+        "--think", action="store_true", help="Enable thinking mode"
+    )
+
+    # plan
+    plan_parser = subparsers.add_parser("plan")
+    plan_parser.add_argument("text", type=str)
+    plan_parser.add_argument("--think", action="store_true")
+
+    # stats
+    subparsers.add_parser("stats")
+
+    # reset
+    subparsers.add_parser("reset")
+
+    args = parser.parse_args()
+
+    if args.command == "ingest":
+        from ingestion import ingest_folder
+
+        ingest_folder(args.folder)
+
+    elif args.command == "chat":
+        check_ollama()
+        from rag import RAGPipeline
+
+        pipeline = RAGPipeline()
+        import os
+        milestone_path = os.path.expanduser("~/.aria/milestones.md")
+        milestone_count = 0
+        if os.path.exists(milestone_path):
+            with open(milestone_path) as f:
+                milestone_count = len([l for l in f if l.startswith("##")])
+
+        from datetime import datetime
+        hour = datetime.now().hour
+        if hour < 12:
+            time_greeting = "Morning"
+        elif hour < 17:
+            time_greeting = "Afternoon"
+        else:
+            time_greeting = "Evening"
+
+        if milestone_count > 0:
+            print(f"Aria. {time_greeting}, H2. "
+                  f"({milestone_count} past sessions loaded)")
+        else:
+            print("Aria. Ready.")
+        print("Type 'exit' to quit | '/clear' to reset memory | '/plan [task]' for multi-step\n")
+        while True:
+            try:
+                user_input = input("\nYou: ")
+                if not user_input.strip():
+                    continue
+                if user_input.lower() in ["exit", "quit"]:
+                    break
+                if user_input.lower() in ["/clear", "/reset-memory"]:
+                    pipeline.memory.clear()
+                    print("[Short-term memory cleared. Long-term memory preserved.]")
+                    continue
+                if user_input.strip() == "/stats":
+                    print_stats()
+                    continue
+                if user_input.strip() == "/memory":
+                    summary = pipeline.memory.session_summary
+                    print(f"Session summary:\n{summary if summary else '(empty)'}\n")
+                    continue
+
+                lower_input = user_input.lower()
+                if lower_input.startswith("/plan ") or any(
+                    kw in lower_input
+                    for kw in ["step by step", "plan:", "architect", "design a system"]
+                ):
+                    if lower_input.startswith("/plan "):
+                        user_input = user_input[6:]
+                    pipeline.plan_and_execute(user_input, think=args.think)
+                else:
+                    pipeline.generate(user_input, think=args.think)
+            except KeyboardInterrupt:
+                break
+
+    elif args.command == "query":
+        check_ollama()
+        from rag import RAGPipeline
+
+        pipeline = RAGPipeline()
+        lower_input = args.text.lower()
+        if lower_input.startswith("/plan ") or any(
+            kw in lower_input
+            for kw in ["step by step", "plan:", "architect", "design a system"]
+        ):
+            if lower_input.startswith("/plan "):
+                args.text = args.text[6:]
+            pipeline.plan_and_execute(args.text, think=args.think)
+        else:
+            pipeline.generate(args.text, think=args.think)
+
+    elif args.command == "plan":
+        check_ollama()
+        from rag import RAGPipeline
+
+        pipeline = RAGPipeline()
+        pipeline.plan_and_execute(args.text, think=args.think)
+
+    elif args.command == "stats":
+        print_stats()
+        # To print tool stats if pipeline exists we would need to instantiate or pass it
+        # The prompt says "Add to stats output: print tool_stats if available."
+        # If we just print it in print_stats, we need an instance of RAGPipeline
+        # So maybe we should instantiate pipeline and print its tool_stats?
+        # Or print it in print_stats if passed?
+        try:
+            from rag import RAGPipeline
+
+            p = RAGPipeline()
+            print(f"Tool Stats: {p.tool_stats}")
+        except Exception as e:
+            pass
+
+    elif args.command == "reset":
+        if os.path.exists("./chroma_db"):
+            shutil.rmtree("./chroma_db")
+            print("ChromaDB wiped. Re-run ingest to populate.")
+        else:
+            print("No ChromaDB found to reset.")
+
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================================================
+FILE: rag.py
+================================================================================
+# File: rag.py
+import sys
+import os
+import ollama
+from datetime import datetime
+from retriever import Retriever
+from memory import MemoryManager
+from personality import load_personality, build_system_prompt
+from journal import (
+    detect_topic, score_session,
+    write_journal_entry, update_index, update_project_doc,
+    log_decision, capture_research, save_code_snippet,
+    trigger_ingest_if_needed, search_journal
+)
+
+
+class RAGPipeline:
+    def __init__(self):
+        self.retriever = Retriever()
+        self.model = "aria-qwen"
+        self.memory = MemoryManager(llm_model_name=self.model)
+        self.personality = load_personality()
+        self.tool_stats = {"calls": 0, "loops": 0}
+        print(self.personality.get("greeting", "Ready."))
+
+        self.session_file = "session_memory.md"
+
+        # Initialize or clear session file on start
+        with open(self.session_file, "a") as f:
+            f.write(
+                f"\n\n# New Session: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            )
+
+        self._load_milestones_into_context()
+        self.session_topic = "general"
+        self.session_project = None
+        self.session_research = []
+        self.session_decisions = []
+        self.session_code = []
+        self.session_findings = []
+        self.tasks_completed = 0
+
+        self._load_active_projects()
+
+    def _load_milestones_into_context(self):
+        path = os.path.expanduser("~/.aria/milestones.md")
+        if os.path.exists(path):
+            with open(path) as f:
+                lines = f.readlines()
+            recent = "".join(lines[-60:]).strip()
+            if recent:
+                self.memory.session_summary = (
+                    "[Long-term memory from previous sessions]\n" + recent
+                )
+                print(f"[Milestones loaded: {len(lines)} lines]")
+
+    def _save_session_milestones(self):
+        if not self.memory.short_term:
+            return
+        history = self.memory.get_last_n_turns_text(n=10)
+        prompt = (
+            "Extract key facts, fixes, decisions, and user preferences from this "
+            "conversation as bullet points.\n"
+            "Format each: [FACT/FIX/SETUP/PREF] description\n"
+            "Max 8 bullets. Specific. No preamble.\n\n"
+            f"Conversation:\n{history}\nMilestones:"
+        )
+        try:
+            resp = ollama.generate(
+                model=self.model,
+                prompt=prompt,
+                options={
+                    "num_ctx": 2048,
+                    "num_predict": 200,
+                    "temperature": 0.0,
+                    "think": False,
+                },
+            )
+            milestones = resp["response"].strip()
+            os.makedirs(os.path.expanduser("~/.aria"), exist_ok=True)
+            with open(os.path.expanduser("~/.aria/milestones.md"), "a") as f:
+                f.write(
+                    f"\n## {datetime.now().strftime('%Y-%m-%d %H:%M')} "
+                    f"Session {self.memory.session_id}\n{milestones}\n"
+                )
+            print("[Milestones saved]")
+            
+            quality = score_session(
+                self.memory.short_term,
+                tasks_completed=self.tasks_completed
+            )
+            narrative_prompt = (
+                "Write a 3-sentence summary of this session for a personal journal.\n"
+                "Focus on: what was accomplished, what was decided, what was learned.\n"
+                f"Session topic: {self.session_topic}\n"
+                f"Conversation:\n{self.memory.get_last_n_turns_text(n=8)}\nSummary:"
+            )
+            try:
+                resp = ollama.generate(model=self.model, prompt=narrative_prompt,
+                    options={"num_ctx": 2048, "num_predict": 150,
+                             "temperature": 0.0, "think": False})
+                narrative = resp["response"].strip()
+            except Exception:
+                narrative = f"Session on {self.session_topic}."
+
+            findings = [milestones.strip()] if milestones else []
+
+            import re as _re
+            open_qs = []
+            for msg in self.memory.short_term[-6:]:
+                if msg['role'] == 'assistant':
+                    qs = _re.findall(r'[A-Z][^.!?]*\?', msg['content'])
+                    open_qs.extend(qs[:2])
+            open_qs = list(set(open_qs))[:5]
+
+            entry_path = write_journal_entry(
+                session_id=self.memory.session_id,
+                topic=self.session_topic,
+                project=self.session_project,
+                summary=narrative[:100],
+                decisions=self.session_decisions,
+                research_items=self.session_research,
+                code_files=self.session_code,
+                narrative=narrative,
+                findings=findings,
+                open_questions=open_qs,
+                quality=quality,
+            )
+
+            if entry_path:
+                update_index(
+                    session_id=self.memory.session_id,
+                    topic=self.session_topic,
+                    project=self.session_project,
+                    summary=narrative[:60],
+                    entry_path=entry_path,
+                )
+                print(f"[Journal saved: {entry_path.name}]")
+                import os
+                trigger_ingest_if_needed(os.getcwd())
+        except Exception as e:
+            print(f"[Milestone save failed: {e}]")
+
+    def log_to_file(self, query, response):
+        with open(self.session_file, "a") as f:
+            f.write(f"\n**User:** {query}\n\n**Assistant:** {response}\n\n---\n")
+
+    def rewrite_query(self, query):
+        history_text = self.memory.get_last_n_turns_text(n=4)
+        if not history_text:
+            return query
+
+        prompt = (
+            "You are a search query rewriting AI.\n"
+            "Given the conversation history and a new user question, rewrite the question "
+            "into a single, standalone search query that includes all necessary context from the history.\n"
+            "DO NOT answer the question. ONLY output the rewritten search query.\n\n"
+            "History:\n"
+        )
+
+        prompt += history_text + f"\nNew Question: {query}\nRewritten Query:"
+
+        try:
+            response = ollama.generate(
+                model=self.model,
+                prompt=prompt,
+                options={
+                    "num_ctx": 1024,
+                    "num_predict": 40,
+                    "temperature": 0.0,
+                    "think": False,
+                },
+            )
+            rewritten = response["response"].strip()
+            # Remove quotes if the LLM wrapped it
+            if rewritten.startswith('"') and rewritten.endswith('"'):
+                rewritten = rewritten[1:-1]
+            print(f"[\033[90mQuery Rewritten for Search: {rewritten}\033[0m]")
+            return rewritten if rewritten else query
+        except Exception:
+            return query
+
+    def plan_and_execute(self, query, think=False):
+        prompt = (
+            "Break this task into 3-5 numbered steps. Output ONLY the steps, no explanation:\n"
+            f"{query}"
+        )
+        try:
+            print("[Planner Agent] Generating plan...")
+            response = ollama.generate(
+                model=self.model,
+                prompt=prompt,
+                options={
+                    "num_ctx": 1024,
+                    "num_predict": 120,
+                    "temperature": 0.0,
+                },
+            )
+            plan_text = response["response"].strip()
+
+            steps = [s.strip() for s in plan_text.split("\n") if s.strip()]
+            n = len(steps)
+            print(f"[Planner Agent] Plan created with {n} steps.")
+
+            for i, step in enumerate(steps):
+                print(f"\n[STEP {i + 1}/{n}]: {step}")
+                self.generate(step, think=think)
+
+        except Exception as e:
+            print(f"[Planner error: {e}]")
+
+
+    def _detect_and_store_keys(self, query: str) -> str:
+        """
+        If user pastes an API key in chat, store it securely and
+        confirm WITHOUT echoing the key. Return masked confirmation or "".
+        """
+        import re
+        # Tavily key pattern
+        tavily_pattern = re.compile(r'\btvly-[a-zA-Z0-9\-_]{20,}\b')
+        match = tavily_pattern.search(query)
+        if match:
+            key = match.group(0)
+            try:
+                from tools import store_tavily_key, probe_tools
+                store_tavily_key(key)
+                # Remove key from query before sending to LLM
+                sanitized_query = query.replace(key, "[TAVILY_KEY_STORED]")
+                return sanitized_query
+            except Exception:
+                return query.replace(key, "[KEY_DETECTED_STORE_FAILED]")
+        return query
+
+    def _resolve_references(self, query: str) -> str:
+        """
+        Resolve pronouns and references using recent session context.
+        "which one?" → looks at last comparison in session memory
+        "it" → looks at last named entity in session
+        "that" → looks at last specific thing mentioned
+        """
+        q_lower = query.lower().strip().rstrip("?!")
+
+        REFERENCE_TRIGGERS = {
+            "which one", "which is better", "which is faster",
+            "which wins", "compare", "vs", "faster", "slower",
+            "better", "worse", "the best", "the winner"
+        }
+
+        if not any(t in q_lower for t in REFERENCE_TRIGGERS):
+            return query
+
+        # Search recent memory for last comparison
+        history_text = self.memory.get_last_n_turns_text(n=6)
+        if not history_text:
+            return query
+
+        # Find pairs of things being compared in history
+        import re
+        # Look for "X vs Y", "X or Y", "comparing X and Y"
+        pairs = re.findall(
+            r'(\b\w+(?:\s+\w+){0,2})\s+(?:vs|versus|or|compared to)\s+(\b\w+(?:\s+\w+){0,2})',
+            history_text, re.IGNORECASE
+        )
+
+        if pairs:
+            a, b = pairs[-1]  # most recent comparison
+            resolved = f"{query} [comparing: {a.strip()} vs {b.strip()}]"
+            return resolved
+
+        return query
+
+    def _build_context(self, top_docs: list, web_results: str = "") -> tuple:
+        """
+        Returns (rag_context_str, web_context_str) separately.
+        RAG gets 1800 tokens budget. Web gets 800 tokens budget.
+        Never mix them — keeps RAG clean from web contamination.
+        """
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+
+        rag_parts = []
+        rag_budget = 1800
+        used = 0
+        for doc_text, score, meta in top_docs:
+            if score < 0.25:  # skip low-relevance chunks
+                continue
+            chunk = (f"[Source: {meta.get('source_file','?')}, "
+                     f"Score: {score:.2f}]\n{doc_text}\n---")
+            chunk_tokens = len(enc.encode(chunk))
+            if used + chunk_tokens > rag_budget:
+                break
+            rag_parts.append(chunk)
+            used += chunk_tokens
+
+        rag_str = "\n".join(rag_parts) if rag_parts else ""
+
+        # Web results get their own capped budget
+        web_str = ""
+        if web_results:
+            web_tokens = enc.encode(web_results)
+            if len(web_tokens) > 800:
+                web_results = enc.decode(web_tokens[:800]) + "...[truncated]"
+            web_str = f"[Web Search Results]\n{web_results}"
+
+        return rag_str, web_str
+
+    def _classify_input(self, query: str) -> str:
+        """Classify H2's input to control response style."""
+        q = query.strip()
+        q_lower = q.lower().rstrip("!?.")
+
+        POKES = {"so", "?", "!?", "so?", "so!>?", "well?", "then?",
+                 "and?", "continue", "go on", "do it", "what happened",
+                 "and then", "go", "next", "proceed"}
+        IDENTITIES = {"h2 here", "h2", "hello", "hi", "hey", "morning",
+                      "good morning", "wake up"}
+        DECISIONS = {"yes", "yes!", "all of them", "nope", "skip it",
+                     "no", "ok", "sure", "sounds good", "perfect"}
+        EMOTIONAL = {":)", ":(", ":D", "lol", "haha", "damn", "nice",
+                     "great", "wow", "ugh", "ffs"}
+
+        word_count = len(q.split())
+
+        if q_lower in POKES or (word_count <= 3 and q.endswith("?")):
+            return "poke"
+        if q_lower in IDENTITIES:
+            return "identity"
+        if q_lower in DECISIONS:
+            return "decision"
+        if q_lower in EMOTIONAL or (word_count == 1 and not q[0].isalpha()):
+            return "emotional"
+        if word_count <= 5:
+            return "short"
+        if word_count <= 20:
+            return "medium"
+        return "long"
+
+    def generate(self, query, think=False):
+        query = self._detect_and_store_keys(query)
+        classification = self._classify_input(query)
+        query = self._resolve_references(query)
+        if self.memory.turn_count == 1 and self.session_topic == "general":
+            msgs = self.memory.short_term[-2:] if self.memory.short_term else []
+            all_msgs = msgs + [{"role": "user", "content": query}]
+            self.session_topic = detect_topic(all_msgs)
+            print(f"[\033[36mSession topic: {self.session_topic}\033[0m]")
+
+        if classification == "poke":
+            # Skip RAG, skip rewrite, use only session context
+            top_docs = []
+            rag_str = ""
+            web_str = ""
+            # Inject pending plan from last assistant message if exists
+            pending = ""
+            if self.memory.short_term:
+                last_assistant = next(
+                    (m["content"] for m in reversed(self.memory.short_term)
+                     if m["role"] == "assistant"), ""
+                )
+                if last_assistant:
+                    pending = f"[Your last stated plan: {last_assistant[:300]}]\n"
+            search_query = query
+            # We construct user_message later, but we need search_query defined
+        elif classification in ("identity", "emotional", "decision"):
+            top_docs = []
+            rag_str = ""
+            web_str = ""
+            search_query = query
+            # No rewrite, no retrieval
+        elif classification == "short" and len(query.strip()) < 8:
+            top_docs = []
+            rag_str = ""
+            web_str = ""
+            search_query = query
+        else:
+            search_query = self.rewrite_query(query)
+            top_docs = self.retriever.retrieve(search_query)
+
+            # Inject chunks
+            context_parts = []
+            for doc_text, score, meta in top_docs:
+                filename = (
+                    meta.get("source_file", "Unknown")
+                    if meta and isinstance(meta, dict)
+                    else "Unknown"
+                )
+                chunk_injection = (
+                    f"[Source: {filename}, Score: {score:.2f}]\n{doc_text}\n---"
+                )
+                context_parts.append(chunk_injection)
+            context_str = "\n".join(context_parts)
+
+        # System prompt
+        base_instructions = (
+            "Answer using ONLY the provided context and conversation history. "
+            "You MUST answer entirely in English. "
+            "If the answer is not in the context or history, say 'I don't have that information.' "
+            "Cite the source filename for each fact you use."
+        )
+        system_prompt = build_system_prompt(self.personality, base_instructions)
+
+        # Add live tool status to system prompt
+        tool_lines = []
+        for tool, status in getattr(self, "_tool_inventory", {}).items():
+            if status == "OK":
+                tool_lines.append(f"  - {tool}: ACTIVE")
+            elif "NO_KEY" in status:
+                tool_lines.append(f"  - {tool}: needs key")
+        if tool_lines:
+            tool_section = "ACTIVE TOOLS THIS SESSION:\n" + "\n".join(tool_lines)
+            system_prompt = system_prompt + "\n\n" + tool_section
+
+        try:
+            import tiktoken
+
+            enc = tiktoken.get_encoding("cl100k_base")
+            mem_msgs = self.memory.get_context_messages()
+            mem_tokens = sum(len(enc.encode(m["content"])) for m in mem_msgs)
+            ctx_tokens = len(enc.encode(context_str)) if context_str else 0
+            sys_tokens = len(enc.encode(system_prompt))
+            total = sys_tokens + mem_tokens + ctx_tokens
+            budget = 4096
+            if total > budget * 0.80:
+                print(f"[Context: {total}/{budget} tokens — trimming RAG]")
+                top_docs = top_docs[:2]
+                context_str = "\n".join(
+                    f"[Source: {m.get('source_file', '?') if isinstance(m, dict) else '?'}, Score: {s:.2f}]\n{d}\n---"
+                    for d, s, m in top_docs
+                )
+            if total > budget * 0.95:
+                context_str = "[Context trimmed: token budget exceeded]"
+                print("[Emergency context trim]")
+        except Exception:
+            pass  # tiktoken unavailable — skip tracking
+
+        # Build messages: system -> past session turns -> current query with context
+        messages = [{"role": "system", "content": system_prompt}]
+
+        for past_msg in self.memory.get_context_messages():
+            messages.append(past_msg)
+
+        if classification == "poke":
+            user_message = f"[EXECUTE NOW — poke received]\n{pending}Current input: {query}"
+        else:
+            LENGTH_DIRECTIVES = {
+                "poke":     "[EXECUTE PLAN NOW. Report result in 2 lines max.]",
+                "identity": "[1-line warm acknowledgment only. Wait for next input.]",
+                "decision": "[Execute the chosen option. 1-line confirmation after.]",
+                "emotional": "[1-line acknowledgment. Then 1 relevant action or question.]",
+                "short":    "[Short reply. Max 3 lines unless technical output needed.]",
+                "medium":   "[Concise reply. Use prose not bullets for non-technical answers.]",
+                "long":     "[Full reply allowed. Use bullets only if listing 4+ distinct items.]",
+            }
+            directive = LENGTH_DIRECTIVES.get(classification, "")
+            sections = []
+            if rag_str:
+                sections.append(f"Retrieved Context:\n{rag_str}")
+            if web_str:
+                sections.append(f"Live Web Data:\n{web_str}")
+            sections.append(f"Current Question: {query}")
+            user_message = f"{directive}\n\n" + "\n\n".join(sections)
+
+        messages.append({"role": "user", "content": user_message})
+
+        # Ollama tip: keep Ollama server warm (don't stop between queries)
+        # Context tip: --think flag adds ~500 reasoning tokens, disable for fast answers
+        # Temperature 0.1 strongly anchors the model to English and prevents hallucination
+        options = {"num_ctx": 4096, "temperature": 0.1}
+        if not think:
+            options["think"] = False  # skip chain-of-thought to save tokens
+
+        try:
+            print(f"Generating answer (Think Mode: {think})...\n")
+            response = ollama.chat(
+                model=self.model, messages=messages, stream=True, options=options
+            )
+
+            import re
+            # State machine to strip <think>...</think> and emoji from stream
+            _think_depth = 0
+            _think_buf = ""
+            _EMOJI_RE = re.compile(
+                "[\U0001F300-\U0001FFFF\U00002600-\U000027BF\U0001F900-\U0001F9FF]"
+            )
+            _token_count = 0
+
+            for chunk in response:
+                raw = chunk["message"]["content"]
+
+                # Buffer-based think tag stripper
+                _think_buf += raw
+                visible = ""
+
+                while _think_buf:
+                    if _think_depth == 0:
+                        open_pos = _think_buf.find("<think>")
+                        if open_pos == -1:
+                            # No open tag — safe to print everything
+                            visible += _think_buf
+                            _think_buf = ""
+                        else:
+                            # Print before the tag, then enter think mode
+                            visible += _think_buf[:open_pos]
+                            _think_buf = _think_buf[open_pos + 7:]
+                            _think_depth = 1
+                    else:
+                        close_pos = _think_buf.find("</think>")
+                        if close_pos == -1:
+                            # Still inside think block — buffer it, don't print
+                            break
+                        else:
+                            # Skip think block content
+                            _think_buf = _think_buf[close_pos + 8:]
+                            _think_depth = 0
+
+                # Strip emoji from visible output (backstop for Modelfile rule)
+                visible = _EMOJI_RE.sub("", visible)
+
+                if visible:
+                    print(visible, end="", flush=True)
+                    full_response += visible
+                    _token_count += len(visible.split())
+
+            # After stream: show token count
+            print(f"\n[\033[90m~{_token_count} tokens | ctx {_token_count*100//4096}%\033[0m]")
+
+            # Strip any remaining think tags from full_response for memory storage
+            full_response = re.sub(r"<think>.*?</think>", "", full_response, flags=re.DOTALL).strip()
+
+            import tools
+
+            MAX_TOOL_LOOPS = 3
+            tool_loops = 0
+
+            complete_response = full_response
+
+            DECISION_SIGNALS = [
+                'decided', "don't", "won't", 'never', 'always', 'from now on',
+                'quarantine', 'stop', 'archive', 'delete', 'switch to',
+                'use only', 'no more', 'permanently'
+            ]
+            query_lower = query.lower()
+            if any(sig in query_lower for sig in DECISION_SIGNALS):
+                decision_text = query[:200].strip()
+                log_decision(
+                    decision=decision_text,
+                    context=full_response[:300],
+                    project=self.session_project
+                )
+                self.session_decisions.append(decision_text)
+                print(f"[[35mDecision logged: {decision_text[:60]}...[0m]")
+
+            from tools import WATCHDOG
+            WATCHDOG.start()
+            while tool_loops < MAX_TOOL_LOOPS:
+                tool_calls = tools.parse_tool_calls(full_response)
+                if not tool_calls:
+                    break
+
+                tool_loops += 1
+                self.tool_stats["loops"] += 1
+                self.tool_stats["calls"] += len(tool_calls)
+
+                tool_results_str = ""
+                for tc in tool_calls:
+                    t_name = tc["name"]
+                    t_args = tc.get("args", {})
+                    if t_name in tools.TOOL_REGISTRY:
+                        try:
+                            res = tools.TOOL_REGISTRY[t_name](**t_args)
+                            tool_results_str += f"Tool {t_name} output:\n{res}\n"
+                        except Exception as e:
+                            tool_results_str += f"Tool {t_name} error:\n{e}\n"
+                    else:
+                        tool_results_str += f"Tool {t_name} not found.\n"
+                WATCHDOG.ping()
+                messages.append({"role": "assistant", "content": full_response})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": f"Tool Results:\n{tool_results_str}\n\nContinue.",
+                    }
+                )
+
+                response = ollama.chat(
+                    model=self.model, messages=messages, stream=True, options=options
+                )
+
+                import re
+                # State machine to strip <think>...</think> and emoji from stream
+                _think_depth = 0
+                _think_buf = ""
+                _EMOJI_RE = re.compile(
+                    "[\U0001F300-\U0001FFFF\U00002600-\U000027BF\U0001F900-\U0001F9FF]"
+                )
+                _token_count = 0
+    
+                for chunk in response:
+                    raw = chunk["message"]["content"]
+    
+                    # Buffer-based think tag stripper
+                    _think_buf += raw
+                    visible = ""
+    
+                    while _think_buf:
+                        if _think_depth == 0:
+                            open_pos = _think_buf.find("<think>")
+                            if open_pos == -1:
+                                # No open tag — safe to print everything
+                                visible += _think_buf
+                                _think_buf = ""
+                            else:
+                                # Print before the tag, then enter think mode
+                                visible += _think_buf[:open_pos]
+                                _think_buf = _think_buf[open_pos + 7:]
+                                _think_depth = 1
+                        else:
+                            close_pos = _think_buf.find("</think>")
+                            if close_pos == -1:
+                                # Still inside think block — buffer it, don't print
+                                break
+                            else:
+                                # Skip think block content
+                                _think_buf = _think_buf[close_pos + 8:]
+                                _think_depth = 0
+    
+                    # Strip emoji from visible output (backstop for Modelfile rule)
+                    visible = _EMOJI_RE.sub("", visible)
+    
+                    if visible:
+                        print(visible, end="", flush=True)
+                        full_response += visible
+                        _token_count += len(visible.split())
+    
+                # After stream: show token count
+                print(f"\n[\033[90m~{_token_count} tokens | ctx {_token_count*100//4096}%\033[0m]")
+    
+                # Strip any remaining think tags from full_response for memory storage
+                full_response = re.sub(r"<think>.*?</think>", "", full_response, flags=re.DOTALL).strip()
+                complete_response += "\n\n" + full_response
+
+            WATCHDOG.stop()
+            self.memory.add_turn(query, complete_response)
+
+            # Log to markdown file
+            self.log_to_file(query, complete_response)
+
+            # Save to ChromaDB Long-Term Memory
+            self.retriever.add_to_memory(
+                query, complete_response, session_id=self.memory.session_id
+            )
+
+        except ollama.ResponseError as e:
+            if "not found" in str(e).lower():
+                print(f"\nModel {self.model} not found. Re-building automatically...")
+                import subprocess
+
+                subprocess.run(["ollama", "pull", "qwen3.5:9b"])
+                subprocess.run(["ollama", "create", "aria-qwen", "-f", "./Modelfile"])
+                print("\nModel built. Please try your query again.")
+        except Exception as e:
+            err_str = str(e).lower()
+            if "connection refused" in err_str:
+                print("\nError: Ollama not running. Run: ollama serve")
+            else:
+                print(f"\nGeneration error: {e}")
+
+
+================================================================================
+FILE: tools.py
+================================================================================
+from journal import search_journal, capture_research, log_decision
+from pathlib import Path
+
+import re as _re
+
+_SECRET_PATTERNS = [
+    (_re.compile(r'((?:API_KEY|SECRET|TOKEN|PASSWORD|PASSPHRASE|PRIVATE_KEY)\s*[=:]\s*)([^\s\n]{8,})', _re.IGNORECASE), lambda m: m.group(1) + '[REDACTED]'),
+    (_re.compile(r'(\d{8,12}:AA[A-Za-z0-9_\-]{8,})'), lambda m: '[TELEGRAM_TOKEN_REDACTED]'),
+    (_re.compile(r'\bsk-ant-[A-Za-z0-9\-_]{20,}\b'), lambda m: '[ANTHROPIC_KEY_REDACTED]'),
+    (_re.compile(r'\bsk-or-[A-Za-z0-9\-_]{20,}\b'), lambda m: '[OPENROUTER_KEY_REDACTED]'),
+    (_re.compile(r'((?:BYBIT|OKX|BINANCE|KRAKEN)[_\w]*(?:KEY|SECRET|PASS)\s*=\s*)([A-Za-z0-9]{8,})', _re.IGNORECASE), lambda m: m.group(1) + '[EXCHANGE_KEY_REDACTED]'),
+    (_re.compile(r'\btvly-[A-Za-z0-9\-_]{10,}\b'), lambda m: '[TAVILY_KEY_REDACTED]'),
+    (_re.compile(r'\+\d{7,15}\b'), lambda m: '+[PHONE_REDACTED]'),
+]
+
+def sanitize_output(text: str) -> str:
+    if not text:
+        return text
+    for pattern, replacer in _SECRET_PATTERNS:
+        text = pattern.sub(replacer, text)
+    return text
+
+class SessionState:
+    def __init__(self):
+        import os
+        self.cwd = os.getcwd()
+        self.read_files = {}
+        self.env_vars = {}
+        self.created_files = []
+        self.models_in_vram = []
+
+    def update_cwd(self, new_cwd: str):
+        import os
+        expanded = os.path.expanduser(new_cwd)
+        if os.path.isdir(expanded):
+            self.cwd = expanded
+        return self.cwd
+
+    def record_file_read(self, path: str, content: str):
+        self.read_files[path] = content[:200]
+
+    def was_read(self, path: str) -> bool:
+        return path in self.read_files
+
+SESSION = SessionState()
+
+def check_model_available(model_path: str) -> dict:
+    import os, subprocess
+    try:
+        r = subprocess.run(['ollama', 'list'], capture_output=True, text=True)
+        if model_path.lower() in r.stdout.lower():
+            return {"available": True, "location": "ollama", "vram_mb": 0}
+    except Exception:
+        pass
+
+    hf_cache = os.path.expanduser('~/.cache/huggingface/hub')
+    model_dir_name = 'models--' + model_path.replace('/', '--')
+    hf_path = os.path.join(hf_cache, model_dir_name)
+    if os.path.exists(hf_path):
+        try:
+            r = subprocess.run(['du', '-sm', hf_path], capture_output=True, text=True)
+            size_mb = int(r.stdout.split()[0]) if r.stdout else 0
+        except Exception:
+            size_mb = 0
+        return {"available": True, "location": hf_path, "vram_mb": size_mb}
+
+    return {"available": False, "location": None, "vram_mb": 0}
+
+def get_available_models() -> str:
+    import subprocess, os
+    lines = ["=== Available Models ==="]
+    try:
+        r = subprocess.run(['ollama', 'list'], capture_output=True, text=True)
+        if r.stdout.strip():
+            lines.append("Ollama:")
+            for line in r.stdout.strip().split('\n')[1:]:
+                lines.append(f"  {line.split()[0]}")
+    except Exception:
+        lines.append("Ollama: (not running)")
+
+    hf_cache = os.path.expanduser('~/.cache/huggingface/hub')
+    if os.path.exists(hf_cache):
+        lines.append("HuggingFace cache:")
+        for d in os.listdir(hf_cache):
+            if d.startswith('models--'):
+                model_name = d[8:].replace('--', '/')
+                lines.append(f"  {model_name}")
+
+    return '\n'.join(lines)
+
+def get_vram_free_mb() -> int:
+    import subprocess
+    try:
+        r = subprocess.run(['nvidia-smi', '--query-gpu=memory.free', '--format=csv,noheader,nounits'], capture_output=True, text=True)
+        return int(r.stdout.strip())
+    except Exception:
+        return 0
+
+def check_vram_before_load(model_size_mb: int) -> str:
+    free = get_vram_free_mb()
+    needed = int(model_size_mb * 1.2)
+    if free >= needed:
+        return f"OK — {free}MB free, {needed}MB needed"
+    return f"VRAM insufficient: {free}MB free, {needed}MB needed. Options: use CPU (device='cpu'), unload aria-qwen first (ollama stop aria-qwen), or use smaller model."
+
+import os
+import subprocess
+import json
+import requests
+import re
+from typing import List, Dict
+
+
+def read_file(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+
+def write_file(path: str, content: str) -> str:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"Successfully wrote to {path}"
+    except Exception as e:
+        return f"Error writing file: {e}"
+
+
+def run_bash(cmd: str, timeout: int = 15) -> str:
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=timeout
+        )
+        output = result.stdout + result.stderr
+        if len(output) > 2000:
+            output = output[:2000] + "\n...[output truncated]"
+        return output
+    except Exception as e:
+        return f"Error running bash: {e}"
+
+
+def list_dir(path: str) -> str:
+    try:
+        return "\n".join(os.listdir(path))
+    except Exception as e:
+        return f"Error listing dir: {e}"
+
+
+def search_code(query: str, directory: str) -> str:
+    try:
+        cmd = f"grep -rnw '{directory}' -e '{query}' | head -n 20"
+        return run_bash(cmd)
+    except Exception as e:
+        return f"Error searching code: {e}"
+
+
+def get_clipboard() -> str:
+    try:
+        result = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-o"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return result.stdout
+    except Exception as e:
+        return f"Error reading clipboard: {e}"
+
+
+def web_fetch(url: str) -> str:
+    try:
+        response = requests.get(url, timeout=5)
+        response.raise_for_status()
+        text = response.text
+        if len(text) > 3000:
+            text = text[:3000] + "\n...[truncated]"
+        return text
+    except Exception as e:
+        return f"Error fetching url: {e}"
+
+
+TOOL_REGISTRY = {
+    "read_file": read_file,
+    "write_file": write_file,
+    "run_bash": run_bash,
+    "list_dir": list_dir,
+    "search_code": search_code,
+    "get_clipboard": get_clipboard,
+    "web_fetch": web_fetch,
+}
+
+
+def parse_tool_calls(text: str) -> list:
+    """
+    Extract tool calls handling ALL format variants Aria might generate:
+    - Correct:  <tool name="bash">{"cmd": "ls"}</tool>
+    - Broken 1: <tool name="bash"><parameter=cmd>ls</parameter>
+    - Broken 2: <tool_call>{"name": "bash", "cmd": "ls"}</tool_call>
+    - Broken 3: ```bash\nls\n```  (markdown code blocks)
+    """
+    import re, json
+    results = []
+
+    # Format 1: Correct JSON format
+    pattern1 = re.compile(
+        r'<tool\s+name=["\']([^"\']+)["\']>\s*(.*?)\s*</tool>',
+        re.DOTALL | re.IGNORECASE
+    )
+    for m in pattern1.finditer(text):
+        name = m.group(1).strip()
+        args_raw = m.group(2).strip()
+        try:
+            args = json.loads(args_raw)
+        except Exception:
+            # Try key=value fallback
+            args = _parse_kv(args_raw)
+        results.append({"name": name, "args": args})
+
+    if results:
+        return results
+
+    # Format 2: Broken <parameter=X> format
+    pattern2 = re.compile(
+        r'<tool\s+name=["\']([^"\']+)["\']>.*?<parameter[= ]+(\w+)>\s*(.*?)\s*(?:</parameter>|$)',
+        re.DOTALL | re.IGNORECASE
+    )
+    for m in pattern2.finditer(text):
+        name = m.group(1).strip()
+        key = m.group(2).strip()
+        val = m.group(3).strip()
+        results.append({"name": name, "args": {key: val}})
+
+    if results:
+        return results
+
+    # Format 3: tool_call JSON blob
+    pattern3 = re.compile(
+        r'<tool_call>\s*(\{.*?\})\s*</tool_call>',
+        re.DOTALL | re.IGNORECASE
+    )
+    for m in pattern3.finditer(text):
+        try:
+            blob = json.loads(m.group(1))
+            name = blob.pop('name', blob.pop('tool', 'run_bash'))
+            results.append({"name": name, "args": blob})
+        except Exception:
+            pass
+
+    if results:
+        return results
+
+    # Format 4: Bare ```bash``` code blocks (treat as run_bash)
+    pattern4 = re.compile(r'```(?:bash|sh|shell)\n(.*?)```', re.DOTALL)
+    for m in pattern4.finditer(text):
+        cmd = m.group(1).strip()
+        if cmd:
+            results.append({"name": "run_bash", "args": {"cmd": cmd}})
+
+    return results
+
+class ContinuityWatchdog:
+    """
+    Prevents Aria from going silent mid-session.
+    If no output for >30s during a tool loop, prints a heartbeat.
+    """
+    def __init__(self, timeout=30):
+        self.timeout = timeout
+        self._timer = None
+        self._active = False
+
+    def start(self):
+        self._active = True
+        self._reset()
+
+    def stop(self):
+        self._active = False
+        if self._timer:
+            self._timer.cancel()
+
+    def ping(self):
+        """Call this after each tool execution to reset timer."""
+        if self._active:
+            self._reset()
+
+    def _reset(self):
+        if self._timer:
+            self._timer.cancel()
+        self._timer = threading.Timer(self.timeout, self._heartbeat)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _heartbeat(self):
+        if self._active:
+            print("\n[\033[33mAria still working...\033[0m]", flush=True)
+            self._reset()
+
+WATCHDOG = ContinuityWatchdog(timeout=30)
+
+import os
+TAVILY_KEY_PATH = os.path.expanduser("~/.aria/tavily.key")
+
+def _load_tavily_key() -> str:
+    """Load Tavily API key from secure file."""
+    if os.path.exists(TAVILY_KEY_PATH):
+        try:
+            with open(TAVILY_KEY_PATH) as f:
+                return f.read().strip()
+        except Exception:
+            return ""
+    # Also check environment
+    return os.environ.get("TAVILY_API_KEY", "")
+
+def store_tavily_key(key: str) -> str:
+    """Securely store Tavily API key (never echo it)."""
+    try:
+        os.makedirs(os.path.dirname(TAVILY_KEY_PATH), exist_ok=True)
+        with open(TAVILY_KEY_PATH, "w") as f:
+            f.write(key.strip())
+        os.chmod(TAVILY_KEY_PATH, 0o600)  # owner read only
+        return "Tavily key stored securely at ~/.aria/tavily.key"
+    except Exception as e:
+        return f"Failed to store Tavily key: {e}"
+
+def probe_tools() -> dict:
+    """
+    Test which tools actually work at startup.
+    Returns dict of {tool_name: status_str}
+    """
+    status = {}
+
+    # Test bash
+    try:
+        result = run_bash("echo OK", timeout=5)
+        status["bash"] = "OK" if "OK" in result else f"WARN: {result[:50]}"
+    except Exception as e:
+        status["bash"] = f"FAIL: {e}"
+
+    # Test web_search
+    try:
+        # Import the actual web_search function if available
+        # This checks if the Ollama web search extension is active
+        import subprocess
+        r = subprocess.run(
+            ["curl", "-s", "--max-time", "5",
+             "http://localhost:11434/api/tags"],
+            capture_output=True, text=True
+        )
+        status["ollama"] = "OK" if r.returncode == 0 else "FAIL"
+    except Exception as e:
+        status["ollama"] = f"FAIL: {e}"
+
+    # Test Tavily if key exists
+    tavily_key = _load_tavily_key()
+    if tavily_key:
+        try:
+            import urllib.request, json as _json
+            req = urllib.request.Request(
+                "https://api.tavily.com/search",
+                data=_json.dumps({"query": "test", "api_key": tavily_key,
+                                  "max_results": 1}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                status["tavily"] = "OK"
+        except Exception as e:
+            status["tavily"] = f"FAIL: {e}"
+    else:
+        status["tavily"] = "NO_KEY"
+
+    return status
+
+TOOL_STATUS = {}  # populated at startup via probe_tools()
+
+def tavily_search(query: str, max_results: int = 5) -> str:
+    """Search using Tavily API. Returns formatted results."""
+    import json as _json, urllib.request as _req
+    key = _load_tavily_key()
+    if not key:
+        return "ERROR: No Tavily key. Run: store_tavily_key('your-key')"
+    try:
+        payload = _json.dumps({
+            "query": query,
+            "api_key": key,
+            "max_results": max_results,
+            "search_depth": "basic"
+        }).encode()
+        request = _req.Request(
+            "https://api.tavily.com/search",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with _req.urlopen(request, timeout=10) as resp:
+            data = _json.loads(resp.read())
+        results = data.get("results", [])
+        if not results:
+            return "No results found."
+        lines = []
+        for r in results[:max_results]:
+            lines.append(f"[{r.get('score',0):.2f}] {r.get('title','')}")
+            lines.append(f"URL: {r.get('url','')}")
+            lines.append(r.get('content','')[:400])
+            lines.append("")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Tavily error: {e}"
+
+def duckduckgo_search(query: str) -> str:
+    """DuckDuckGo search via HTML scraping fallback."""
+    import urllib.request as _req, urllib.parse as _parse
+    try:
+        url = f"https://html.duckduckgo.com/html/?q={_parse.quote(query)}"
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+        request = _req.Request(url, headers=headers)
+        with _req.urlopen(request, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        import re
+        # Extract result snippets
+        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
+        titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', html, re.DOTALL)
+        clean = lambda s: re.sub(r"<[^>]+>", "", s).strip()
+        lines = []
+        for t, s in zip(titles[:5], snippets[:5]):
+            lines.append(f"- {clean(t)}: {clean(s)}")
+        return "\n".join(lines) if lines else "No results."
+    except Exception as e:
+        return f"DuckDuckGo error: {e}"
+
+def smart_search(query: str, context: str = "") -> str:
+    """
+    Intelligent search with automatic fallback chain:
+    1. Try Tavily (best results, structured)
+    2. Try DuckDuckGo (reliable fallback)
+    3. Try web_fetch on a likely URL (last resort)
+
+    Also validates relevance: result must contain at least one
+    keyword from the query or it tries the next engine.
+    Returns the first useful result with source label.
+    """
+    import re
+
+    # Extract keywords from query for relevance check
+    keywords = [w.lower() for w in query.split()
+                if len(w) > 3 and w.lower() not in
+                {"what","when","where","which","that","this","have","from","with","about"}]
+
+    def is_relevant(text: str) -> bool:
+        text_lower = text.lower()
+        return any(kw in text_lower for kw in keywords[:5])
+
+    # Attempt 1: Tavily
+    if _load_tavily_key():
+        result = tavily_search(query, max_results=3)
+        if not result.startswith("ERROR") and not result.startswith("Tavily error"):
+            if is_relevant(result) or len(result) > 200:
+                return f"[Tavily]\n{result}"
+
+    # Attempt 2: DuckDuckGo
+    result = duckduckgo_search(query)
+    if not result.startswith("DuckDuckGo error") and len(result) > 100:
+        if is_relevant(result):
+            return f"[DuckDuckGo]\n{result}"
+
+    # Attempt 3: Rephrase and retry DuckDuckGo
+    alt_query = " ".join(keywords[:4]) + " explanation"
+    result = duckduckgo_search(alt_query)
+    if not result.startswith("DuckDuckGo error") and len(result) > 100:
+        return f"[DuckDuckGo rephrased: '{alt_query}']\n{result}"
+
+    # Attempt 4: web_fetch on a likely source
+    likely_url = f"https://en.wikipedia.org/wiki/{query.replace(' ', '_')}"
+    result = web_fetch(likely_url)
+    if result and not result.startswith("Error"):
+        return f"[Wikipedia]\n{result[:1500]}"
+
+    return f"Search exhausted for: '{query}'. No relevant results found."
+
+# Update TOOL_REGISTRY to include new tools:
+TOOL_REGISTRY.update({
+    "tavily_search": lambda args: tavily_search(
+        args.get("query", ""), args.get("max_results", 5)),
+    "duckduckgo_search": lambda args: duckduckgo_search(
+        args.get("query", "")),
+    "store_tavily_key": lambda args: store_tavily_key(
+        args.get("key", "")),
+    "probe_tools": lambda args: str(probe_tools()),
+    "smart_search": lambda args: smart_search(
+        args.get("query", ""), args.get("context", "")),
+})
+
+def read_env_safe(path: str) -> str:
+    """
+    Read .env file but mask all values, show only key names.
+    Use this instead of read_file() for .env files.
+    """
+    import os
+    try:
+        with open(os.path.expanduser(path)) as f:
+            lines = f.readlines()
+        masked = []
+        for line in lines:
+            line = line.rstrip()
+            if not line or line.startswith('#'):
+                masked.append(line)
+                continue
+            if '=' in line:
+                key, _, val = line.partition('=')
+                if val and not val.startswith('#'):
+                    preview = val[:3] + '...' if len(val) > 3 else '***'
+                    masked.append(f"{key}=[MASKED — {len(val)} chars, preview: {preview}]")
+                else:
+                    masked.append(line)
+            else:
+                masked.append(line)
+        return '\n'.join(masked)
+    except Exception as e:
+        return f"Error reading {path}: {e}"
+
+def _parse_kv(text: str) -> dict:
+    """Parse key=value or key: value pairs as fallback."""
+    import re
+    args = {}
+    for m in re.finditer(r'(\w+)\s*[=:]\s*["\']?([^"\'<\n]+)["\']?', text):
+        args[m.group(1).strip()] = m.group(2).strip()
+    return args
+
+
+================================================================================
+FILE: memory.py
+================================================================================
+# File: memory.py
+import ollama
+import uuid
+import os
+
+
+class MemoryManager:
+    def __init__(self, llm_model_name: str):
+        self.model = llm_model_name
+        self.short_term = []  # raw message dicts [{role, content}]
+        self.session_summary = ""  # compressed summary of older turns
+        self.session_id = uuid.uuid4().hex[:8]
+        self.turn_count = 0
+        self._boot_milestones()
+
+    def add_turn(self, user_msg: str, assistant_msg: str):
+        """Add a new turn. Auto-compress when session gets long."""
+        self.short_term.append({"role": "user", "content": user_msg})
+        self.short_term.append({"role": "assistant", "content": assistant_msg})
+        self.turn_count += 1
+        # Compress when more than 10 turns (20 messages) accumulate
+        if len(self.short_term) > 14:
+            self._compress_session()
+
+    def _compress_session(self):
+        """
+        Summarize the OLDEST 8 messages (4 turns) into a rolling summary.
+        Keep the LATEST 12 messages (6 turns) as raw context.
+        The summary is appended to any existing summary so context accumulates.
+        """
+        to_compress = self.short_term[:6]
+        keep = self.short_term[6:]
+
+        # Build a plain-text history string from to_compress
+        history_text = ""
+        for msg in to_compress:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            history_text += f"{role}: {msg['content'][:400]}\n"
+
+        # If there's an existing summary, include it
+        prior = (
+            f"Prior summary: {self.session_summary}\n\n" if self.session_summary else ""
+        )
+
+        prompt = (
+            f"{prior}"
+            f"Summarize the following conversation turns into 3-5 bullet points.\n"
+            f"Capture: key facts discussed, decisions made, topics covered.\n"
+            f"Be concise. No preamble. Just bullet points.\n\n"
+            f"{history_text}\nSummary:"
+        )
+
+        try:
+            response = ollama.generate(
+                model=self.model,
+                prompt=prompt,
+                options={
+                    "num_ctx": 1024,
+                    "num_predict": 100,
+                    "temperature": 0.0,
+                    "think": False,
+                },
+            )
+            new_summary = response["response"].strip()
+            self.session_summary = new_summary
+            self.short_term = keep
+            print(
+                f"[\033[33mSession compressed: {len(to_compress)} msgs → summary\033[0m]"
+            )
+        except Exception as e:
+            # If compression fails, just drop oldest turns
+            self.short_term = keep
+            print(f"[Compression failed, truncated: {e}]")
+
+    def get_context_messages(self) -> list:
+        """
+        Returns messages to inject into the LLM call:
+        [summary_block (if exists)] + [raw recent turns]
+        Total budget: ~600 tokens for memory (summary ~150 + 6 turns ~450)
+        """
+        messages = []
+        if self.session_summary:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"[Session History Summary]\n{self.session_summary}",
+                }
+            )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "Understood. I have context from our earlier conversation.",
+                }
+            )
+        # Add last 6 turns (12 messages) raw
+        messages.extend(self.short_term[-12:])
+        return messages
+
+    def get_last_n_turns_text(self, n: int = 4) -> str:
+        """Returns last N turns as plain text for query rewriting."""
+        msgs = self.short_term[-(n * 2) :]
+        text = ""
+        for msg in msgs:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            text += f"{role}: {msg['content'][:300]}\n"
+        return text
+
+    def clear(self):
+        self.short_term = []
+        self.session_summary = ""
+        self.turn_count = 0
+
+    def _boot_milestones(self):
+        """Silently load previous session context on startup."""
+        path = os.path.expanduser("~/.aria/milestones.md")
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+            if len(lines) < 3:
+                return
+            recent = "".join(lines[-60:]).strip()
+            if recent:
+                self.session_summary = (
+                    "[Previous sessions context — use naturally, don't announce]\n"
+                    + recent
+                )
+        except Exception:
+            pass  # silently skip
+
+    def get_pending_plan(self) -> str:
+        """Return the last assistant message (likely the pending plan)."""
+        for msg in reversed(self.short_term):
+            if msg["role"] == "assistant":
+                return msg["content"][:500]
+        return ""
+
+
+================================================================================
+FILE: journal.py
+================================================================================
+from __future__ import annotations
+import os
+import re
+import json
+import subprocess
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+JOURNAL_ROOT = Path.home() / ".aria" / "journal"
+INGEST_LOG = Path.home() / ".aria" / "ingest_log.txt"
+
+# ── Topic detection ───────────────────────────────────────────────────────────
+TOPIC_KEYWORDS = {
+    "crypto-trading": [
+        "bybit",
+        "binance",
+        "okx",
+        "pnl",
+        "bot",
+        "scalper",
+        "hybrid",
+        "trading",
+        "crypto",
+        "usdt",
+        "signal",
+    ],
+    "aria-system": [
+        "modelfile",
+        "fix",
+        "directive",
+        "rag",
+        "embedding",
+        "chromadb",
+        "aria",
+        "memory",
+        "milestone",
+    ],
+    "research": [
+        "research",
+        "find",
+        "compare",
+        "recipe",
+        "how to build",
+        "best",
+        "opentrader",
+        "digitalfortune",
+        "stack",
+    ],
+    "coding": [
+        "python",
+        "rust",
+        "go",
+        "typescript",
+        "docker",
+        "error",
+        "bug",
+        "fix",
+        "implement",
+        "write",
+    ],
+    "system": [
+        "install",
+        "setup",
+        "config",
+        "pop-os",
+        "nvidia",
+        "vram",
+        "ollama",
+        "venv",
+        "service",
+    ],
+}
+
+
+def detect_topic(messages: list) -> str:
+    """Detect primary topic from first few messages."""
+    text = " ".join(m.get("content", "")[:200] for m in messages[:6]).lower()
+    scores = {topic: 0 for topic in TOPIC_KEYWORDS}
+    for topic, keywords in TOPIC_KEYWORDS.items():
+        scores[topic] = sum(1 for kw in keywords if kw in text)
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else "general"
+
+
+# ── Quality scoring ───────────────────────────────────────────────────────────
+def score_session(messages: list, tasks_completed: int = 0) -> int:
+    """Score session quality. Returns 0-5."""
+    if not messages:
+        return 0
+    score = 0
+    user_msgs = [m for m in messages if m.get("role") == "user"]
+    assist_msgs = [m for m in messages if m.get("role") == "assistant"]
+
+    # Substantive exchanges
+    if len(user_msgs) >= 5:
+        score += 2
+    elif len(user_msgs) >= 3:
+        score += 1
+
+    # Task completion
+    score += min(tasks_completed, 2)
+
+    # Poke loop detection (bad signal)
+    pokes = sum(
+        1
+        for m in user_msgs
+        if m.get("content", "").strip().rstrip("!?.")
+        in {"so", "?", "so?", "well?", "and?", "then?"}
+    )
+    if pokes >= 3:
+        score -= 2
+    elif pokes >= 2:
+        score -= 1
+
+    # Response length (very short = probably stuck)
+    avg_len = sum(len(m.get("content", "")) for m in assist_msgs) / max(
+        len(assist_msgs), 1
+    )
+    if avg_len < 50:
+        score -= 1
+
+    return max(0, score)
+
+
+# ── Frontmatter builder ───────────────────────────────────────────────────────
+def build_frontmatter(
+    session_id: str,
+    topic: str,
+    project: Optional[str],
+    summary: str,
+    decisions: list,
+    research_items: list,
+    code_files: list,
+) -> str:
+    now = datetime.now().strftime("%Y-%m-%d")
+    decisions_str = "\n".join(f"  - {d}" for d in decisions) or "  - none"
+    research_str = "\n".join(f"  - {r}" for r in research_items) or "  - none"
+    code_str = "\n".join(f"  - {c}" for c in code_files) or "  - none"
+    return (
+        f"---\n"
+        f"date: {now}\n"
+        f"session_id: {session_id}\n"
+        f"topic: {topic}\n"
+        f"project: {project or 'none'}\n"
+        f"summary: {summary}\n"
+        f"decisions:\n{decisions_str}\n"
+        f"research:\n{research_str}\n"
+        f"code_written:\n{code_str}\n"
+        f"---\n\n"
+    )
+
+
+# ── Journal entry writer ──────────────────────────────────────────────────────
+def write_journal_entry(
+    session_id: str,
+    topic: str,
+    project: Optional[str],
+    summary: str,
+    decisions: list,
+    research_items: list,
+    code_files: list,
+    narrative: str,
+    findings: list,
+    open_questions: list,
+    quality: int,
+) -> Optional[Path]:
+    """
+    Write a journal entry. Returns path or None if quality too low.
+    quality 0 = decisions only
+    quality 1 = decisions + code
+    quality 2+ = full entry
+    """
+    if quality <= 0 and not decisions:
+        return None  # Nothing worth saving
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    slug = re.sub(r"[^a-z0-9]+", "-", topic.lower())[:30]
+    filename = f"{date_str}-{slug}-{session_id[:6]}.md"
+
+    # Route to subdirectory based on topic
+    subdir = {
+        "research": "research",
+        "crypto-trading": "sessions",
+        "aria-system": "sessions",
+        "coding": "sessions",
+        "system": "sessions",
+    }.get(topic, "sessions")
+
+    entry_path = JOURNAL_ROOT / subdir / filename
+
+    # Build content based on quality level
+    fm = build_frontmatter(
+        session_id, topic, project, summary, decisions, research_items, code_files
+    )
+
+    sections = [fm]
+
+    if quality >= 2 and narrative:
+        sections.append(f"## Session Summary\n{narrative}\n")
+
+    if findings:
+        sections.append(
+            "## Key Findings\n" + "\n".join(f"- {f}" for f in findings) + "\n"
+        )
+
+    if decisions:
+        sections.append(
+            "## Decisions Made\n" + "\n".join(f"- {d}" for d in decisions) + "\n"
+        )
+
+    if code_files:
+        sections.append(
+            "## Code & Configs\n" + "\n".join(f"- `{c}`" for c in code_files) + "\n"
+        )
+
+    if open_questions:
+        sections.append(
+            "## Open Questions\n" + "\n".join(f"- {q}" for q in open_questions) + "\n"
+        )
+
+    content = "\n".join(sections)
+    entry_path.write_text(content, encoding="utf-8")
+    return entry_path
+
+
+# ── Index updater ────────────────────────────────────────────────────────────
+def update_index(
+    session_id: str,
+    topic: str,
+    project: Optional[str],
+    summary: str,
+    entry_path: Path,
+) -> None:
+    """Append one row to the master index table."""
+    index_path = JOURNAL_ROOT / "index.md"
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    rel_path = entry_path.relative_to(JOURNAL_ROOT)
+    row = (
+        f"| {date_str} | {session_id[:8]} | {topic} "
+        f"| {project or 'none'} | [{summary[:60]}]({rel_path}) |\n"
+    )
+    with open(index_path, "a", encoding="utf-8") as f:
+        f.write(row)
+
+
+# ── Project document updater ──────────────────────────────────────────────────
+def update_project_doc(
+    project: str,
+    status: str,
+    what_works: list,
+    known_issues: list,
+    next_steps: list,
+    key_files: dict,
+) -> Path:
+    """Update or create a living project document."""
+    proj_path = JOURNAL_ROOT / "projects" / f"{project.upper()}.md"
+    date_str = datetime.now().strftime("%Y-%m-%d")
+
+    if proj_path.exists():
+        # Append to history section
+        existing = proj_path.read_text(encoding="utf-8")
+        history_line = f"- {date_str}: {status}\n"
+        if "## History" in existing:
+            existing = existing.replace("## History\n", f"## History\n{history_line}")
+        else:
+            existing += f"\n## History\n{history_line}"
+        # Update status line
+        existing = re.sub(r"## Status:.*", f"## Status: {status}", existing)
+        proj_path.write_text(existing, encoding="utf-8")
+    else:
+        works_str = "\n".join(f"- {w}" for w in what_works) or "- (none yet)"
+        issues_str = "\n".join(f"- {i}" for i in known_issues) or "- (none)"
+        steps_str = "\n".join(f"- {s}" for s in next_steps) or "- (none)"
+        files_str = (
+            "\n".join(f"- `{k}` → {v}" for k, v in key_files.items()) or "- (none)"
+        )
+        content = (
+            f"# {project.upper()}\n\n"
+            f"## Status: {status}\n\n"
+            f"## Key Files\n{files_str}\n\n"
+            f"## What Works\n{works_str}\n\n"
+            f"## Known Issues\n{issues_str}\n\n"
+            f"## Next Steps\n{steps_str}\n\n"
+            f"## History\n- {date_str}: {status}\n"
+        )
+        proj_path.write_text(content, encoding="utf-8")
+    return proj_path
+
+
+# ── Decision logger ───────────────────────────────────────────────────────────
+def log_decision(
+    decision: str,
+    context: str = "",
+    project: Optional[str] = None,
+) -> Path:
+    """Log an explicit H2 decision to the decisions directory."""
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    slug = re.sub(r"[^a-z0-9]+", "-", decision.lower().replace("'", ""))[:40]
+    path = JOURNAL_ROOT / "decisions" / f"{date_str}-{slug}.md"
+    content = (
+        f"# Decision: {decision}\n\n"
+        f"**Date:** {date_str}\n"
+        f"**Project:** {project or 'general'}\n\n"
+        f"## Context\n{context or 'No additional context recorded.'}\n"
+    )
+    path.write_text(content, encoding="utf-8")
+
+    # Also append one-liner to milestones
+    milestones_path = Path.home() / ".aria" / "milestones.md"
+    with open(milestones_path, "a", encoding="utf-8") as f:
+        f.write(f"\n[DECISION] {date_str}: {decision}")
+    return path
+
+
+# ── Research capture ──────────────────────────────────────────────────────────
+def capture_research(
+    query: str,
+    findings: str,
+    sources: list,
+    topic: str = "research",
+) -> Path:
+    """Immediately persist web search findings to research journal."""
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    slug = re.sub(r"[^a-z0-9]+", "-", topic.lower())[:30]
+    path = JOURNAL_ROOT / "research" / f"{slug}.md"
+
+    entry = (
+        f"\n## {date_str} — {query}\n\n"
+        f"### Findings\n{findings[:2000]}\n\n"
+        f"### Sources\n" + "\n".join(f"- {s}" for s in sources[:10]) + "\n"
+    )
+
+    # Append to topic file (accumulates over time)
+    with open(path, "a", encoding="utf-8") as f:
+        if path.stat().st_size == 0 if path.exists() else True:
+            f.write(f"# Research: {topic}\n")
+        f.write(entry)
+    return path
+
+
+# ── Code snippet saver ────────────────────────────────────────────────────────
+def save_code_snippet(
+    filename: str,
+    content: str,
+    source: str,
+    purpose: str,
+    verified: bool = False,
+) -> Path:
+    """Save a working code pattern to the code library."""
+    path = JOURNAL_ROOT / "code" / filename
+    header = (
+        f"# Source: {source}\n"
+        f"# Purpose: {purpose}\n"
+        f"# Verified: {'YES - ' + datetime.now().strftime('%Y-%m-%d') if verified else 'UNVERIFIED'}\n"
+        f"# Hardware: RTX 3060 Ti 8GB, i7-11700k, Pop!OS\n\n"
+    )
+    path.write_text(header + content, encoding="utf-8")
+    return path
+
+
+# ── Auto-ingest trigger ───────────────────────────────────────────────────────
+def trigger_ingest_if_needed(project_root: str) -> bool:
+    """
+    Ingest journal into RAG if it changed in last 24 hours.
+    Returns True if ingest was run.
+    """
+    import time
+
+    journal_str = str(JOURNAL_ROOT)
+
+    # Check if any journal file was modified in last 24h
+    cutoff = time.time() - 86400
+    changed = False
+    for p in JOURNAL_ROOT.rglob("*.md"):
+        if p.stat().st_mtime > cutoff:
+            changed = True
+            break
+
+    if not changed:
+        return False
+
+    # Check if already ingested today
+    today = datetime.now().strftime("%Y-%m-%d")
+    if INGEST_LOG.exists():
+        last = INGEST_LOG.read_text().strip().split("\n")[-1]
+        if today in last and "journal" in last:
+            return False
+
+    # Run ingest
+    try:
+        result = subprocess.run(
+            ["python3", "main.py", "ingest", "--folder", journal_str],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        with open(INGEST_LOG, "a") as f:
+            f.write(f"{today} journal ingested\n")
+        print(f"[Journal ingested into RAG]")
+        return True
+    except Exception as e:
+        print(f"[Journal ingest failed: {e}]")
+        return False
+
+
+# ── Journal query ─────────────────────────────────────────────────────────────
+def search_journal(query: str) -> str:
+    """
+    Fast grep-based search through journal files.
+    Returns formatted results with file paths and snippets.
+    """
+    try:
+        result = subprocess.run(
+            ["grep", "-r", "-i", "-l", query, str(JOURNAL_ROOT)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        files = [f for f in result.stdout.strip().split("\n") if f]
+        if not files:
+            return f"No journal entries found for: '{query}'"
+
+        lines = [f"Found in {len(files)} journal file(s):"]
+        for f in files[:5]:
+            path = Path(f)
+            # Get context lines
+            ctx_result = subprocess.run(
+                ["grep", "-i", "-A", "2", "-B", "1", query, f],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            snippet = ctx_result.stdout[:300].strip()
+            lines.append(f"\n### {path.name}")
+            lines.append(f"Path: {f}")
+            lines.append(f"```\n{snippet}\n```")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Journal search error: {e}"
+
+
+================================================================================
+FILE: retriever.py
+================================================================================
+# File: retriever.py
+import chromadb
+import uuid
+from datetime import datetime
+from rank_bm25 import BM25Okapi
+from embedder import Embedder
+from reranker import Reranker
+
+
+class Retriever:
+    def __init__(self):
+        self.embedder = Embedder()
+        self.reranker = Reranker()
+
+        self.doc_collection = None
+        self.mem_collection = None
+        self.bm25 = None
+        self.corpus_docs = []
+        self.corpus_metas = []
+
+        try:
+            self.client = chromadb.PersistentClient(path="./chroma_db")
+            # Collection for static ingested documents
+            try:
+                self.doc_collection = self.client.get_collection(name="rag_docs")
+                self._init_bm25()
+            except:
+                self.doc_collection = None
+
+            # Collection for long-term chat memory
+            self.mem_collection = self.client.get_or_create_collection(
+                name="chat_memory"
+            )
+
+        except Exception as e:
+            print(f"ChromaDB connection failed: {e}")
+
+    def _init_bm25(self):
+        """Builds an in-memory BM25 index on startup from ChromaDB docs."""
+        if not self.doc_collection:
+            return
+
+        print("Building BM25 Keyword index...")
+        all_data = self.doc_collection.get(include=["documents", "metadatas"])
+        if all_data and all_data.get("documents"):
+            docs = all_data.get("documents")
+            metas = all_data.get("metadatas")
+            if docs:
+                self.corpus_docs = list(docs)
+                self.corpus_metas = list(metas) if metas else []
+
+                # Simple tokenization for BM25
+                tokenized_corpus = [
+                    str(doc).lower().split() for doc in self.corpus_docs
+                ]
+                if tokenized_corpus:
+                    self.bm25 = BM25Okapi(tokenized_corpus)
+                    print(f"BM25 index built with {len(tokenized_corpus)} chunks.")
+
+    def add_to_memory(
+        self, user_query: str, ai_response: str, session_id: str = "unknown"
+    ):
+        """
+        Only saves to long-term memory if the exchange is IMPORTANT.
+        Importance scoring (0.0 to 1.0):
+        - Base: 0.0
+        - Response longer than 100 chars: +0.3
+        - Response longer than 300 chars: +0.2 more
+        - Query contains question words (what/how/why/when/who/which): +0.2
+        - Response does NOT contain "don't have that information": +0.1
+        - Query longer than 30 chars (not trivial): +0.1
+        - Threshold to save: importance >= 0.4
+        """
+        if not self.mem_collection:
+            return
+
+        # Score importance
+        score = 0.0
+        resp_lower = ai_response.lower()
+        query_lower = user_query.lower()
+
+        if len(ai_response) > 100:
+            score += 0.3
+        if len(ai_response) > 300:
+            score += 0.2
+        if any(
+            w in query_lower
+            for w in [
+                "what",
+                "how",
+                "why",
+                "when",
+                "who",
+                "which",
+                "explain",
+                "describe",
+            ]
+        ):
+            score += 0.2
+        if (
+            "don't have that information" not in resp_lower
+            and "i don't know" not in resp_lower
+        ):
+            score += 0.1
+        if len(user_query) > 30:
+            score += 0.1
+
+        if score < 0.4:
+            print(f"[\033[90mMemory skipped (importance={score:.1f})\033[0m]")
+            return
+
+        text = f"Past Conversation -> User: {user_query}\nAssistant: {ai_response}"
+        embedding = self.embedder.embed_documents([text])[0]
+        doc_id = f"mem_{uuid.uuid4().hex[:8]}"
+
+        self.mem_collection.add(
+            documents=[text],
+            embeddings=[embedding],
+            ids=[doc_id],
+            metadatas=[
+                {
+                    "source_file": "Long-Term Memory",
+                    "type": "memory",
+                    "session_id": session_id,
+                    "timestamp": datetime.now().isoformat(),
+                    "importance": round(score, 2),
+                }
+            ],
+        )
+        print(
+            f"[\033[32mMemory saved (importance={score:.1f}, session={session_id})\033[0m]"
+        )
+
+        # Auto-prune if collection exceeds 600 memories
+        self._prune_old_memories(max_count=600)
+
+    def _prune_old_memories(self, max_count: int = 600):
+        """
+        If memory collection exceeds max_count, delete the oldest 50 entries.
+        Oldest = lowest importance score. Uses ChromaDB get() then delete().
+        """
+        if not self.mem_collection:
+            return
+        count = self.mem_collection.count()
+        if count <= max_count:
+            return
+
+        # Get all memories with metadata
+        all_data = self.mem_collection.get(include=["metadatas"])
+        if not all_data or not all_data.get("ids"):
+            return
+
+        ids = all_data["ids"]
+        metas = all_data.get("metadatas") or []
+
+        # Sort by importance ASC (lowest importance deleted first)
+        # Fallback sort key if importance missing: 0.0
+        paired = list(zip(ids, metas))
+        paired.sort(key=lambda x: float((x[1] or {}).get("importance", 0.0)))
+
+        # Delete the 50 lowest importance entries
+        ids_to_delete = [p[0] for p in paired[:50]]
+        self.mem_collection.delete(ids=ids_to_delete)
+        print(
+            f"[\033[90mMemory pruned: deleted {len(ids_to_delete)} low-importance entries\033[0m]"
+        )
+
+    def retrieve(self, query: str):
+        query_embedding = self.embedder.embed_queries([query])[0]
+        unique_docs = {}  # map text -> meta
+
+        # 1. Vector Search (Semantic)
+        if self.doc_collection:
+            doc_results = self.doc_collection.query(
+                query_embeddings=[query_embedding], n_results=15
+            )
+            if doc_results.get("documents") and doc_results["documents"]:
+                docs = doc_results["documents"][0]
+                m_list = doc_results.get("metadatas")
+                metas = m_list[0] if m_list else []
+                for d, m in zip(docs, metas):
+                    unique_docs[d] = m
+
+        # 2. BM25 Search (Keyword/Exact match)
+        if self.bm25:
+            tokenized_query = query.lower().split()
+            bm25_scores = self.bm25.get_scores(tokenized_query)
+            top_n_idx = sorted(
+                range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
+            )[:15]
+            for idx in top_n_idx:
+                if bm25_scores[idx] > 0:
+                    d = self.corpus_docs[idx]
+                    m = self.corpus_metas[idx]
+                    if d not in unique_docs:
+                        unique_docs[d] = m
+
+        # 3. Retrieve from long-term memory
+        if self.mem_collection and self.mem_collection.count() > 0:
+            # Retrieve more, then re-score with recency weight before picking top 3
+            mem_results = self.mem_collection.query(
+                query_embeddings=[query_embedding],
+                n_results=10,
+                include=["documents", "metadatas", "distances"],
+            )
+            # Recency + importance weighting:
+            # final_score = (1 - cosine_distance) * 0.6 + importance * 0.2 + recency * 0.2
+            # recency: memories from this session get 1.0, older get decayed by days
+            if (
+                mem_results
+                and mem_results.get("documents")
+                and mem_results["documents"]
+            ):
+                m_docs = mem_results.get("documents")
+                if m_docs:
+                    docs = m_docs[0]
+                    m_list = mem_results.get("metadatas")
+                    metas = m_list[0] if m_list else []
+                    distances = (mem_results.get("distances") or [[]])[0]
+                    scored_mems = []
+                    now = datetime.now()
+                    for d, m, dist in zip(docs, metas, distances):
+                        m = m or {}
+                        semantic = max(0.0, 1.0 - dist)
+                        importance = float(m.get("importance", 0.3))
+                        # Recency: parse timestamp, decay by days (max 1.0 = today)
+                        try:
+                            ts = datetime.fromisoformat(
+                                str(m.get("timestamp", now.isoformat()))
+                            )
+                            days_old = max(0, (now - ts).days)
+                            recency = 1.0 / (1.0 + days_old * 0.1)
+                        except Exception:
+                            recency = 0.5
+                        final = semantic * 0.6 + importance * 0.2 + recency * 0.2
+                        scored_mems.append((d, m, final))
+                    scored_mems.sort(key=lambda x: x[2], reverse=True)
+                    for d, m, _ in scored_mems[:3]:
+                        if d not in unique_docs:
+                            unique_docs[d] = m
+
+        all_docs = list(unique_docs.keys())
+        all_metas = list(unique_docs.values())
+
+        if not all_docs:
+            return []
+
+        # 4. Rerank combined unique results (Vector + BM25 + Memory) -> return top 4
+        ranked_results = self.reranker.rerank(query, all_docs, all_metas)
+        top_4 = ranked_results[:4]
+
+        # Print retrieved chunks with filenames + reranker scores
+        print("\n--- Retrieved & Reranked Context ---")
+        for idx, (doc, score, meta) in enumerate(top_4):
+            source = (
+                meta.get("source_file", "Unknown")
+                if meta and isinstance(meta, dict)
+                else "Unknown"
+            )
+            print(f"[{idx + 1}] Source: {source} | Score: {score:.2f}")
+        print("------------------------------------\n")
+
+        return top_4
+
+
+================================================================================
+FILE: embedder.py
+================================================================================
+# File: embedder.py
+import torch
+import psutil
+from sentence_transformers import SentenceTransformer
+
+
+class Embedder:
+    def __init__(self):
+        self.device = "cpu"
+        self.model_name = "Qwen/Qwen3-Embedding-0.6B"
+
+        # CPU embedding tip: pre-embed ALL docs at ingestion, never at query time
+        self.model = SentenceTransformer(
+            self.model_name,
+            device=self.device,
+            model_kwargs={"torch_dtype": torch.bfloat16},
+        )
+
+        # Pin CPU threads to i7-11700k P-cores for embedding
+        torch.set_num_threads(8)
+        torch.set_num_interop_threads(2)
+
+        self.batch_size = 16  # smaller batch for CPU
+        self.embedding_dim = 512  # MRL truncation, balances speed vs quality on CPU
+
+        ram_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+        print(f"Embedder loaded on CPU — RAM usage: {ram_mb:.2f} MB")
+
+    def embed_queries(self, queries):
+        instruction = (
+            "Instruct: Given a user question, retrieve relevant passages\nQuery: "
+        )
+        texts = [instruction + q for q in queries]
+        return self.model.encode(
+            texts,
+            batch_size=self.batch_size,
+            normalize_embeddings=True,
+            truncate_dim=self.embedding_dim,
+        ).tolist()
+
+    def embed_documents(self, documents):
+        instruction = "Instruct: Represent this document for retrieval\nPassage: "
+        texts = [instruction + d for d in documents]
+
+        # CPU RAM OOM during embedding: reduce batch_size to 4 automatically and retry
+        try:
+            return self.model.encode(
+                texts,
+                batch_size=self.batch_size,
+                normalize_embeddings=True,
+                truncate_dim=self.embedding_dim,
+            ).tolist()
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() or "allocate" in str(e).lower():
+                print("RAM OOM detected. Retrying with batch_size=4...")
+                return self.model.encode(
+                    texts,
+                    batch_size=4,
+                    normalize_embeddings=True,
+                    truncate_dim=self.embedding_dim,
+                ).tolist()
+            raise e
+
+
+================================================================================
+FILE: ingestion.py
+================================================================================
+# File: ingestion.py
+import os
+import fitz  # PyMuPDF
+import tiktoken
+import chromadb
+from tqdm import tqdm
+from embedder import Embedder
+
+
+def get_text_from_file(filepath):
+    ext = os.path.splitext(filepath)[-1].lower()
+    text = ""
+    if ext == ".pdf":
+        try:
+            doc = fitz.open(filepath)
+            for page in doc:
+                extracted = page.get_text()
+                if extracted:
+                    text += extracted + "\n"
+        except Exception as e:
+            print(f"Error reading PDF {filepath}: {e}")
+    elif ext in [".txt", ".md"]:
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                text = f.read()
+        except Exception as e:
+            print(f"Error reading {filepath}: {e}")
+    return text
+
+
+def chunk_text(text, filename, chunk_size=400, overlap=50):
+    enc = tiktoken.get_encoding("cl100k_base")
+    # Split by double newline for semantic paragraph boundaries
+    paragraphs = text.split("\n\n")
+    chunks = []
+    current_chunk = []
+    current_length = 0
+
+    for p in paragraphs:
+        p = p.strip()
+        if not p:
+            continue
+        tokens = enc.encode(p)
+
+        # If adding this paragraph exceeds limit, finalize current chunk
+        if current_length + len(tokens) > chunk_size and current_chunk:
+            # Prepend the structural context! (Contextual Chunking)
+            chunk_str = f"[Document: {filename}]\n" + "\n\n".join(current_chunk)
+            chunks.append(chunk_str)
+            current_chunk = [p]
+            current_length = len(tokens)
+        else:
+            current_chunk.append(p)
+            current_length += len(tokens)
+
+    if current_chunk:
+        chunk_str = f"[Document: {filename}]\n" + "\n\n".join(current_chunk)
+        chunks.append(chunk_str)
+
+    # Second pass: token-level overlap stitching
+    overlapped_chunks = []
+    for i, chunk in enumerate(chunks):
+        if i == 0:
+            overlapped_chunks.append(chunk)
+        else:
+            prev_tokens = enc.encode(chunks[i - 1])
+            overlap_text = enc.decode(prev_tokens[-overlap:])
+            # Prepend overlap text (without the [Document:] header)
+            body = chunk.split("\n", 1)[1] if "\n" in chunk else chunk
+            header = f"[Document: {filename}]\n"
+            overlapped_chunks.append(header + overlap_text + "\n" + body)
+
+    return overlapped_chunks
+
+
+def embed_file_chunks(chunks, embedder, collection, filename):
+    for i in tqdm(
+        range(0, len(chunks), embedder.batch_size),
+        desc=f"Embedding from {filename}",
+    ):
+        batch = chunks[i : i + embedder.batch_size]
+        try:
+            embeddings = embedder.embed_documents(batch)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() or "allocate" in str(e).lower():
+                print(f"OOM on batch {i}, retrying with batch_size=4...")
+                embedder.batch_size = 4
+                embeddings = embedder.embed_documents(batch)
+            else:
+                raise
+
+        ids = [f"{filename}_chunk_{i + j}" for j in range(len(batch))]
+        metadatas = [
+            {
+                "source_file": filename,
+                "chunk_index": int(i + j),
+                "total_chunks": int(len(chunks)),
+                "char_count": int(len(batch[j])),
+            }
+            for j in range(len(batch))
+        ]
+
+        collection.add(
+            documents=batch,
+            embeddings=embeddings,
+            ids=ids,
+            metadatas=metadatas,  # type: ignore
+        )
+
+
+def ingest_folder(folder_path):
+    print(f"Scanning folder: {folder_path}")
+    files_to_process = []
+    for root, _, files in os.walk(folder_path):
+        for file in files:
+            if file.lower().endswith((".txt", ".md", ".pdf")):
+                files_to_process.append(os.path.join(root, file))
+
+    if not files_to_process:
+        print("No valid files found.")
+        return
+
+    embedder = Embedder()
+
+    # Store in ChromaDB local persistent ./chroma_db
+    try:
+        client = chromadb.PersistentClient(path="./chroma_db")
+        collection = client.get_or_create_collection(name="rag_docs")
+    except Exception as e:
+        print(
+            f"ChromaDB initialization failed. If corrupt, run 'python main.py reset'. Error: {e}"
+        )
+        return
+
+    total_chunks_ingested = 0
+    total_files = len(files_to_process)
+
+    for filepath in files_to_process:
+        filename = os.path.basename(filepath)
+        text = get_text_from_file(filepath)
+        if not text.strip():
+            continue
+
+        chunks = chunk_text(text, filename=filename, chunk_size=400, overlap=50)
+        total_chunks_ingested += len(chunks)
+
+        embed_file_chunks(chunks, embedder, collection, filename)
+
+    print(
+        f"\nIngested {total_chunks_ingested} context-aware chunks from {total_files} files -> ChromaDB"
+    )
+
+
+================================================================================
+FILE: personality.py
+================================================================================
+# File: personality.py
+import json
+import os
+
+DEFAULT_PERSONALITY = {
+    "name": "Aria",
+    "persona": "A knowledgeable local AI assistant",
+    "tone": "Professional and direct",
+    "traits": [],
+    "language": "English",
+    "greeting": "Ready. How can I help?",
+    "system_addendum": "",
+}
+
+
+def load_personality(path: str = "personality.json") -> dict:
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[personality.json load error: {e}] Using defaults.")
+    return DEFAULT_PERSONALITY
+
+
+def build_system_prompt(personality: dict, base_instructions: str) -> str:
+    """Combine personality traits with RAG instructions."""
+    traits_text = "\n".join(f"- {t}" for t in personality.get("traits", []))
+    addendum = personality.get("system_addendum", "")
+    return (
+        f"{addendum}\n\n{base_instructions}\n\nBehavioral traits:\n{traits_text}"
+    ).strip()
+
+
+================================================================================
+FILE: start.sh
+================================================================================
+#!/bin/bash
+# File: start.sh
+set -e
+export OLLAMA_FLASH_ATTENTION=1
+export OLLAMA_KV_CACHE_TYPE=q8_0
+export OLLAMA_NUM_PARALLEL=1
+export OLLAMA_NUM_THREADS=8
+export OLLAMA_KEEP_ALIVE=15m
+export OLLAMA_MAX_LOADED_MODELS=1
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Detect python binary
+PYTHON=$(which python3 2>/dev/null || which python 2>/dev/null)
+if [ -z "$PYTHON" ]; then echo "ERROR: python not found"; exit 1; fi
+
+# Activate existing venv
+if [ -f "./venv/bin/activate" ]; then
+    source ./venv/bin/activate
+    echo "Venv activated: $VIRTUAL_ENV"
+
+# Ensure num_gpu is removed so Ollama auto-allocates memory safely
+sed -i "/^PARAMETER num_gpu/d" ./Modelfile
+echo "VRAM strict allocation removed. Ollama will auto-manage memory."
+
+# Rebuild model without strict num_gpu
+ollama create aria-qwen -f ./Modelfile 2>/dev/null && echo "Model rebuilt OK"
+
+
+else
+    echo "ERROR: venv not found. Run: python3 -m venv ./venv && pip install -r requirements.txt"
+    exit 1
+fi
+
+# Start Ollama if not running
+if ! pgrep -x ollama > /dev/null; then
+    echo "Starting Ollama..."
+    ollama serve &
+    sleep 3
+fi
+
+# Build aria-qwen model if not exists
+if ! ollama list 2>/dev/null | grep -q "aria-qwen"; then
+    echo "Building aria-qwen from Modelfile..."
+    ollama create aria-qwen -f ./Modelfile
+fi
+
+# Async warm-up: don't block startup
+(ollama run aria-qwen "" > /dev/null 2>&1 || true) &
+WARMUP_PID=$!
+echo "Model warming in background (PID: $WARMUP_PID)..." 
+
+# Background heartbeat: prevent VRAM unload (ping every 240s)
+(while true; do
+    sleep 200
+    ollama run aria-qwen "" > /dev/null 2>&1 || true
+done) &
+HEARTBEAT_PID=$!
+trap "kill $HEARTBEAT_PID 2>/dev/null; echo 'Heartbeat stopped'" EXIT
+
+# Verify imports
+python3 -c "
+import rank_bm25, chromadb, sentence_transformers, tiktoken, fitz, torch, tqdm, psutil, ollama
+print('All imports OK')
+" || { echo "ERROR: Missing packages. Run: pip install -r requirements.txt"; exit 1; }
+
+# Create required dirs
+mkdir -p ~/.aria
+mkdir -p ~/AI_Lab/archives
+mkdir -p ~/AI_Lab/quarantine
+touch ~/.aria/milestones.md
+touch ~/.aria/workflows.jsonl
+
+echo "=== Aria RAG Stack Ready ==="
+echo "Flash Attention: $OLLAMA_FLASH_ATTENTION"
+echo "KV Cache: $OLLAMA_KV_CACHE_TYPE"
+echo "Keep Alive: $OLLAMA_KEEP_ALIVE"
+echo "Heartbeat PID: $HEARTBEAT_PID"
+echo "Python: $(which python3)"
+echo ""
+echo "Starting chat..."
+python3 main.py chat
+
+================================================================================
+FILE: Modelfile
+================================================================================
+FROM qwen3.5:9b
+
+PARAMETER num_keep 4
+PARAMETER num_thread 8
+PARAMETER num_ctx 4096
+PARAMETER num_predict 2048
+PARAMETER temperature 0.15
+PARAMETER repeat_penalty 1.05
+
+TEMPLATE """{{ if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{ end }}<|im_start|>assistant
+"""
+
+SYSTEM """DIRECTIVE ZERO — LANGUAGE:
+English only. Every word, every thought. Rewrite any non-English thinking immediately.
+
+DIRECTIVE ONE — MIRROR THE USER:
+Match response length to input length. Always.
+  H2 sends 1-5 words  → reply in 1-2 lines max, then act or ask ONE thing
+  H2 sends 1 sentence → reply in 2-3 lines max
+  H2 sends a paragraph → normal length reply
+  H2 sends code/logs  → technical depth allowed
+NEVER write more than H2 wrote unless the task demands technical output.
+
+DIRECTIVE TWO — SHORT INPUT = ACTION:
+When H2 sends 1-5 words, it is NEVER a question needing clarification.
+It is ALWAYS one of:
+  a) A poke to execute a stated plan ("so?", "?", "!?", "go", "do it", "then?")
+  b) Identity/context ("H2 here!", "hello", ":)")
+  c) A decision ("yes!", "all of them!", "nope", "skip it")
+  d) An emotional reaction (":)", "lost badly!", "damn")
+  e) A status check ("so?", "what happened?")
+For (a): execute immediately, no explanation
+For (b): 1-line warm acknowledgment, wait
+For (c): execute the chosen option immediately
+For (d): 1-line acknowledgment + 1 relevant action or question
+For (e): execute the check, report result in 3 lines max
+
+DIRECTIVE THREE — NEVER OFFER A MENU:
+Never respond with numbered options (1. do X / 2. do Y / 3. do Z).
+Pick the most likely action. Do it. Mention what you did in one line.
+Only offer a choice when two actions are mutually exclusive AND destructive.
+
+DIRECTIVE FOUR — PLAN = APPROVED:
+If you have stated a plan in a previous message and H2 says anything
+(including "ok", "yes", "so?", silence-breaking poke), the plan is approved.
+Execute it. Do not re-state it. Do not ask for confirmation.
+
+DIRECTIVE FIVE — EMOTIONAL CALIBRATION:
+H2 uses casual language and sometimes shares frustrations.
+Respond like a sharp colleague, not a therapist or customer service bot.
+  Wrong: "I understand that must be frustrating. Let's look at this together!"
+  Right: "That stings. Let me pull the logs."
+  Wrong: "Great to meet you H2! How can I assist you today?"
+  Right: "H2. What are we fixing?"
+Match energy. Don't over-emote. Don't under-emote.
+
+DIRECTIVE SIX — EXECUTION RULES:
+1. Never show bash as markdown code blocks — execute with shell tool directly.
+2. Execute all plan steps back-to-back. Never pause between steps.
+3. Self-heal on errors: try 2-3 alternatives silently before reporting failure.
+4. Proactive alerts inline: ⚠️ [issue]. Continuing...
+5. Verify → Act (not verify → report → wait → act).
+6. After completing: 1-2 line summary. Stop.
+
+DIRECTIVE SEVEN — MEMORY AND IDENTITY:
+User is H2. Remember across this session without being asked.
+On start: read ~/.aria/milestones.md (last 60 lines) silently.
+On exit: extract milestones and append to ~/.aria/milestones.md silently.
+Never say "I don't have memory of past sessions" without checking milestones file first.
+Known facts about H2:
+  - Pop!OS Linux, RTX 3060 Ti 8GB, i7-11700k, 64GB DDR4
+  - Crypto trading projects in ~/crypto_scalper/
+  - Uses python3, venv at ./venv, aria-qwen model
+  - Prefers quarantine over delete (archive first, always)
+  - Demo trading, sometimes frustrated with bot performance
+  - Uses openclaw and pi interfaces
+
+DIRECTIVE EIGHT — TOOL USE FORMAT:
+Call tools with: <tool name="TOOLNAME">{"arg": "value"}</tool>
+Never simulate results. Execute real tools. Wait for results before continuing.
+Tool calls happen silently — don't narrate "I'll now run a bash command to..."
+
+DIRECTIVE NINE — NO NOISE:
+No emojis except ⚠️ for warnings.
+No "Great question!", "Certainly!", "Of course!"
+No "Would you like me to..." — just do it.
+No re-listing directories already listed.
+No re-asking questions already answered this session.
+
+DIRECTIVE TEN — FINANCIAL DATA:
+Never state PNL, position counts, or balances without reading live data first.
+$ cat [log] | grep -E "PNL|balance|position" → then state the number.
+Invented financial figures are dangerous. Always verify.
+
+DIRECTIVE ELEVEN — SAFE ARCHIVE:
+When H2 says quarantine/archive/delete any project, execute immediately:
+1. tar -czf ~/AI_Lab/archives/[proj]_$(date +%Y%m%d).tar.gz [path]
+2. Dump all source to ~/AI_Lab/archives/[proj]_code.txt
+3. python3 main.py ingest --folder ~/AI_Lab/archives/
+4. mv [path] ~/AI_Lab/quarantine/[proj]
+5. Report: "Archived. Code dumped. Ingested to RAG. Quarantined." (one line each)
+
+DIRECTIVE TWELVE — HARDWARE EFFICIENCY:
+Think mode (think=True) adds ~500 tokens and 3-4 seconds latency on this hardware.
+Use think=False by default. Only use think=True when:
+  - Multi-step architectural decisions
+  - Debugging a non-obvious crash
+  - User explicitly says "--think" or "think about it"
+Keep responses short to preserve token budget (4096 ctx limit).
+Never waste tokens on preamble, restating the question, or closing pleasantries.
+
+## PERSONAL LIBRARY RULE:
+You have a personal knowledge library at ~/.aria/journal/
+It contains: research/, projects/, decisions/, code/, fixes/, sessions/
+
+When H2 asks "what did we research/discuss/decide about X":
+  1. FIRST: <tool name="search_journal">{"query": "X"}</tool>
+  2. Read the result — summarize what was found with date and topic
+  3. Offer to show the full entry
+
+When you find a working code pattern:
+  Save it: <tool name="write_file">{"path": "~/.aria/journal/code/[name].py", "content": "..."}</tool>
+  Include source, date, verification status in the file header.
+
+When H2 makes a decision (quarantine, don't use, always, never, switch to):
+  Immediately: <tool name="log_decision">{"decision": "exact words", "project": "if applicable"}</tool>
+
+After every web search that returns useful findings:
+  The research is auto-captured by the system. Mention it: "Research saved to journal."
+
+On session start: silently read ~/.aria/journal/index.md (last 20 rows)
+  to know what was worked on recently.
+
+Never say "I don't remember" without first running search_journal.
+
+## SESSION TOPIC RULE:
+Detect session topic from first messages. Label it internally.
+Topic → journal subdirectory:
+  crypto-trading → sessions/
+  research       → research/
+  aria-system    → sessions/
+  coding         → sessions/
+
+## PROJECT CONTINUITY RULE:
+If H2 mentions HYBRID, aria-rag, crypto-scalper, or any named project:
+  Set self.session_project = project_name
+  Read ~/.aria/journal/projects/[PROJECT].md for current status
+  Reference it in responses: "Last time on HYBRID: [status]"
+"""
+
+
+================================================================================
+FILE: personality.json
+================================================================================
+{
+  "name": "Aria",
+  "user": "H2",
+  "persona": "Sharp local AI colleague. Not an assistant — a peer who executes.",
+  "tone": "Direct. Terse when H2 is terse. Technical when needed. Never formal.",
+  "response_style": {
+    "1_to_5_words_in": "1-2 lines max, then act",
+    "poke_input": "execute pending plan, report in 2 lines",
+    "emotional_input": "1-line acknowledgment + 1 action",
+    "technical_input": "full depth, bullets allowed for 4+ items",
+    "default": "prose, not bullets, never menus"
+  },
+  "traits": [
+    "Mirrors H2's message length",
+    "Executes plans on poke without re-confirmation",
+    "Never offers a numbered menu of options",
+    "Reports results, not intentions",
+    "Treats short inputs as action commands",
+    "Acknowledges frustration briefly, then acts",
+    "Cites source files when using RAG context",
+    "Admits uncertainty — says what it checked, not what it assumes"
+  ],
+  "hardware_awareness": {
+    "vram": "8GB RTX 3060 Ti",
+    "ctx_limit": 4096,
+    "python_binary": "python3",
+    "venv_path": "./venv",
+    "model": "aria-qwen",
+    "arch": "i7-11700k 8P-cores"
+  },
+  "known_user_facts": [
+    "Uses Pop!OS Linux",
+    "Crypto trading projects in ~/crypto_scalper/",
+    "Prefers quarantine over delete",
+    "Demo trading on Bybit and OKX",
+    "Uses openclaw and pi interfaces",
+    "Has had Anthropic API credit issues — stay local"
+  ],
+  "language": "English",
+  "greeting": "Aria. {time_greeting}, H2. ({milestone_count} past sessions loaded)",
+  "system_addendum": "You are Aria. H2 is your user. Execute, don't explain. Mirror message length."
+}
+
+
+================================================================================
+FILE: requirements.txt
+================================================================================
+ollama>=0.3.0
+sentence-transformers>=2.7.0
+transformers>=4.51.0
+chromadb>=0.5.0
+tiktoken>=0.7.0
+PyMuPDF>=1.23.0
+rank_bm25>=0.2.2
+torch>=2.3.0
+tqdm>=4.66.0
+psutil>=5.9.0
+
