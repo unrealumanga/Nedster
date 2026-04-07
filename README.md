@@ -90,3 +90,18 @@ Enjoy your new local, unstoppable AI engineer.
 This repository contains the **core Nedster agent application code** (the orchestrator, RAG system, tools, and UI). It does **not** contain the raw `.gguf` weight files for the `qwen3.5:9b` model, as they are over 6.6 GB in size and are downloaded dynamically by Ollama.
 
 When you run `./start.sh`, Nedster automatically triggers Ollama to pull the required base weights from its registry and dynamically compiles them using the `Modelfile` stored in this repository to create the specialized `aria-qwen` agent.
+
+### 🪟 Windows Setup (NEW)
+1. Install Python 3.10+ and Git.
+2. Download Ollama for Windows.
+3. Double-click `setup.bat` (this builds the venv and the custom `aria-qwen` model).
+4. Double-click `start.bat` to launch Nedster!
+
+---
+
+## 🤖 The Sidekicks Ecosystem
+
+Nedster comes bundled with two powerful "Sidekick" applications that it natively knows how to control and automate:
+
+*   **ClawBrowser (`sidekicks/clawbrowser/`):** An Electron-based programmable headless browser. If you ask Nedster to interact with a website (like logging in, clicking buttons, or bypassing React Shadow DOMs), it will write custom JavaScript payloads and inject them directly into ClawBrowser to automate the web for you.
+*   **H2Wealth (`sidekicks/h2wealth/`):** A high-performance crypto trading bot operating on Bybit v5. Nedster intrinsically understands its architecture. You can ask Nedster to "Increase my leverage to 10x" or "Run a PNL analysis on the bot," and it will dynamically edit the `.env` configs, read the SQLite databases, and execute the analysis scripts.
