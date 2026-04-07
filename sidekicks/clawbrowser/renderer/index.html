@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClawBrowser</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background-color: #f5f5f7;
+        color: #1d1d1f;
+        height: 100vh;
+        display: flex;
+      }
+
+      .sidebar {
+        width: 80px;
+        background-color: white;
+        border-right: 1px solid #e0e0e0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding-top: 20px;
+        transition: width 0.3s ease;
+      }
+
+      .sidebar:hover {
+        width: 250px;
+      }
+
+      .sidebar:hover .tab-label {
+        opacity: 1;
+      }
+
+      .tab-btn {
+        background: none;
+        border: none;
+        width: 50px;
+        height: 50px;
+        margin: 10px 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 12px;
+        cursor: pointer;
+        transition: background-color 0.2s;
+      }
+
+      .tab-btn:hover {
+        background-color: #f0f0f0;
+      }
+
+      .tab-btn.active {
+        background-color: #0071e3;
+        color: white;
+      }
+
+      .tab-label {
+        margin-left: 10px;
+        font-size: 14px;
+        white-space: nowrap;
+        opacity: 0;
+        transition: opacity 0.2s;
+      }
+
+      .new-tab-btn {
+        margin-top: auto;
+        margin-bottom: 20px;
+        width: 50px;
+        height: 50px;
+        border-radius: 12px;
+        background-color: #f0f0f0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border: none;
+        cursor: pointer;
+      }
+
+      .new-tab-btn:hover {
+        background-color: #e0e0e0;
+      }
+
+      .main-content {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        background-color: white;
+      }
+
+      .toolbar {
+        display: flex;
+        align-items: center;
+        padding: 12px 20px;
+        border-bottom: 1px solid #e0e0e0;
+        background-color: white;
+        gap: 10px;
+      }
+
+      .back-forward-btn {
+        background: none;
+        border: none;
+        width: 36px;
+        height: 36px;
+        border-radius: 8px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+      }
+
+      .back-forward-btn:hover {
+        background-color: #f0f0f0;
+      }
+
+      .address-bar {
+        flex: 1;
+        height: 36px;
+        border: 1px solid #d1d1d6;
+        border-radius: 8px;
+        padding: 0 12px;
+        font-size: 14px;
+        outline: none;
+        transition: border-color 0.2s;
+      }
+
+      .address-bar:focus {
+        border-color: #0071e3;
+      }
+
+      .go-btn {
+        background: none;
+        border: none;
+        width: 36px;
+        height: 36px;
+        border-radius: 8px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        margin-left: 4px;
+      }
+
+      .go-btn:hover {
+        background-color: #f0f0f0;
+      }
+
+      .share-btn {
+        background: none;
+        border: none;
+        width: 36px;
+        height: 36px;
+        border-radius: 8px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        margin-left: 4px;
+      }
+
+      .share-btn:hover {
+        background-color: #f0f0f0;
+      }
+
+      .webview-container {
+        flex: 1;
+        position: relative;
+      }
+
+      webview {
+        width: 100%;
+        height: 100%;
+        border: none;
+      }
+
+      .downloads-panel {
+        position: absolute;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        height: 80px;
+        background-color: white;
+        border-top: 1px solid #e0e0e0;
+        display: flex;
+        align-items: center;
+        padding: 0 20px;
+        gap: 15px;
+        transform: translateY(100%);
+        transition: transform 0.3s ease;
+      }
+
+      .downloads-panel.show {
+        transform: translateY(0);
+      }
+
+      .download-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex: 1;
+      }
+
+      .download-icon {
+        width: 32px;
+        height: 32px;
+        background-color: #f0f0f0;
+        border-radius: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .download-info {
+        flex: 1;
+      }
+
+      .download-filename {
+        font-weight: 500;
+        font-size: 13px;
+      }
+
+      .download-progress {
+        width: 100%;
+        height: 4px;
+        background-color: #f0f0f0;
+        border-radius: 2px;
+        margin-top: 4px;
+        overflow: hidden;
+      }
+
+      .download-progress-fill {
+        height: 100%;
+        background-color: #0071e3;
+        width: 0%;
+        transition: width 0.2s;
+      }
+
+      .download-actions {
+        display: flex;
+        gap: 8px;
+      }
+
+      .action-btn {
+        background: none;
+        border: none;
+        width: 28px;
+        height: 28px;
+        border-radius: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        font-size: 14px;
+      }
+
+      .action-btn:hover {
+        background-color: #f0f0f0;
+      }
+
+      /* Icons using Unicode characters */
+      .icon-arrow-left:before {
+        content: "←";
+      }
+      .icon-arrow-right:before {
+        content: "→";
+      }
+      .icon-reload:before {
+        content: "⟳";
+      }
+      .icon-home:before {
+        content: "🏠";
+      }
+      .icon-plus:before {
+        content: "+";
+      }
+      .icon-share:before {
+        content: "⤳";
+      }
+      .icon-download:before {
+        content: "⬇";
+      }
+      .icon-folder:before {
+        content: "📁";
+      }
+      .icon-trash:before {
+        content: "🗑";
+      }
+    </style>
+  </head>
+  <body>
+    <div class="sidebar">
+      <button class="tab-btn active" id="tab1">
+        <span class="icon-home"></span>
+        <span class="tab-label">Home</span>
+      </button>
+      <button class="tab-btn" id="tab2">
+        <span class="icon-plus"></span>
+        <span class="tab-label">New Tab</span>
+      </button>
+      <button class="tab-btn" id="tab3">
+        <span class="icon-download"></span>
+        <span class="tab-label">Downloads</span>
+      </button>
+      <button class="new-tab-btn" id="new-tab-btn">
+        <span class="icon-plus"></span>
+      </button>
+    </div>
+
+    <div class="main-content">
+      <div class="toolbar">
+        <button class="back-forward-btn" id="back-btn" disabled>
+          <span class="icon-arrow-left"></span>
+        </button>
+        <button class="back-forward-btn" id="forward-btn" disabled>
+          <span class="icon-arrow-right"></span>
+        </button>
+        <input
+          type="text"
+          class="address-bar"
+          id="address-bar"
+          placeholder="Search or enter address"
+        />
+        <button class="go-btn" id="go-btn">
+          <span class="icon-reload"></span>
+        </button>
+        <button class="share-btn" id="share-btn">
+          <span class="icon-share"></span>
+        </button>
+      </div>
+
+      <div class="webview-container">
+        <webview id="webview" src="https://qwant.com"></webview>
+        <div class="downloads-panel" id="downloads-panel">
+          <!-- Download items will be inserted here dynamically -->
+        </div>
+      </div>
+    </div>
+
+    <script>
+      // DOM Elements
+      const webview = document.getElementById("webview");
+      const addressBar = document.getElementById("address-bar");
+      const goBtn = document.getElementById("go-btn");
+      const backBtn = document.getElementById("back-btn");
+      const forwardBtn = document.getElementById("forward-btn");
+      const shareBtn = document.getElementById("share-btn");
+      const downloadsPanel = document.getElementById("downloads-panel");
+      const newTabBtn = document.getElementById("new-tab-btn");
+
+      // Tab elements
+      const tabButtons = document.querySelectorAll(".tab-btn");
+
+      // State
+      let currentTab = 1;
+      let downloads = [];
+
+      // Event Listeners
+      goBtn.addEventListener("click", loadURL);
+      addressBar.addEventListener("keypress", (e) => {
+        if (e.key === "Enter") loadURL();
+      });
+
+      backBtn.addEventListener("click", () => {
+        if (webview.canGoBack()) webview.goBack();
+      });
+
+      forwardBtn.addEventListener("click", () => {
+        if (webview.canGoForward()) webview.goForward();
+      });
+
+      shareBtn.addEventListener("click", () => {
+        // Share functionality would go here
+        alert("Share feature coming soon!");
+      });
+
+      newTabBtn.addEventListener("click", () => {
+        // New tab functionality
+        alert("New tab feature coming soon!");
+      });
+
+      tabButtons.forEach((button) => {
+        button.addEventListener("click", () => {
+          tabButtons.forEach((btn) => btn.classList.remove("active"));
+          button.classList.add("active");
+          // Switch tab logic would go here
+        });
+      });
+
+      // Webview event listeners
+      webview.addEventListener("did-start-loading", () => {
+        goBtn.innerHTML = '<span class="icon-reload"></span>';
+        addressBar.value = webview.getURL() || "";
+        updateNavigationButtons();
+      });
+
+      webview.addEventListener("did-stop-loading", () => {
+        goBtn.innerHTML = '<span class="icon-arrow-left"></span>';
+        addressBar.value = webview.getURL() || "";
+        updateNavigationButtons();
+      });
+
+      webview.addEventListener("did-navigate", () => {
+        addressBar.value = webview.getURL() || "";
+        updateNavigationButtons();
+      });
+
+      webview.addEventListener("new-window", (e) => {
+        // Open links in the same webview instead of new window
+        e.preventDefault();
+        webview.src = e.url;
+      });
+
+      // Download handling
+      webview.addEventListener("will-download", (event) => {
+        event.preventDefault();
+
+        const item = event.detail.item;
+        const downloadInfo = {
+          id: Date.now(),
+          filename: item.getFilename(),
+          url: item.getURL(),
+          state: "progress",
+          progress: 0,
+          item: item,
+        };
+
+        downloads.push(downloadInfo);
+        renderDownloads();
+        showDownloadsPanel();
+
+        item.on("updated", () => {
+          downloadInfo.progress = item.getProgress();
+          downloadInfo.state = item.getState();
+          renderDownloads();
+
+          if (item.getState() === "completed") {
+            setTimeout(() => {
+              downloads = downloads.filter((d) => d.id !== downloadInfo.id);
+              renderDownloads();
+              if (downloads.length === 0) {
+                hideDownloadsPanel();
+              }
+            }, 3000);
+          }
+        });
+
+        item.on("done", (event, state) => {
+          if (state === "completed") {
+            downloadInfo.state = "completed";
+            downloadInfo.progress = 100;
+            renderDownloads();
+          }
+        });
+      });
+
+      // Functions
+      function loadURL() {
+        let url = addressBar.value.trim();
+        if (!url) return;
+
+        // Add protocol if missing
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+          url = "https://" + url;
+        }
+
+        webview.src = url;
+      }
+
+      function updateNavigationButtons() {
+        backBtn.disabled = !webview.canGoBack();
+        forwardBtn.disabled = !webview.canGoForward();
+      }
+
+      function renderDownloads() {
+        downloadsPanel.innerHTML = "";
+
+        if (downloads.length === 0) {
+          hideDownloadsPanel();
+          return;
+        }
+
+        downloads.forEach((download) => {
+          const downloadElement = document.createElement("div");
+          downloadElement.className = "download-item";
+          downloadElement.innerHTML = `
+                    <div class="download-icon">
+                        ${getFileIcon(download.filename)}
+                    </div>
+                    <div class="download-info">
+                        <div class="download-filename">${download.filename}</div>
+                        <div class="download-progress">
+                            <div class="download-progress-fill" style="width: ${download.progress}%"></div>
+                        </div>
+                    </div>
+                    <div class="download-actions">
+                        ${
+                          download.state === "progress"
+                            ? `<button class="action-btn" title="Cancel">✕</button>`
+                            : `<button class="action-btn" title="Show in folder">📁</button>
+                             <button class="action-btn" title="Open">📂</button>`
+                        }
+                    </div>
+                `;
+          downloadsPanel.appendChild(downloadElement);
+        });
+      }
+
+      function showDownloadsPanel() {
+        downloadsPanel.classList.add("show");
+      }
+
+      function hideDownloadsPanel() {
+        downloadsPanel.classList.remove("show");
+      }
+
+      function getFileIcon(filename) {
+        const ext = filename.split(".").pop().toLowerCase();
+        switch (ext) {
+          case "pdf":
+            return "📄";
+          case "jpg":
+          case "jpeg":
+          case "png":
+          case "gif":
+          case "webp":
+            return "🖼";
+          case "mp4":
+          case "mov":
+          case "avi":
+          case "mkv":
+            return "🎥";
+          case "mp3":
+          case "wav":
+          case "flac":
+          case "aac":
+            return "🎵";
+          case "zip":
+          case "rar":
+          case "7z":
+            return "📦";
+          default:
+            return "📎";
+        }
+      }
+
+      // Initialize
+      addressBar.focus();
+    </script>
+  </body>
+</html>
