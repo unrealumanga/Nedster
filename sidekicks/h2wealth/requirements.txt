@@ -1,0 +1,9 @@
+# H2Wealth Dependencies
+aiohttp>=3.9.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+redis>=5.0.0
+textual>=0.52.0
+numpy>=1.26.0
+python-dotenv>=1.0.0
+rich>=13.7.0
