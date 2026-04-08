@@ -57,7 +57,20 @@ def check_ollama():
         return False
 
 
-def print_stats():
+def print_stats(project_dir):
+    import os, json
+    todo_path = os.path.join(str(project_dir), ".nedster_todos.json")
+    if os.path.exists(todo_path):
+        try:
+            with open(todo_path) as f:
+                todos = json.load(f)
+            pending = [t for t in todos if t.get("status") != "completed"]
+            if pending:
+                print(f"\nPending tasks ({len(pending)}):")
+                for t in pending[:5]:
+                    print(f"  [{t.get('status','todo')}] {t.get('content','')[:60]}")
+        except Exception:
+            pass
     """Show VRAM, token budget, tool status."""
     import torch
     import psutil
@@ -699,7 +712,7 @@ def handle_slash_command(cmd: str, agent, project_dir: str, auto: bool, think: b
         tui.print_success("Memory compressed.")
 
     elif command == "/stats":
-        print_stats()
+        print_stats(project_dir)
         tui.print_status(f"Tool stats: {agent.tool_stats}")
 
     elif command == "/auto":

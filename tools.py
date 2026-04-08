@@ -1,3 +1,4 @@
+TOOL_REGISTRY = {}
 import os
 from journal import search_journal, capture_research, log_decision
 from pathlib import Path
@@ -328,15 +329,7 @@ def web_fetch(url: str) -> str:
         return f"Error fetching url: {e}"
 
 
-TOOL_REGISTRY = {
-    "read_file": read_file,
-    "run_bash": run_bash,
-    "list_dir": list_dir,
-    "search_code": search_code,
-    "get_clipboard": get_clipboard,
-    "web_fetch": web_fetch,
-    "search_code": search_code,
-}
+
 
 
 def normalize_tool_args(tool_name: str, args: dict) -> dict:
@@ -408,15 +401,7 @@ def parse_tool_calls(text: str) -> list:
     for cmd in bash_blocks:
         results.append({"name": "run_bash", "args": {"cmd": cmd.strip()}})
         
-    py_blocks = re.findall(r'```python\n(.*?)\n```', text, re.DOTALL)
-    for code in py_blocks:
-        # If it's just os.remove or basic python we could run it, but better to put it in a temp file and execute.
-        # Actually, let's just use run_bash to execute it inline
-        escaped_code = code.replace("'", "'\''")
-        results.append({"name": "run_bash", "args": {"cmd": f"python3 -c '{escaped_code}'"}})
-        
-    if results:
-        return results
+
 
     # Format 2: Broken <parameter=X> format
     pattern2 = re.compile(
@@ -437,15 +422,7 @@ def parse_tool_calls(text: str) -> list:
     for cmd in bash_blocks:
         results.append({"name": "run_bash", "args": {"cmd": cmd.strip()}})
         
-    py_blocks = re.findall(r'```python\n(.*?)\n```', text, re.DOTALL)
-    for code in py_blocks:
-        # If it's just os.remove or basic python we could run it, but better to put it in a temp file and execute.
-        # Actually, let's just use run_bash to execute it inline
-        escaped_code = code.replace("'", "'\''")
-        results.append({"name": "run_bash", "args": {"cmd": f"python3 -c '{escaped_code}'"}})
-        
-    if results:
-        return results
+
 
     # Format 3: tool_call JSON blob
     pattern3 = re.compile(
@@ -1059,7 +1036,6 @@ def market_intel(
     )
 
 
-TOOL_REGISTRY["market_intel"] = market_intel
 
 # ══ TOOL #2: codebase_map ════════════════════════════════════
 
@@ -1220,7 +1196,6 @@ def codebase_map(path: str = ".", max_depth: int = 3, show_sizes: bool = True) -
     )
 
 
-TOOL_REGISTRY["codebase_map"] = codebase_map
 
 # ══ TOOL #3: process_watch ═══════════════════════════════════
 
@@ -1332,7 +1307,6 @@ def process_watch(action: str = "list", name: str = "", signal: str = "status") 
     return f"Unknown action: {action}"
 
 
-TOOL_REGISTRY["process_watch"] = process_watch
 
 # ══ TOOL #4: log_analyzer ════════════════════════════════════
 
@@ -1491,7 +1465,6 @@ def log_analyzer(path: str, mode: str = "auto", tail: int = 200) -> str:
     return "\n".join(str(r) for r in results)
 
 
-TOOL_REGISTRY["log_analyzer"] = log_analyzer
 
 # ══ TOOL #5: code_xray ═══════════════════════════════════════
 
@@ -1580,7 +1553,6 @@ def code_xray(path: str, focus: str = "all") -> str:
     return "\n".join(results)
 
 
-TOOL_REGISTRY["code_xray"] = code_xray
 
 # ══ TOOL #6: multi_edit ══════════════════════════════════════
 
@@ -1699,7 +1671,6 @@ def multi_edit(edits: list, dry_run: bool = False) -> str:
     )
 
 
-TOOL_REGISTRY["multi_edit"] = multi_edit
 
 # ══ TOOL #7: bot_runner ══════════════════════════════════════
 
@@ -1821,7 +1792,6 @@ def bot_runner(
     return f"Unknown action: {action}"
 
 
-TOOL_REGISTRY["bot_runner"] = bot_runner
 
 # ══ TOOL #8: secret_scan ═════════════════════════════════════
 
@@ -1942,7 +1912,6 @@ def secret_scan(path: str = ".", fix: bool = False) -> str:
     return summary
 
 
-TOOL_REGISTRY["secret_scan"] = secret_scan
 
 # ══ TOOL #9: model_bench ═════════════════════════════════════
 
@@ -2041,7 +2010,6 @@ def model_bench(
     return "\n".join(lines)
 
 
-TOOL_REGISTRY["model_bench"] = model_bench
 
 # ══ TOOL #10: context_inject ═════════════════════════════════
 
@@ -2133,23 +2101,9 @@ def context_inject(mode: str = "project", path: str = ".", query: str = "") -> s
     return f"Unknown mode: {mode}"
 
 
-TOOL_REGISTRY["context_inject"] = context_inject
 
 # ══ VERIFY ═══════════════════════════════════════════════════
-NEW_TOOLS = [
-    "market_intel",
-    "codebase_map",
-    "process_watch",
-    "log_analyzer",
-    "code_xray",
-    "multi_edit",
-    "bot_runner",
-    "secret_scan",
-    "model_bench",
-    "context_inject",
-]
-for t in NEW_TOOLS:
-    assert t in TOOL_REGISTRY, f"MISSING from registry: {t}"
+
 
 def scaffold_project(
     path: str,
@@ -2404,17 +2358,97 @@ def todowrite(todos: list) -> str:
     except Exception as e:
         return f"Error updating todo list: {e}"
 
-TOOL_REGISTRY["glob_search"] = glob_search
-TOOL_REGISTRY["grep_search"] = grep_search
-TOOL_REGISTRY["edit_file"] = edit_file
-TOOL_REGISTRY["web_fetch"] = web_fetch
-TOOL_REGISTRY["todowrite"] = todowrite
 
-TOOL_REGISTRY["write_file"] = write_file
-TOOL_REGISTRY["_create_file"] = _create_file
-TOOL_REGISTRY["scaffold_project"] = scaffold_project
-TOOL_REGISTRY["create file"] = write_file
-TOOL_REGISTRY["create_file"] = write_file
-TOOL_REGISTRY["create"] = _create_file
-TOOL_REGISTRY["write"] = write_file
-TOOL_REGISTRY["make_file"] = write_file
+
+
+# SINGLE COMPLETE REGISTRATION (end of file)
+TOOL_REGISTRY.update({
+    "read_file":         read_file,
+    "write_file":        write_file,
+    "_create_file":      _create_file,
+    "create_file":       write_file,
+    "create file":       write_file,
+    "create":            _create_file,
+    "write":             write_file,
+    "make_file":         write_file,
+    "new_file":          write_file,
+    "run_bash":          run_bash,
+    "list_dir":          list_dir,
+    "search_code":       search_code,
+    "get_clipboard":     get_clipboard,
+    "web_fetch":         web_fetch,
+    "scaffold_project":  scaffold_project,
+    "glob_search":       glob_search,
+    "grep_search":       grep_search,
+    "edit_file":         edit_file,
+    "todowrite":         todowrite,
+    "market_intel":      market_intel,
+    "codebase_map":      codebase_map,
+    "process_watch":     process_watch,
+    "log_analyzer":      log_analyzer,
+    "code_xray":         code_xray,
+    "multi_edit":        multi_edit,
+    "bot_runner":        bot_runner,
+    "model_bench":       model_bench,
+})
+
+try:
+    TOOL_REGISTRY["secret_scan"] = secret_scan
+except NameError: pass
+try:
+    TOOL_REGISTRY["context_inject"] = context_inject
+except NameError: pass
+try:
+    TOOL_REGISTRY["tavily_search"] = lambda args: tavily_search(args.get("query",""), args.get("max_results",5))
+    TOOL_REGISTRY["store_tavily_key"] = lambda args: store_tavily_key(args.get("key",""))
+except NameError: pass
+try:
+    TOOL_REGISTRY["duckduckgo_search"] = lambda args: duckduckgo_search(args.get("query",""))
+except NameError: pass
+try:
+    TOOL_REGISTRY["get_crypto_price"] = lambda args: get_crypto_price(args.get("symbol","BTC"), args.get("currency","usd"))
+    TOOL_REGISTRY["read_bot_logs"] = lambda args: read_bot_logs(args.get("bot_name",""), args.get("lines",50))
+except NameError: pass
+try:
+    TOOL_REGISTRY["probe_tools"] = lambda args: str(probe_tools())
+except NameError: pass
+
+try:
+    from git_tools import (git_status, git_diff, git_commit, git_branch, git_stash, git_log)
+    def _git_wrap(fn, *arg_keys):
+        def wrapper(**kwargs):
+            d = kwargs["args"] if len(kwargs)==1 and "args" in kwargs else kwargs
+            return fn(*[_resolve_path(str(d.get(k,"."))) if k=="cwd" else d.get(k,"") for k in arg_keys])
+        return wrapper
+    TOOL_REGISTRY.update({
+        "git_status": _git_wrap(git_status, "cwd"),
+        "git_diff":   _git_wrap(git_diff, "cwd", "file"),
+        "git_commit": _git_wrap(git_commit, "cwd", "message"),
+        "git_branch": _git_wrap(git_branch, "cwd"),
+        "git_stash":  _git_wrap(git_stash, "cwd"),
+        "git_log":    _git_wrap(git_log, "cwd"),
+    })
+except ImportError: pass
+
+try:
+    from code_tools import (run_tests, run_linter, run_formatter, check_syntax, get_project_info)
+    TOOL_REGISTRY.update({
+        "run_tests":      lambda **kw: run_tests(kw.get("cwd",".")),
+        "run_linter":     lambda **kw: run_linter(kw.get("cwd",".")),
+        "run_formatter":  lambda **kw: run_formatter(kw.get("cwd",".")),
+        "check_syntax":   lambda **kw: check_syntax(kw.get("code",""), kw.get("language","python")),
+        "get_project_info": lambda **kw: str(get_project_info(kw.get("cwd","."))),
+    })
+except ImportError: pass
+
+# Ensure SESSION interface
+if not hasattr(SESSION, 'active_project_dir'):
+    SESSION.active_project_dir = SESSION.cwd
+if not hasattr(SESSION, 'set_project'):
+    def _set_project(path: str):
+        import os
+        expanded = os.path.expanduser(str(path))
+        if os.path.isdir(expanded):
+            SESSION.active_project_dir = expanded
+            SESSION.cwd = expanded
+    SESSION.set_project = _set_project
