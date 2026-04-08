@@ -243,6 +243,14 @@ def _get_model_capability(model_name: str) -> str:
 
 
 def cmd_repl(project_dir: str, auto: bool, think: bool):
+
+    print("\033[1;36m")
+    print(" █▄ █ █▀▀ █▀▄ █▀  ▀█▀ █▀▀ █▀▄ ")
+    print(" █ ▀█ █▀▀ █ █ ▄█   █  █▀▀ █▀▄ ")
+    print(" ▀  ▀ ▀▀▀ ▀▀  ▀▀   ▀  ▀▀▀ ▀ ▀ ")
+    print("         \033[38;5;245mUnchained Local AI\033[0m")
+    print("")
+
     """Interactive REPL loop."""
     from agent import NedsterAgent
 

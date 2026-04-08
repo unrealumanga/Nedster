@@ -74,6 +74,12 @@ mkdir -p ~/AI_Lab/quarantine
 touch ~/.aria/milestones.md
 touch ~/.aria/workflows.jsonl
 
+echo -e "\033[1;36m"
+echo " █▄ █ █▀▀ █▀▄ █▀  ▀█▀ █▀▀ █▀▄ "
+echo " █ ▀█ █▀▀ █ █ ▄█   █  █▀▀ █▀▄ "
+echo " ▀  ▀ ▀▀▀ ▀▀  ▀▀   ▀  ▀▀▀ ▀ ▀ "
+echo -e "         \033[38;5;245mUnchained Local AI\033[0m"
+echo ""
 echo "=== Aria RAG Stack Ready ==="
 echo "Flash Attention: $OLLAMA_FLASH_ATTENTION"
 echo "KV Cache: $OLLAMA_KV_CACHE_TYPE"
