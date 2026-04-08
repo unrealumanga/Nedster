@@ -451,19 +451,31 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
             global_skills = ""
             if os.path.exists(skills_dir):
                 import glob
-                skill_files = glob.glob(os.path.join(skills_dir, "**/*.md"), recursive=True)
+                # Prioritize user-created skills over built-in agent skills to prevent overflow
+                user_skills = glob.glob(os.path.join(skills_dir, "user/**/*.md"), recursive=True)
+                other_skills = glob.glob(os.path.join(skills_dir, "*.md"), recursive=False)
+                
+                skill_files = user_skills + other_skills
+                
                 for sf in skill_files:
+                    if len(global_skills) > 4000:  # STRICT CAP: Prevent context overflow
+                        break
                     try:
-                        with open(sf, "r") as f:
+                        with open(sf, "r", encoding="utf-8") as f:
                             content = f.read().strip()
                             if content:
                                 skill_name = os.path.basename(os.path.dirname(sf))
                                 if skill_name == "user" or skill_name == "skills":
                                     skill_name = os.path.basename(sf).replace(".md", "")
-                                global_skills += f"\n--- SKILL: {skill_name} ---\n{content[:1500]}\n"
+                                # Take max 800 chars per skill to fit more
+                                global_skills += f"\n--- SKILL: {skill_name} ---\n{content[:800]}\n"
                     except Exception:
                         pass
+                        
             if global_skills:
+                # Absolute hard cap on the injected string length
+                if len(global_skills) > 5000:
+                    global_skills = global_skills[:5000] + "\n...[Additional skills truncated]"
                 system_prompt += f"\n\n## Global Skills (Learned Capabilities):\n{global_skills}"
 
             # Add NEDSTER.md content
