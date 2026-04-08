@@ -115,6 +115,11 @@ class NedsterTUI:
         auto: bool,
     ) -> None:
         """Print detailed boot screen."""
+        self.console.print("[bold cyan] █▄ █ █▀▀ █▀▄ █▀▀ ▀█▀ █▀▀ █▀▄ [/]")
+        self.console.print("[bold cyan] █ ▀█ █▀▀ █ █ ▀▀█  █  █▀▀ █▀▄ [/]")
+        self.console.print("[bold cyan] ▀  ▀ ▀▀▀ ▀▀  ▀▀▀  ▀  ▀▀▀ ▀ ▀ [/]")
+        self.console.print("         [dim]Unchained Local AI[/]\n")
+
         think_str = "ON" if think else "OFF"
         auto_str = "ON" if auto else "OFF"
 
