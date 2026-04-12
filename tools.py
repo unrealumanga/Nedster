@@ -203,21 +203,33 @@ def read_file(path: str) -> str:
         return sanitize_output(f"Error reading file: {e}")
 
 
-def write_file(path: str, content: str = "") -> str:
+def write_file(path: str, content: str = "", encoding: str = "utf-8", **kwargs) -> str:
     import os
-    path = _resolve_path(str(path))
-    nedster_home = "/home/mnm/AI_Lab/Workspace/Nedster"
-    if not path.startswith(nedster_home):
-        print(f"  [Writing to external path: {path}]")
+    from pathlib import Path
+
+    if not content and "text" in kwargs:
+        content = kwargs["text"]
+
+    p = Path(path)
+    if not p.is_absolute():
+        root = Path(SESSION.active_project_dir or os.getcwd())
+        p = root / path
+
+    home = Path.home()
     try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        if os.path.exists(path):
-            return f"Written: {path} ({os.path.getsize(path)} bytes, {content.count(chr(10))+1} lines)"
-        return f"ERROR: {path} not found after write"
+        p.resolve().relative_to(home.resolve())
+    except ValueError:
+        return f"[BLOCKED] Path outside home: {path}"
+
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding=encoding, errors="replace")
+        if not p.exists():
+            return f"[Error] File not created: {p}"
+        actual_size = p.stat().st_size
+        return f"Written: {p} ({actual_size} bytes, {content.count(chr(10))+1} lines)"
     except Exception as e:
-        return f"ERROR: {e}"
+        return f"[Error] write_file failed: {e}"
 
 def _create_file(path: str, content: str = "", file: str = "") -> str:
     """
@@ -248,32 +260,43 @@ def _create_file(path: str, content: str = "", file: str = "") -> str:
 
 
 
-def run_bash(cmd: str, timeout: int = 15) -> str:
-    import subprocess, os
-    # Expand ~ in command
+def _win_dir_size(cmd: str) -> str:
+    import subprocess
+    path = cmd.split()[-1] if cmd.split() else "."
+    r = subprocess.run(
+        ["powershell", "-Command", f"(Get-ChildItem '{path}' -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1MB"],
+        capture_output=True, text=True, timeout=10)
+    return f"{r.stdout.strip()} MB" if r.returncode == 0 else "N/A"
+
+def _win_list_dir(cmd: str) -> str:
+    import subprocess
+    path = cmd.split()[-1] if len(cmd.split()) > 2 else "."
+    r = subprocess.run(["dir", path], shell=True, capture_output=True, text=True, timeout=5)
+    return r.stdout
+
+def run_bash(cmd: str, timeout: int = 15, **kwargs) -> str:
+    import subprocess, os, sys
+    if sys.platform == "win32":
+        WINDOWS_REDIRECTS = {
+            "tmux new-session": lambda c: bot_runner("start", bot_name=c.split()[-1]),
+            "tmux list-sessions": lambda c: "tmux not available on Win",
+            "tmux kill-session": lambda c: "Use taskkill on Windows.",
+            "du -sh": lambda c: _win_dir_size(c),
+            "ls -la": lambda c: _win_list_dir(c),
+        }
+        for prefix, handler in WINDOWS_REDIRECTS.items():
+            if cmd.strip().startswith(prefix):
+                return handler(cmd)
+    
     cmd = os.path.expanduser(cmd)
     try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True,
-            text=True, timeout=timeout,
-            cwd=SESSION.active_project_dir    # ADD: run in project dir
-        )
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=SESSION.active_project_dir)
         output = result.stdout + result.stderr
-        if len(output) > 3000:
-            output = output[:3000] + "\n...[truncated]"
-        
-        # Always include exit code
-        exit_str = (f"\n[exit code: {result.returncode}]"
-                    if result.returncode != 0
-                    else f"\n[exit 0]")
-        
+        if len(output) > 3000: output = output[:3000] + "\n...[truncated]"
+        exit_str = f"\n[exit code: {result.returncode}]" if result.returncode != 0 else "\n[exit 0]"
         cwd_used = SESSION.active_project_dir or os.getcwd()
         output_with_cwd = f"[cwd: {cwd_used}]\n{output}"
-        
-        # For empty output on success, confirm
-        if not output.strip() and result.returncode == 0:
-            return f"[OK — command ran, no output]{exit_str}"
-        
+        if not output.strip() and result.returncode == 0: return f"[OK — command ran, no output]{exit_str}"
         return output_with_cwd + exit_str
     except subprocess.TimeoutExpired:
         return f"[TIMEOUT after {timeout}s]"
@@ -288,20 +311,48 @@ def list_dir(path: str) -> str:
         return f"Error listing dir: {e}"
 
 
-def search_code(
-    query: str = "", directory: str = ".", pattern: str = "", path: str = ""
-) -> str:
-    actual_query = pattern or query
-    actual_dir = path or directory
-    if not actual_query:
-        return "Error: no search pattern provided"
+def grep_search(pattern: str = "", path: str = ".", query: str = "", directory: str = "", **kwargs) -> str:
+    import re, os
+    from pathlib import Path
 
-    actual_dir = _resolve_path(str(actual_dir))
+    if not pattern and query: pattern = query
+    if not path and directory: path = directory
+    if not pattern: return "[Error] grep_search: pattern required"
+
+    search_root = _resolve_path(path)
+    if not os.path.exists(search_root):
+        search_root = "."
+
+    SKIP_DIRS = {".git", "venv", ".venv", "node_modules", "__pycache__", "chroma_db", "target", "DOOM-3-BFG"}
+    EXTS = (".py",".js",".ts",".go",".rs",".md",".json", ".yaml",".yml",".txt",".sh",".bat",".cfg",".ini")
+
     try:
-        cmd = f"grep -rnw '{actual_dir}' -e '{actual_query}' | head -n 20"
-        return run_bash(cmd)
-    except Exception as e:
-        return f"Error searching code: {e}"
+        pat = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        return f"[Error] Invalid regex: {e}"
+
+    results = []
+    for root, dirs, files in os.walk(search_root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fname in files:
+            if not any(fname.endswith(e) for e in EXTS): continue
+            fpath = os.path.join(root, fname)
+            try:
+                with open(fpath, encoding="utf-8", errors="ignore") as f:
+                    for i, line in enumerate(f, 1):
+                        if pat.search(line):
+                            rel = os.path.relpath(fpath, search_root)
+                            results.append(f"{rel}:{i}: {line.rstrip()}")
+                            if len(results) >= 50: break
+            except Exception: pass
+        if len(results) >= 50: break
+
+    if not results:
+        return f"No matches for '{pattern}' in {search_root}"
+    return "\n".join(results[:50])
+
+def search_code(query: str = "", directory: str = ".", pattern: str = "", path: str = "", **kwargs) -> str:
+    return grep_search(pattern=pattern or query, path=path or directory)
 
 
 def get_clipboard() -> str:
@@ -317,16 +368,34 @@ def get_clipboard() -> str:
         return f"Error reading clipboard: {e}"
 
 
-def web_fetch(url: str) -> str:
+def web_fetch(url: str, format: str = "text", method: str = "GET", **kwargs) -> str:
+    import requests
+    from html.parser import HTMLParser
+
+    if not url.startswith(("http://", "https://")):
+        return f"[Error] Invalid URL: {url}"
+
     try:
-        response = requests.get(url, timeout=5)
-        response.raise_for_status()
-        text = response.text
-        if len(text) > 3000:
-            text = text[:3000] + "\n...[truncated]"
-        return text
+        resp = requests.request(method=method, url=url, timeout=12, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
+        resp.raise_for_status()
+        text = resp.text
+
+        if format in ("markdown", "md"):
+            class Stripper(HTMLParser):
+                parts = []
+                def handle_data(self, d): self.parts.append(d)
+            s = Stripper()
+            s.feed(text)
+            text = " ".join(s.parts)
+        elif format == "json":
+            return text[:4000]
+
+        return text[:4000] + ("\n...[truncated]" if len(text) > 4000 else "")
+    except requests.exceptions.ConnectionError:
+        return f"[Error] Cannot reach {url}. Check network or try a different URL."
     except Exception as e:
-        return f"Error fetching url: {e}"
+        return f"[Error] web_fetch failed: {e}"
+
 
 
 
@@ -1675,125 +1744,55 @@ def multi_edit(edits: list, dry_run: bool = False) -> str:
 # ══ TOOL #7: bot_runner ══════════════════════════════════════
 
 
-def bot_runner(
-    action: str, bot_path: str = "", bot_name: str = "", args: str = ""
-) -> str:
-    """Start, stop, restart, and monitor crypto trading bots."""
-    import subprocess, os, re, time
+
+
+def bot_runner(action: str = "start", bot_path: str = "", bot_name: str = "", **kwargs) -> str:
+    import subprocess, os, sys
     from pathlib import Path
 
-    bot_path = _resolve_path(bot_path) if bot_path else ""
+    if not bot_path and bot_name:
+        for search in [f"sidekicks/{bot_name}/main.py", f"sidekicks/{bot_name}/__main__.py", f"{bot_name}/main.py"]:
+            if Path(search).exists():
+                bot_path = search
+                break
 
-    def _detect_start_cmd(path: str) -> str:
-        p = Path(path)
-        if (p / "start.sh").exists():
-            return f"bash start.sh {args}"
-        if (p / "Makefile").exists():
-            mk = (p / "Makefile").read_text()
-            if "start:" in mk:
-                return f"make start {args}"
-        if (p / "main.py").exists():
-            venv = p / "venv" / "bin" / "python3"
-            py = str(venv) if venv.exists() else "python3"
-            return f"{py} main.py {args}"
-        if (p / "main.go").exists():
-            return f"go run . {args}"
-        if (p / "Cargo.toml").exists():
-            return f"cargo run -- {args}"
-        if (p / "docker-compose.yml").exists():
-            return f"docker-compose up -d {args}"
-        return f"echo 'Cannot detect start command for {path}'"
+    if action == "start":
+        if not bot_path: return "[Error] bot_runner: bot_path required"
+        bot_path_full = Path(bot_path).resolve()
+        if not bot_path_full.exists(): return f"[Error] Bot file not found: {bot_path}"
 
-    if not bot_name and bot_path:
-        bot_name = Path(bot_path).name.upper()[:20]
-
-    def _tmux(cmd: str) -> str:
-        r = subprocess.run(f"tmux {cmd}", shell=True, capture_output=True, text=True)
-        return r.stdout + r.stderr
-
-    if action == "status":
-        r = subprocess.run(
-            [
-                "tmux",
-                "list-sessions",
-                "-F",
-                "#{session_name} #{session_created} #{window_name}",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if r.returncode != 0:
-            return "No tmux sessions running."
-        sessions = r.stdout.strip().split("\n")
-        lines = ["Running bot sessions:"]
-        for s in sessions:
-            parts = s.split()
-            if len(parts) >= 2:
-                name = parts[0]
-                ts = int(parts[1]) if parts[1].isdigit() else 0
-                if ts:
-                    elapsed = int(time.time()) - ts
-                    h, m = divmod(elapsed // 60, 60)
-                    uptime = f"{h}h{m:02d}m"
-                else:
-                    uptime = "?"
-                lines.append(f"  {name:<20} uptime: {uptime}")
-        return "\n".join(lines)
-
-    elif action == "start":
-        if not bot_path:
-            return "Error: bot_path required for start"
-        cmd = _detect_start_cmd(bot_path)
-        _tmux(f"kill-session -t {bot_name} 2>/dev/null")
-        _tmux(f"new-session -d -s {bot_name} -c '{bot_path}' '{cmd}'")
-        time.sleep(1)
-        r = _tmux(f"has-session -t {bot_name}")
-        alive = "error" not in r.lower()
-        return (
-            f"{'Started' if alive else 'FAILED'}: "
-            f"{bot_name}\n"
-            f"  cmd: {cmd}\n"
-            f"  dir: {bot_path}\n"
-            f"  attach: tmux attach -t {bot_name}"
-        )
+        if sys.platform == "win32":
+            cmd = f'start "Nedster-Bot" cmd /k "python {bot_path_full}"'
+            subprocess.Popen(cmd, shell=True, cwd=str(bot_path_full.parent))
+            return f"Started cmd window for: {bot_path_full}"
+        else:
+            try:
+                session = Path(bot_path).stem
+                subprocess.run(["tmux", "new-session", "-d", "-s", session, f"python {bot_path_full}"], check=True)
+                return f"Started tmux session: {session}"
+            except FileNotFoundError:
+                subprocess.Popen(["python", str(bot_path_full)], cwd=str(bot_path_full.parent))
+                return f"Started: {bot_path_full}"
 
     elif action == "stop":
-        if not bot_name:
-            return "Error: bot_name required"
-        _tmux(f"send-keys -t {bot_name} C-c")
-        time.sleep(0.5)
-        _tmux(f"kill-session -t {bot_name}")
-        return f"Stopped: {bot_name}"
+        if sys.platform == "win32":
+            r = subprocess.run(["taskkill", "/FI", "WINDOWTITLE eq Nedster-Bot*", "/T", "/F"], capture_output=True, text=True)
+            return r.stdout or f"Stop command issued for Nedster-Bot windows"
+        else:
+            session = Path(bot_path).stem if bot_path else bot_name
+            r = subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True, text=True)
+            return f"Stopped: {session}"
 
-    elif action == "snapshot":
-        if not bot_name:
-            return "Error: bot_name required"
-        r = subprocess.run(
-            ["tmux", "capture-pane", "-pt", bot_name, "-S", "-50"],
-            capture_output=True,
-            text=True,
-        )
-        if r.returncode != 0:
-            return f"Session {bot_name} not found"
-        return f"=== {bot_name} (last 50 lines) ===\n{r.stdout}"
-
-    elif action == "attach":
-        return f"Run: tmux attach -t {bot_name}"
-
-    elif action == "restart":
-        stop_result = bot_runner("stop", bot_name=bot_name)
-        time.sleep(1)
-        return (
-            stop_result
-            + "\n"
-            + bot_runner("start", bot_path=bot_path, bot_name=bot_name, args=args)
-        )
-
+    elif action in ("status", "list"):
+        if sys.platform == "win32":
+            r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV"], capture_output=True, text=True)
+            lines = [l for l in r.stdout.split("\n") if "python" in l.lower()]
+            return f"Python processes: {len(lines)}\n" + "\n".join(lines[:10])
+        else:
+            r = subprocess.run(["tmux", "list-sessions"], capture_output=True, text=True)
+            return r.stdout or "No tmux sessions"
+    
     return f"Unknown action: {action}"
-
-
-
-# ══ TOOL #8: secret_scan ═════════════════════════════════════
 
 
 def secret_scan(path: str = ".", fix: bool = False) -> str:
@@ -2254,43 +2253,20 @@ TOOL_NAME_ALIASES = {
 
 # Update TOOL_REGISTRY explicitly at the end
 
-def glob_search(pattern: str, path: str = ".") -> str:
-    """Find files by name patterns like **/*.js"""
+def glob_search(pattern: str, path: str = ".", **kwargs) -> str:
     import glob, os
-    actual_path = _resolve_path(str(path))
-    if not os.path.isdir(actual_path):
-        return f"Error: Directory {actual_path} not found"
-        
-    search_pattern = os.path.join(actual_path, pattern)
+    from pathlib import Path
     try:
-        files = glob.glob(search_pattern, recursive=True)
-        files = [f for f in files if os.path.isfile(f)]
-        rel_files = [os.path.relpath(f, SESSION.active_project_dir) for f in files]
-        
-        if not rel_files:
-            return f"No files matched pattern '{pattern}'"
-        
-        return "Matches:\n" + "\n".join(sorted(rel_files)[:50])
+        search_root = Path(_resolve_path(path))
+        if not search_root.exists(): return f"[Error] Path not found: {path}"
+        results = []
+        for file in search_root.rglob(pattern):
+            if file.is_file() and ".git" not in file.parts and "venv" not in file.parts and "node_modules" not in file.parts:
+                results.append(str(file.relative_to(search_root)))
+        if not results: return f"No files matching '{pattern}' in {path}"
+        return "\n".join(results[:100])
     except Exception as e:
-        return f"Error globbing: {e}"
-
-def grep_search(pattern: str, include: str = "*", path: str = ".") -> str:
-    """Fast content search using regex via ripgrep (if available) or basic grep"""
-    import subprocess
-    actual_path = _resolve_path(str(path))
-    has_rg = subprocess.run(["which", "rg"], capture_output=True).returncode == 0
-    
-    try:
-        if has_rg:
-            inc_flag = f"-g '{include}'" if include and include != "*" else ""
-            cmd = f"rg -n {inc_flag} '{pattern}' '{actual_path}' | head -n 50"
-        else:
-            inc_flag = f"--include='{include}'" if include and include != "*" else ""
-            cmd = f"grep -rnE {inc_flag} '{pattern}' '{actual_path}' | head -n 50"
-        
-        return run_bash(cmd)
-    except Exception as e:
-        return f"Error searching: {e}"
+        return f"[Error] glob_search failed: {e}"
 
 def edit_file(path: str, oldString: str, newString: str, replaceAll: bool = False) -> str:
     """Exact string replacement in a file."""
@@ -2319,33 +2295,7 @@ def edit_file(path: str, oldString: str, newString: str, replaceAll: bool = Fals
     except Exception as e:
         return f"Error editing file: {e}"
 
-def web_fetch(url: str, format: str = "markdown") -> str:
-    """Fetch content from a URL and optionally convert to markdown."""
-    import subprocess
-    try:
-        if format == "markdown":
-            res = subprocess.run(["curl", "-s", url], capture_output=True, text=True)
-            html = res.stdout
-            from html.parser import HTMLParser
-            class HTMLFilter(HTMLParser):
-                text = ""
-                def handle_data(self, data):
-                    self.text += data
-            f = HTMLFilter()
-            f.feed(html)
-            text = f.text.strip()
-            
-            if len(text) > 4000:
-                text = text[:4000] + "\n...[truncated]"
-            return text
-        else:
-            res = subprocess.run(["curl", "-s", url], capture_output=True, text=True)
-            text = res.stdout
-            if len(text) > 4000:
-                text = text[:4000] + "\n...[truncated]"
-            return text
-    except Exception as e:
-        return f"Error fetching URL: {e}"
+
         
 def todowrite(todos: list) -> str:
     """Create and manage a structured task list."""
@@ -2374,7 +2324,7 @@ TOOL_REGISTRY.update({
     "new_file":          write_file,
     "run_bash":          run_bash,
     "list_dir":          list_dir,
-    "search_code":       search_code,
+    "search_code":       grep_search,
     "get_clipboard":     get_clipboard,
     "web_fetch":         web_fetch,
     "scaffold_project":  scaffold_project,
@@ -2382,6 +2332,9 @@ TOOL_REGISTRY.update({
     "grep_search":       grep_search,
     "edit_file":         edit_file,
     "todowrite":         todowrite,
+    "workflow":          lambda **kw: __import__('workflows').workflow_tool(**kw),
+    "3d_pipeline":       lambda **kw: __import__('workflows').workflow_tool(**kw),
+
     "market_intel":      market_intel,
     "codebase_map":      codebase_map,
     "process_watch":     process_watch,
@@ -2452,3 +2405,42 @@ if not hasattr(SESSION, 'set_project'):
             SESSION.active_project_dir = expanded
             SESSION.cwd = expanded
     SESSION.set_project = _set_project
+
+
+def todowrite(todos: list, project_dir: str = None, **kwargs) -> str:
+    import json, os
+    from pathlib import Path
+    from datetime import datetime
+
+    if not project_dir: project_dir = SESSION.active_project_dir
+
+    state_path = Path(project_dir) / "nedster_state.json"
+    try:
+        with open(state_path) as f: state = json.load(f)
+    except Exception:
+        state = {"tasks": []}
+
+    existing_by_id = {str(t["id"]): t for t in state.get("tasks", []) if "id" in t}
+    for todo in todos:
+        tid = str(todo.get("id", ""))
+        if not tid: continue
+        if tid in existing_by_id:
+            existing_by_id[tid].update(todo)
+        else:
+            existing_by_id[tid] = {
+                "id": tid,
+                "content": todo.get("content", ""),
+                "status": todo.get("status", "pending"),
+                "verified": todo.get("verified", False),
+                "verify_cmd": todo.get("verify_cmd", ""),
+                "created": datetime.now().isoformat()
+            }
+
+    state["tasks"] = list(existing_by_id.values())
+    with open(state_path, "w") as f:
+        json.dump(state, f, indent=2)
+
+    pending = sum(1 for t in state["tasks"] if t.get("status") == "pending")
+    done = sum(1 for t in state["tasks"] if t.get("status") == "completed")
+    verified = sum(1 for t in state["tasks"] if t.get("verified"))
+    return f"Tasks: {len(state['tasks'])} total, {pending} pending, {done} done, {verified} verified"

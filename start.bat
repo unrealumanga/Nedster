@@ -1,6 +1,46 @@
 @echo off
 setlocal enabledelayedexpansion
 
+REM ── Install mode: adds nedster to PATH ────────────────────
+if "%1"=="--install" goto :install
+if "%1"=="-i"        goto :install
+goto :run
+
+:install
+echo Installing nedster to PATH...
+set "NEDSTER_DIR=%~dp0"
+REM Remove trailing backslash
+set "NEDSTER_DIR=%NEDSTER_DIR:~0,-1%"
+
+REM Create nedster.bat in a permanent location
+set "BIN_DIR=%USERPROFILE%\AppData\Local\nedster-bin"
+if not exist "%BIN_DIR%" mkdir "%BIN_DIR%"
+
+REM Write the launcher
+(
+  echo @echo off
+  echo cd /d "%NEDSTER_DIR%"
+  echo call venv\Scripts\activate.bat
+  echo python nedster.py %%*
+) > "%BIN_DIR%\nedster.bat"
+
+REM Add to user PATH permanently
+for /f "tokens=2*" %%A in ('reg query HKCU\Environment /v PATH 2^>nul') do set "CURPATH=%%B"
+
+echo "%CURPATH%" | findstr /i "%BIN_DIR%" >nul
+if errorlevel 1 (
+    reg add HKCU\Environment /v PATH /d "%CURPATH%;%BIN_DIR%" /f >nul
+    echo Added to PATH: %BIN_DIR%
+    echo.
+    echo IMPORTANT: Open a NEW terminal for 'nedster' to work.
+    echo In new terminal: nedster
+) else (
+    echo Already in PATH.
+)
+goto :eof
+
+:run
+REM ── Normal start ───────────────────────────────────────────
 echo === Aria RAG Stack - Starting (Windows) ===
 
 :: Speed env vars for Ollama
@@ -39,10 +79,10 @@ if not exist "venv\Scripts\activate.bat" (
 )
 
 echo === Aria is ready ===
-echo Run: "call venv\Scripts\activate.bat" and "python main.py chat"
+echo Launching nedster...
 
 :: Automatically start the REPL
 call venv\Scripts\activate.bat
-python main.py chat
+python nedster.py
 
 pause

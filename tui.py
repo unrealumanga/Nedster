@@ -86,6 +86,20 @@ class NedsterTUI:
             self.console.print("\n[Cancelled]", style=self.COLORS["warning"])
             return False
 
+
+    def print_response(self, text: str):
+        """Print agent response, stripping raw tool XML."""
+        import re
+        # Remove tool call blocks — activity feed handles display
+        clean = re.sub(
+            r'<tool\s+name="[^"]*">.*?</tool>\s*',
+            '', text, flags=re.DOTALL)
+        # Remove any trailing whitespace artifacts
+        clean = clean.strip()
+        if clean:
+            self.console.print(clean)
+        # If nothing left to print, print nothing
+
     def print_response_stream(self, chunk: str) -> None:
         """Stream text to console in green."""
         self.console.print(chunk, style=self.COLORS["agent"], end="")

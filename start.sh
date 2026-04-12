@@ -90,4 +90,4 @@ echo "Heartbeat PID: $HEARTBEAT_PID"
 echo "Python: $(which python3)"
 echo ""
 echo "Starting chat..."
-python3 main.py chat
+python3 nedster.py

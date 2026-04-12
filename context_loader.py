@@ -219,15 +219,14 @@ class ContextLoader:
         return '\n\n'.join(blocks)
 
     def read_nedster_md(self) -> str:
-        """Read NEDSTER.md project memory. Return '' if not found."""
-        nedster_path = self.root / 'NEDSTER.md'
-        if nedster_path.exists():
-            try:
-                with open(nedster_path, 'r', encoding='utf-8') as f:
-                    return f.read()
-            except Exception:
-                pass
-        return ''
+        path = self.root / "NEDSTER.md"
+        if not path.exists(): return ""
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        STRIP = ["<|im_", "════", "══ STEP", "I need more context"]
+        for s in STRIP:
+            content = "\n".join(l for l in content.split("\n") if s not in l)
+        return content[:2000].strip()
 
     def update_nedster_md(self, new_facts: str, session_id: str = '') -> None:
         """

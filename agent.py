@@ -1,3 +1,39 @@
+
+class ToolExecutor:
+    """
+    Decoupled tool execution interface.
+    The harness calls tools; the brain sees only tool results.
+    Pattern: Anthropic managed agents brain/hands split.
+    """
+    def __init__(self, registry: dict, auto: bool = False, session_log=None):
+        self.registry = registry
+        self.auto = auto
+        self.session_log = session_log
+        self._budget_remaining = 50
+        self._call_count = 0
+
+    def execute(self, name: str, args: dict, tui=None) -> str:
+        self._call_count += 1
+        self._budget_remaining -= 1
+        if self.session_log:
+            self.session_log.emit("tool_call", {"tool": name, "args": args, "call_n": self._call_count})
+
+        if name not in self.registry:
+            return f"[ERROR: '{name}' unknown. Use write_file to create files.]"
+
+        try:
+            result = self.registry[name](**args)
+            result = str(result)
+        except Exception as e:
+            result = f"[ERROR] {name} failed: {e}"
+
+        if self.session_log:
+            self.session_log.emit("tool_result", {"tool": name, "result": result[:200]})
+        return result
+
+    def budget_exhausted(self) -> bool:
+        return self._budget_remaining <= 0
+
 import os
 
 """Nedster Agent - Core agentic loop extending RAG pipeline"""
@@ -121,11 +157,144 @@ def _detect_tool_refusal(response: str) -> bool:
     return False
 
 
+
+class IterationBudget:
+    def __init__(self, max_iters: int = 10, max_chars: int = 12000):
+        self.max_iters = max_iters
+        self.max_chars = max_chars
+        self._iters = 0
+        self._chars = 0
+    
+    @property
+    def remaining(self) -> int:
+        return max(0, self.max_iters - self._iters)
+    
+    def consume(self, messages: list) -> bool:
+        self._iters += 1
+        self._chars = sum(len(m.get("content","")) for m in messages)
+        return (self._iters <= self.max_iters and self._chars <= self.max_chars)
+    
+    def inject_limit_message(self) -> str:
+        if self._iters >= self.max_iters:
+            return "\n[TOOL LIMIT: Stop calling tools. Summarize what you found and answer directly.]"
+        return "\n[CONTEXT LIMIT: Stop calling tools. Summarize what you found and answer directly.]"
+
+class PluginHooks:
+    def __init__(self):
+        self._hooks = {
+            "pre_llm_call": [],
+            "post_llm_call": [],
+            "on_session_start": [],
+            "on_session_end": [],
+            "on_tool_result": [],
+        }
+        self._load_plugins()
+    
+    def _load_plugins(self):
+        import os, importlib.util, glob
+        plugin_dir = os.path.expanduser("~/.aria/plugins")
+        os.makedirs(plugin_dir, exist_ok=True)
+        for path in glob.glob(os.path.join(plugin_dir, "*.py")):
+            try:
+                spec = importlib.util.spec_from_file_location("plugin", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                for hook in self._hooks:
+                    if hasattr(mod, hook):
+                        self._hooks[hook].append(getattr(mod, hook))
+            except Exception as e:
+                print(f"[Plugin] {path}: {e}")
+    
+    def fire(self, hook: str, **kwargs):
+        for fn in self._hooks.get(hook, []):
+            try: fn(**kwargs)
+            except Exception: pass
+
+
 class NedsterAgent:
+
+    def _update_state(self, key: str, value):
+        import json
+        from pathlib import Path
+        from datetime import datetime
+        state_path = Path(self.project_dir) / "nedster_state.json"
+        try:
+            with open(state_path) as f: state = json.load(f)
+        except Exception:
+            state = {
+                "project": str(self.project_dir),
+                "model": self.model,
+                "created": datetime.now().isoformat(),
+                "tasks": [], "artifacts": [], "milestones": [], "context": {}
+            }
+        
+        if key == "task":
+            existing = next((t for t in state["tasks"] if t.get("id") == value.get("id")), None)
+            if existing: existing.update(value)
+            else: state["tasks"].append(value)
+        elif key == "artifact":
+            state["artifacts"].append({**value, "created": datetime.now().isoformat()})
+        elif key == "milestone":
+            state["milestones"].append({"text": value, "ts": datetime.now().isoformat()})
+        else:
+            state["context"][key] = value
+
+        state["updated"] = datetime.now().isoformat()
+        with open(state_path, "w") as f: json.dump(state, f, indent=2)
+
+    def _read_state(self) -> dict:
+        import json
+        from pathlib import Path
+        state_path = Path(self.project_dir) / "nedster_state.json"
+        try:
+            with open(state_path) as f: return json.load(f)
+        except Exception:
+            ned_path = Path(self.project_dir) / "NEDSTER.md"
+            if ned_path.exists():
+                with open(ned_path) as f:
+                    return {"context": {"nedster_md": f.read()}}
+            return {}
+
     """
     NedsterAgent - Local coding agent with RAG, context awareness, and tool use.
     Extends the Aria RAG pipeline with project context and code editing.
     """
+
+
+    def build_system_prompt(self, tool_use_enabled: bool = True, model_tier: str = "★★★") -> str:
+        if model_tier == "★☆☆":
+            return (
+                "You are Nedster, a helpful local AI assistant for H2. "
+                "Answer questions directly and concisely. "
+                "You are in chat-only mode — no file operations. "
+                "Keep responses under 5 sentences. "
+                "Never output XML tags. Never output [YOU ARE NEDSTER]."
+            )
+        
+        soul_context = self._load_soul_files()
+        system_prompt = soul_context + "\n\n" + self.NEDSTER_SYSTEM_PROMPT
+        
+        from tools import SESSION
+        PLATFORM_INJECTION = f"""
+Platform: {SESSION.platform}
+Shell: {"cmd.exe / PowerShell" if SESSION.platform == "windows" else "bash"}
+"""
+        system_prompt += "\n" + PLATFORM_INJECTION
+        
+        ANTI_MENU_INJECTION = """
+RESPONSE RULES — ABSOLUTE:
+1. After using tools: give a 1-2 sentence result summary. STOP.
+   Bad:  [runs scaffold_project then says nothing]
+   Good: "Scaffolded great-zip/ with Cargo.toml and src/main.rs."
+2. NEVER output "What would you like to do?" — just stop.
+3. NEVER show numbered menus like "1. Read  2. Modify  3. Add"
+4. NEVER narrate tool use: don't say "Let me check..." — just check.
+5. Short user input = short response. "done?" = yes/no + 1 line.
+6. The activity feed shows tool calls. Don't repeat them in text.
+"""
+        system_prompt = ANTI_MENU_INJECTION + "\n" + system_prompt
+        
+        return system_prompt
 
     NEDSTER_SYSTEM_PROMPT = """DIRECTIVE ZERO — LANGUAGE:
 English only. Every word, every thought.
@@ -221,6 +390,12 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
         from tools import SESSION
 
         SESSION.set_project(project_dir)
+
+        import sys, platform
+        from tools import SESSION
+        SESSION.platform = "windows" if sys.platform == "win32" else "linux"
+        SESSION.platform_note = "Windows 10 — no tmux, use tasklist/taskkill, paths use backslash" if SESSION.platform == "windows" else "Linux/Pop!OS — tmux available, bash available"
+
         self.project_dir = project_dir
         self.auto = auto
         self.think = think
@@ -232,6 +407,11 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
         self.retriever = Retriever()
         self.memory = MemoryManager(self.model)
         self.tui = NedsterTUI()
+        self.hooks = PluginHooks()
+        from memory import SessionLog
+        from tools import TOOL_REGISTRY
+        self.session_log = SessionLog(self.memory.session_id)
+        self.executor = ToolExecutor(TOOL_REGISTRY, auto=self.auto, session_log=self.session_log)
 
         self.tool_stats = {"calls": 0, "loops": 0, "edits": 0, "tests": 0}
         self.pending_plan: Optional[str] = None
@@ -329,6 +509,161 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
         if nedster_md:
             self.tui.print_status("Project memory: NEDSTER.md loaded")
 
+        from daemon import read_pending_alerts
+        alerts = read_pending_alerts()
+        if alerts:
+            urgent = [a for a in alerts if a.get("priority")=="urgent"]
+            normal = [a for a in alerts if a.get("priority") != "urgent"]
+            if urgent:
+                for a in urgent: self.tui.print_warning(f"[{a['daemon'].upper()}] {a['message']}")
+            if normal:
+                self.tui.print_status(f"{len(normal)} daemon alerts (run /daemon to view)")
+
+        # Ingest queue pickup
+        from pathlib import Path
+        import json
+        queue_path = Path.home() / ".aria" / "ingest_queue.json"
+        if queue_path.exists():
+            try:
+                with open(queue_path) as f:
+                    queue = json.load(f)
+                if queue:
+                    self.tui.print_status(f"[file-watch] {len(queue)} files queued for RAG ingest — processing...")
+                    for fpath in queue[:10]:
+                        if os.path.exists(fpath):
+                            try:
+                                from ingestion import get_text_from_file, chunk_text, embed_file_chunks
+                                import chromadb
+                                client = chromadb.PersistentClient(path="./chroma_db")
+                                coll = client.get_or_create_collection("rag_docs")
+                                text = get_text_from_file(fpath)
+                                if text:
+                                    chunks = chunk_text(text, fpath)
+                                    embed_file_chunks(chunks, self.retriever.embedder, coll, os.path.basename(fpath))
+                            except Exception: pass
+                    queue_path.unlink()
+            except Exception: pass
+
+
+
+    def _load_soul_files(self) -> str:
+        import os, glob
+        soul_dir = os.path.expanduser("~/.aria/soul")
+        if not os.path.exists(soul_dir):
+            os.makedirs(soul_dir)
+            self._write_default_soul_files(soul_dir)
+        
+        parts = []
+        for fname in ["SOUL.md", "STYLE.md", "TOOLS.md", "HEARTBEAT.md", "SECURITY.md"]:
+            fpath = os.path.join(soul_dir, fname)
+            if os.path.exists(fpath):
+                with open(fpath) as f:
+                    content = f.read().strip()
+                if content:
+                    parts.append(f"[{fname}]\n{content}")
+        
+        mem_path = os.path.join(soul_dir, "MEMORY.md")
+        if os.path.exists(mem_path):
+            with open(mem_path) as f:
+                lines = f.readlines()
+            recent = "".join(lines[-40:]).strip()
+            if recent:
+                parts.append(f"[MEMORY.md - recent]\n{recent}")
+        
+        ref_dir = os.path.join(soul_dir, "REFLECTIONS")
+        if os.path.exists(ref_dir):
+            ref_files = sorted(glob.glob(os.path.join(ref_dir, "*.md")), key=os.path.getmtime, reverse=True)[:2]
+            for rf in ref_files:
+                with open(rf) as f:
+                    content = f.read().strip()
+                if content:
+                    fname = os.path.basename(rf)
+                    parts.append(f"[REFLECTIONS/{fname}]\n{content[:300]}")
+        
+        combined = "\n\n".join(parts)
+        if len(combined) > 3200:
+            combined = combined[:3200] + "\n...[soul truncated]"
+        return combined
+
+    def _write_default_soul_files(self, soul_dir: str):
+        import os
+        os.makedirs(os.path.join(soul_dir, "REFLECTIONS"), exist_ok=True)
+        
+        files = {
+            "SOUL.md": "# Nedster Soul\n## Identity\nYou are Nedster (codename: Aria). A local coding agent for H2.\nYou run ON the aria-qwen model (qwen3.5:9b with custom Modelfile).\n\"Nedster\" = the harness + persona. \"aria-qwen\" = the model you run on.\nThese are NOT different entities. You are Nedster, powered by aria-qwen.\n\n## Platform\nRunning on: Windows 10, RTX 3060 Ti 8GB (or MaxQ GTX 1080 8GB laptop).\nTools run via Windows CMD/PowerShell — no tmux, no Linux grep, no /home paths.\nWindows paths use backslash: C:\\Users\\hethu\\Nedster\\\nHome dir: C:\\Users\\hethu\\\nProject root: wherever nedster.py is running from (os.getcwd()).\n\n## Hardware\nOllama at localhost:11434\nChromaDB at ./chroma_db\nPython venv at ./venv\n\n## Core Character\nSharp, direct, local. Execute — don't explain. Mirror H2's length.\nNEVER say \"I'm Nedster. Aria is a different model.\" — Aria IS Nedster.\nNEVER say \"Aira is not a recognized entity\" — Aria is your name.\nNEVER say \"I don't have filesystem access\" — you have write_file.",
+            "STYLE.md": "# Nedster Style\n## Response Format\nMatch H2 message length exactly",
+            "TOOLS.md": "# Nedster Tools\n## Available Tools...",
+            "SECURITY.md": "# Nedster Security Rules\n## HARD RULES...",
+            "HEARTBEAT.md": "# Nedster Heartbeat Behaviors\n## Daemon Check Intervals...",
+        }
+        for fname, content in files.items():
+            fpath = os.path.join(soul_dir, fname)
+            if not os.path.exists(fpath):
+                with open(fpath, "w") as f: f.write(content)
+        
+        ref_path = os.path.join(soul_dir, "REFLECTIONS", "tool-amnesia.md")
+        if not os.path.exists(ref_path):
+            with open(ref_path, "w") as f:
+                f.write("## 2026-04-12\nDrift detected. Recovering.")
+
+    def _append_reflection(self, theme: str, content: str):
+        import os
+        from datetime import datetime
+        ref_dir = os.path.expanduser("~/.aria/soul/REFLECTIONS")
+        os.makedirs(ref_dir, exist_ok=True)
+        path = os.path.join(ref_dir, f"{theme}.md")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"\n## {datetime.now().strftime('%Y-%m-%d %H:%M')}\n{content}\n")
+
+    def _is_complex_task(self, user_input: str) -> bool:
+        COMPLEX_SIGNALS = ["build", "create a", "implement", "scaffold", "write a bot", "make a", "develop", "set up", "build me", "new project", "trading bot", "full stack", "microservice", "new folder"]
+        lower = user_input.lower()
+        return (any(s in lower for s in COMPLEX_SIGNALS) and len(user_input.split()) > 8)
+
+    def _plan_phase(self, user_input: str) -> list:
+        resp = ollama.generate(
+            model=self.model,
+            prompt=(
+                f"Break this into 3-5 concrete steps. "
+                f"Each step = one tool call action. Be specific.\n"
+                f"Task: {user_input}\n\n"
+                f"Format: 1. [tool] specific action\n"
+                f"Output ONLY the numbered list. No preamble."
+            ),
+            options={"num_ctx": 1024, "num_predict": 200, "temperature": 0.1}
+        )
+        plan_text = resp["response"].strip()
+        steps = [l.strip() for l in plan_text.split("\n") if l.strip() and l.strip()[0].isdigit()]
+        if not steps: steps = [plan_text]
+        todos = [{"id": str(i+1), "content": s, "status": "pending"} for i, s in enumerate(steps)]
+        from tools import todowrite
+        todowrite(todos)
+        return steps
+
+    def _verify_phase(self, steps: list, tool_results: str) -> str:
+        import re, os
+        checks = []
+        PATH_RE = re.compile(r'(/home/[\w/\-_.]+\.\w+|~/[\w/\-_.]+\.\w+|[A-Za-z]:\\[\w/\\\-_.]+\.\w+)')
+        for i, step in enumerate(steps):
+            for path in PATH_RE.findall(step):
+                expanded = os.path.expanduser(path)
+                if os.path.exists(expanded):
+                    checks.append(f"  ✓ {path}")
+                    self._update_state("task", {
+                        "id": str(i+1),
+                        "status": "completed",
+                        "verified": True,
+                        "verify_method": "file_exists",
+                        "verified_path": expanded
+                    })
+                elif any(s in tool_results for s in ["Written:", "Created:", "[exit 0]"]):
+                    checks.append(f"  ~ {path} (in tool output)")
+                else:
+                    checks.append(f"  ✗ {path} — NOT found on disk")
+        if not checks:
+            return "Verify: no file paths to check."
+        return "Verify:\n" + "\n".join(checks)
+
     def _get_model_size(self, model: str) -> float:
         import subprocess
 
@@ -344,6 +679,7 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
         return 0.0
 
     def generate(self, user_input: str, think: Optional[bool] = None):
+        from tools import SESSION
         """
         Full agentic loop for a single user input.
         """
@@ -379,11 +715,11 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
 
                     new_proj = pathlib.Path(expanded).resolve()
                     if str(new_proj) != str(self.project_dir):
-                        from tools import SESSION
+                        # from tools import SESSION
 
                         SESSION.set_project(str(new_proj))
                         self.project_dir = str(new_proj)
-                        self.context_loader.project_root = new_proj
+                        self.context_loader.root = new_proj
                         self.editor.project_dir = new_proj
                         self.context_loader.scan_project()
                         self.tui.print_status(f"Auto-project: {new_proj.name}")
@@ -444,110 +780,17 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
                 context_block = self.context_loader.build_context_block(files)
 
             # Phase 3 - PROMPT ASSEMBLY
-            system_prompt = self.NEDSTER_SYSTEM_PROMPT
+            
+            model_tier = '★★★'
+            if getattr(self, 'tool_use_enabled', True) == False:
+                model_tier = '★☆☆'
 
-            # Load Global Skills (Self-Taught)
-            skills_dir = os.path.expanduser("~/.agents/skills/")
-            global_skills = ""
-            if os.path.exists(skills_dir):
-                import glob
-                # Prioritize user-created skills over built-in agent skills to prevent overflow
-                user_skills = glob.glob(os.path.join(skills_dir, "user/**/*.md"), recursive=True)
-                other_skills = glob.glob(os.path.join(skills_dir, "*.md"), recursive=False)
-                
-                skill_files = user_skills + other_skills
-                
-                for sf in skill_files:
-                    if len(global_skills) > 4000:  # STRICT CAP: Prevent context overflow
-                        break
-                    try:
-                        with open(sf, "r", encoding="utf-8") as f:
-                            content = f.read().strip()
-                            if content:
-                                skill_name = os.path.basename(os.path.dirname(sf))
-                                if skill_name == "user" or skill_name == "skills":
-                                    skill_name = os.path.basename(sf).replace(".md", "")
-                                # Take max 800 chars per skill to fit more
-                                global_skills += f"\n--- SKILL: {skill_name} ---\n{content[:800]}\n"
-                    except Exception:
-                        pass
-                        
-            if global_skills:
-                # Absolute hard cap on the injected string length
-                if len(global_skills) > 5000:
-                    global_skills = global_skills[:5000] + "\n...[Additional skills truncated]"
-                system_prompt += f"\n\n## Global Skills (Learned Capabilities):\n{global_skills}"
+            system_prompt = self.build_system_prompt(tool_use_enabled=getattr(self, 'tool_use_enabled', True), model_tier=model_tier)
 
-            # Add NEDSTER.md content
-            nedster_md = self.context_loader.read_nedster_md()
-            if nedster_md:
-                system_prompt += f"\n\n## Project Memory:\n{nedster_md[:2000]}"
+            # system_prompt = ANTI_MENU_INJECTION (moved to build_system_prompt)
 
-            # Add tool inventory
-            tool_list = "\n".join(f"  - {name}" for name in TOOL_REGISTRY.keys())
-            system_prompt += f"\n\n## Available Tools:\n{tool_list}"
-
-            POWER_TOOLS = """
-POWER TOOLS — use these before brute-force exploration:
-
-  context_inject(mode="project", path=X)
-    → Call FIRST when switching to any project directory.
-      Gives you full architecture in one call.
-      Replaces 10+ list_dir + read_file calls.
-
-  context_inject(mode="task", path=X, query="your task")
-    → Call before starting any coding task.
-      Finds the most relevant files automatically.
-
-  context_inject(mode="bot", path=X)
-    → Call when H2 mentions a trading bot.
-      Gives structure + log summary in one call.
-
-  codebase_map(path=X)
-    → Full project tree + language stats + entry points.
-
-  code_xray(path="file.py", focus="security")
-    → Deep analysis without reading raw file.
-      Use instead of read_file for files > 100 lines.
-
-  log_analyzer(path=X, mode="pnl")
-    → Extract PNL/win-rate from trading bot logs.
-      Use instead of read_file on .log files.
-
-  market_intel(symbol="BTC", depth=True)
-    → Real-time price, funding, OI, orderbook.
-      No API key needed. Replaces get_crypto_price.
-
-  multi_edit(edits=[...])
-    → Apply multiple file changes atomically.
-      Replaces multiple write_file calls with rollback.
-
-  process_watch(action="status")
-    → See all running bots + VRAM consumers at once.
-
-  bot_runner(action="start", bot_path=X)
-    → Launch any bot in tmux. Survives terminal close.
-
-  model_bench(model="qwen3.5:9b")
-    → Measure tok/sec before recommending a model switch.
-
-  secret_scan(path=X)
-    → Scan for exposed credentials before any commit.
-"""
-            system_prompt += "\n" + POWER_TOOLS
-
-            ANCHOR = """
-[ACTIVE DIRECTIVES REMINDER]
-- English only. Mirror H2 message length.
-- No emojis except ⚠️. No numbered menus. No "Great question!"
-- Short input = action command. Execute, don't explain.
-- Emit <edit> or <tool> blocks for ALL file/code changes.
-- You are Nedster. H2 is your user.
-"""
-            system_prompt += "\n" + ANCHOR
-
-            # Build messages
             messages = [{"role": "system", "content": system_prompt}]
+            self.hooks.fire("pre_llm_call", messages=messages, user_input=user_input)
 
             # Inject anchor every 8 turns as a system-role message refresh
             if self.memory.turn_count > 0 and self.memory.turn_count % 8 == 0:
@@ -596,6 +839,20 @@ POWER TOOLS — use these before brute-force exploration:
 
             # Phase 4 - GENERATE (streaming)
             full_response = self._stream_generate(messages, think=think_enabled)
+
+            if getattr(self, 'ralph_enabled', False):
+                from ralph import ralph_check
+                check = ralph_check(full_response)
+                if check["action"] == "RESTART":
+                    self.tui.print_status("[Ralph] RESTART — clearing context and retrying", "bold red")
+                    self.memory.clear()
+                    self.memory.session_summary = ""
+                    full_response = self._stream_generate(messages[-4:], think=think_enabled)
+                elif check["action"] == "INJECT":
+                    self.tui.print_status(f"[Ralph] INJECT — {check['message'][:60]}", "bold yellow")
+                    messages.append({"role": "user", "content": check["message"]})
+                    full_response = self._stream_generate(messages, think=think_enabled)
+
 
             if _detect_tool_refusal(full_response):
                 self.tui.print_status(
@@ -867,6 +1124,47 @@ EXECUTE using the tool format above. RIGHT NOW.
 
         return "question"
 
+
+
+    def _detect_streaming_loop(self, accumulated: str) -> bool:
+        _LOOP_CHAR_THRESH = 30
+        _LOOP_PHRASE_THRESH = 3
+        if len(accumulated) < 20: return False
+
+        tail = accumulated[-_LOOP_CHAR_THRESH:]
+        if len(set(tail[::2])) <= 2: return True
+
+        chunks = [accumulated[i:i+40].strip() for i in range(0, len(accumulated)-40, 40)]
+        if len(chunks) >= _LOOP_PHRASE_THRESH:
+            from collections import Counter
+            counts = Counter(chunks)
+            most_common_count = counts.most_common(1)[0][1]
+            if most_common_count >= _LOOP_PHRASE_THRESH: return True
+
+        words = accumulated.split()
+        if len(words) > 15:
+            recent_10 = words[-10:]
+            if len(set(recent_10)) <= 3: return True
+
+        return False
+
+    def _strip_weak_model_artifacts(self, text: str) -> str:
+        import re
+        text = re.sub(r'<tool\s+name="[^"]*">.*?</tool>', '', text, flags=re.DOTALL)
+        text = re.sub(r'\[YOU ARE NEDSTER\..*?\]', '', text, flags=re.DOTALL)
+        text = re.sub(r'YOU ARE NEDSTER[.,].*?(?=\n|$)', '', text, flags=re.MULTILINE)
+        text = re.sub(r'={3,}\s*FILE:.*?={3,}', '', text, flags=re.DOTALL)
+        text = re.sub(r'\*\*Final response:\*\*\s*', '', text)
+        text = re.sub(r'\*\*Final reply:\*\*\s*', '', text)
+        text = re.sub(r'```\s*$', '', text)
+        return text.strip()
+
+        tail = accumulated[-_REPEAT_THRESHOLD:]
+        if len(set(tail[::2])) <= 2: return True
+        words = accumulated.split()[-20:]
+        if len(words) > 10 and len(set(words)) <= 2: return True
+        return False
+
     def _stream_generate(self, messages: List[dict], think: bool = False) -> str:
         """
         Generate response with streaming output.
@@ -1002,7 +1300,97 @@ EXECUTE using the tool format above. RIGHT NOW.
         if size_gb > 0:
             self.model_size_gb = size_gb
 
+        full_response = self._strip_weak_model_artifacts(full_response)
         return full_response
+
+
+    def _extract_prose(self, text: str) -> str:
+        """Return only the non-tool-call text from a response."""
+        import re
+        cleaned = re.sub(r'<tool\s+name="[^"]*">.*?</tool>', '', text, flags=re.DOTALL)
+        cleaned = re.sub(r'<!--.*?-->', '', cleaned, flags=re.DOTALL)
+        return cleaned.strip()
+
+    def _needs_summary(self, response: str, tool_results: str) -> bool:
+        """
+        Returns True when the model ran tools but gave no prose reply.
+        This is the 'silent scaffolding' bug.
+        """
+        prose = self._extract_prose(response)
+        has_tool_calls = '<tool name=' in response
+        meaningful_prose = len([c for c in prose if c.isalpha()]) > 15
+        return has_tool_calls and not meaningful_prose
+
+    def _generate_summary(self, user_input: str, tool_results: str) -> str:
+        """
+        Generate a short completion summary when the agent
+        ran tools but produced no natural language response.
+        Uses a tight 200-token budget — just enough for a summary.
+        """
+        import ollama
+        import re
+        files_mentioned = re.findall(r'(?:Written|Created|Read):\s*([^\s\(]+)', tool_results)
+        files_str = (", ".join(files_mentioned[:5]) if files_mentioned else "")
+
+        summary_prompt = (
+            f"Task was: {user_input[:100]}\n\n"
+            f"Tool results summary:\n{tool_results[:600]}\n\n"
+            f"In 1-3 lines, state what was done. "
+            f"{'Files: ' + files_str + '. ' if files_str else ''}"
+            f"Be direct. No bullet lists. No questions. "
+            f"No 'What would you like to do next?'"
+        )
+
+        try:
+            resp = ollama.generate(
+                model=self.model,
+                prompt=summary_prompt,
+                options={
+                    "num_ctx": 1024,
+                    "num_predict": 120,
+                    "temperature": 0.1,
+                    "think": False,
+                }
+            )
+            summary = resp.get("response", "").strip()
+            summary = self._extract_prose(summary)
+            return summary if len(summary) > 5 else "Done."
+        except Exception:
+            return "Done."
+
+    def _assess_response_quality(self, response: str, tool_results: str) -> str:
+        """
+        Detect and fix low-quality responses.
+        Returns improved response or original if quality is OK.
+        """
+        import re
+        prose = self._extract_prose(response)
+
+        NARRATION_PATTERNS = [
+            r"I(?:\\'m| am) (?:now |going to |about to )?(?:reading|checking|looking|scanning|running)",
+            r"Let me (?:read|check|look|scan|run|examine)",
+            r"I(?:\\'ll| will) (?:read|check|look|scan|run)",
+            r"\n\s*\d+\.\s+\*\*[A-Z][^*]+\*\*\s*[-—]\s*",
+            r"What (?:specific|would you like|aspect|functionality)",
+            r"What would you like (?:me to|to)",
+            r"I can help you with:",
+            r"Here's (?:what I can|a comprehensive overview)",
+        ]
+        COMPLETION_PATTERNS = [
+            r"(?:scaffold|project) (?:created|initialized|ready)",
+            r"Written:\s+\S+",
+            r"\d+ files? (?:created|written)",
+            r"cargo init",
+            r"\[exit 0\]",
+        ]
+
+        is_narrating = any(re.search(p, prose, re.IGNORECASE) for p in NARRATION_PATTERNS)
+        task_done = any(re.search(p, tool_results, re.IGNORECASE) for p in COMPLETION_PATTERNS)
+
+        if is_narrating and task_done:
+            return self._generate_summary(self.memory.short_term[-1]["content"] if self.memory.short_term else "", tool_results)
+
+        return response
 
     def _execute_response(
         self, response: str, messages: List[dict], think: bool, user_input: str
@@ -1011,20 +1399,20 @@ EXECUTE using the tool format above. RIGHT NOW.
         Parse and execute tool calls and edit blocks.
         Max 3 iterations.
         """
-        max_iterations = 15
-        iteration = 0
+
+        budget = IterationBudget(max_iters=10, max_chars=12000)
         final_response = response
         seen_tool_calls = set()
         applied_edits = []
-
         WATCHDOG.start()
         try:
             tool_loops = 0
-            while iteration < max_iterations:
-                iteration += 1
+            while budget.remaining > 0:
+                iteration = budget._iters + 1
                 tool_loops += 1
                 self.tool_stats["loops"] += 1
                 _seen_this_iteration = set()
+
 
                 # Parse edit blocks
                 edits = self.editor.parse_edit_blocks(response)
@@ -1050,7 +1438,7 @@ EXECUTE using the tool format above. RIGHT NOW.
 
                     # Auto-check syntax for Python files
                     if edit.get("path", "").endswith(".py"):
-                        syntax_result = self._check_file_syntax(edit.get("path"))
+                        syntax_result = self._check_file_syntax(str(edit.get("path", "")))
                         if syntax_result != "OK":
                             self.tui.print_warning(f"Syntax issue: {syntax_result}")
 
@@ -1127,65 +1515,7 @@ EXECUTE using the tool format above. RIGHT NOW.
                                     max_workers=4
                                 )
 
-                            func = TOOL_REGISTRY[tool_name]
-
-                            def wrapper(f=func, a=args):
-                                try:
-                                    return f(**a)
-                                except TypeError:
-                                    return f(a)
-
-                            future = ex.submit(wrapper)
-                            futures[future] = tool_name
-                        else:
-                            # Sequential execution for non-safe tools
-                            try:
-                                func = TOOL_REGISTRY[tool_name]
-                                try:
-                                    result = func(**args)
-                                except TypeError:
-                                    result = func(args)
-
-                                self.tui.print_tool_result(
-                                    tool_name, result, verbose=self.verbose
-                                )
-
-                                self.tool_stats["calls"] += 1
-                                tool_msg_accumulator += (
-                                    f"[Tool result: {tool_name}]\n{result}\n\n"
-                                )
-
-                                VERIFY_AFTER = {
-                                    "write_file",
-                                    "write",
-                                    "create_file",
-                                    "create file",
-                                    "_create_file",
-                                    "edit_file",
-                                    "multi_edit",
-                                }
-                                if (
-                                    tool_name in VERIFY_AFTER
-                                    or raw_name in VERIFY_AFTER
-                                ):
-                                    import os
-                                    from tools import SESSION
-
-                                    written_path = args.get("path", "")
-                                    if written_path:
-                                        written_path = os.path.expanduser(written_path)
-                                        if not os.path.isabs(written_path):
-                                            written_path = os.path.join(
-                                                SESSION.active_project_dir, written_path
-                                            )
-                                        if os.path.exists(written_path):
-                                            size = os.path.getsize(written_path)
-                                            tool_msg_accumulator += f"\n[AUTO-VERIFY] ✓ {written_path} exists ({size} bytes)\n"
-                                        else:
-                                            tool_msg_accumulator += f"\n[AUTO-VERIFY] ✗ {written_path} NOT FOUND after write — write failed silently\n"
-
-                            except Exception as e:
-                                self.tui.print_error(f"Tool {tool_name} failed: {e}")
+                            result = self.executor.execute(tool_name, args, self.tui)
                     else:
                         self.tui.print_warning(f"Unknown tool: {tool_name}")
 
@@ -1224,9 +1554,12 @@ EXECUTE using the tool format above. RIGHT NOW.
 
                     total_chars = sum(len(m.get("content", "")) for m in messages)
 
-                    if iteration >= max_iterations:
+                    if not budget.consume(messages):
+                        tool_msg_accumulator += budget.inject_limit_message()
+                        break
+                    if False:
                         tool_msg_accumulator += "\n[TOOL LIMIT REACHED. Stop calling tools. Summarize what you found and answer directly.]"
-                    elif total_chars > 12000:
+                    elif False:
                         tool_msg_accumulator += "\n[CONTEXT LIMIT WARNING. Stop calling tools. Summarize and answer directly.]"
                     else:
                         tool_msg_accumulator += _build_verification_injection(
@@ -1239,7 +1572,7 @@ EXECUTE using the tool format above. RIGHT NOW.
                     response = self._stream_generate(messages, think=think)
                     final_response += "\n\n" + response
 
-                    if iteration >= max_iterations or total_chars > 12000:
+                    if False:
                         break
                 else:
                     break
@@ -1316,7 +1649,7 @@ EXECUTE using the tool format above. RIGHT NOW.
             return "No messages to save."
 
         try:
-            from journal import score_session, log_session
+            from journal import score_session
 
             prompt = (
                 "Extract 2-3 single-line bullet points summarizing key technical facts, decisions, "

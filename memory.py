@@ -1,3 +1,57 @@
+
+class SessionLog:
+    """
+    Durable append-only event log. Lives outside agent.py.
+    Survives harness crashes. Enables wake/resume.
+    Pattern: Anthropic Managed Agents session architecture.
+    """
+    def __init__(self, session_id: str):
+        import os, json
+        from pathlib import Path
+        from datetime import datetime
+        self.session_id = session_id
+        log_dir = Path.home() / ".aria" / "session_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_path = log_dir / f"{session_id}.jsonl"
+        self._events = []
+        self._load()
+
+    def _load(self):
+        import json
+        if self.log_path.exists():
+            with open(self.log_path) as f:
+                for line in f:
+                    try:
+                        self._events.append(json.loads(line))
+                    except Exception:
+                        pass
+
+    def emit(self, event_type: str, data: dict):
+        """Write event to durable log immediately."""
+        import json
+        from datetime import datetime
+        event = {
+            "type": event_type,
+            "ts": datetime.now().isoformat(),
+            "data": data
+        }
+        self._events.append(event)
+        with open(self.log_path, "a") as f:
+            f.write(json.dumps(event) + "\n")
+
+    def get_events(self, last_n: int = None, event_type: str = None) -> list:
+        events = self._events
+        if event_type:
+            events = [e for e in events if e["type"] == event_type]
+        if last_n:
+            events = events[-last_n:]
+        return events
+
+    @classmethod
+    def wake(cls, session_id: str) -> "SessionLog":
+        """Resume a crashed session from its event log."""
+        return cls(session_id)
+
 # File: memory.py
 import ollama
 import uuid
@@ -28,6 +82,39 @@ def _strip_poison(summary: str) -> str:
 
 
 class MemoryManager:
+
+    def _init_session_db(self):
+        import sqlite3, os
+        db_path = os.path.expanduser("~/.aria/sessions.db")
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self._db = sqlite3.connect(db_path, check_same_thread=False)
+        self._db.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS sessions
+            USING fts5(session_id, date, topic, content)
+        """)
+        self._db.commit()
+    
+    def save_to_search_db(self, session_id: str, topic: str, content: str):
+        from datetime import datetime
+        self._db.execute(
+            "INSERT INTO sessions VALUES (?,?,?,?)",
+            (session_id, datetime.now().isoformat(), topic, content[:5000])
+        )
+        self._db.commit()
+    
+    def search_sessions(self, query: str, limit: int = 5) -> list[dict]:
+        try:
+            cursor = self._db.execute(
+                "SELECT session_id, date, topic, content "
+                "FROM sessions WHERE sessions MATCH ? "
+                "ORDER BY rank LIMIT ?",
+                (query, limit)
+            )
+            return [{"session_id": r[0], "date": r[1],
+                     "topic": r[2], "snippet": r[3][:200]}
+                    for r in cursor.fetchall()]
+        except Exception:
+            return []
     def __init__(self, llm_model_name: str):
         self.model = llm_model_name
         self.short_term = []  # raw message dicts [{role, content}]
@@ -35,6 +122,7 @@ class MemoryManager:
         self.session_id = uuid.uuid4().hex[:8]
         self.turn_count = 0
         self._in_tool_loop = False
+        self._init_session_db()
         self._boot_milestones()
 
     def add_turn(self, user_msg: str, assistant_msg: str):

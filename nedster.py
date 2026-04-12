@@ -1,3 +1,29 @@
+import sys
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+
+MODEL_TIERS = {
+    "aria-qwen":      ("★★★", "Full — Modelfile-baked persona"),
+    "claude-code":    ("★★★", "Full — Modelfile-baked persona"),
+    "qwen3.5":        ("★★☆", "Good — tools work, simplified prompt"),
+    "qwen3.5-9b-local": ("★★☆", "Good"),
+    "mistral-7b":     ("★★☆", "Good"),
+    "qwen2.5-coder:7b": ("★★☆", "Good"),
+    "ministral-14b":  ("★★☆", "Good — reasoning model"),
+    "qwen3-4b":       ("★★☆", "Good — use as Ralph supervisor"),
+    "qwen2.5-coder:1.5b": ("★☆☆", "Chat only — no tool use"),
+    "qwen2.5:1.5b":   ("★☆☆", "Chat only"),
+    "qwen3.5-2b":     ("★☆☆", "Chat only"),
+    "llama3.3-70b":   ("★★★", "Excellent but may OOM 8GB"),
+    "lfm2":           ("★☆☆", "Chat only — no tools"),
+    "nomic-embed-text": ("---", "Embedding only — not for chat"),
+}
+
+def _get_tier(name: str):
+    for k, v in MODEL_TIERS.items():
+        if k.lower() in name.lower(): return v
+    return ("★★☆", "Unknown capability")
+
 #!/usr/bin/env python3
 """Nedster - Local Claude Code Clone CLI
 
@@ -154,8 +180,9 @@ def cmd_stats():
 
 def cmd_one_shot(query: str, project_dir: str, auto: bool, think: bool):
     """Run a single query and exit."""
-    from agent import NedsterAgent
+    
 
+    from agent import NedsterAgent
     tui = NedsterTUI()
 
     if not check_ollama():
@@ -267,8 +294,9 @@ def cmd_repl(project_dir: str, auto: bool, think: bool):
     print("")
 
     """Interactive REPL loop."""
-    from agent import NedsterAgent
+    
 
+    from agent import NedsterAgent
     tui = NedsterTUI()
 
     if not check_ollama():
@@ -775,7 +803,38 @@ def main():
         help="Commands: init (create NEDSTER.md), stats, reset (wipe ChromaDB)",
     )
 
+    parser.add_argument(
+        "--resume", metavar="SESSION_ID",
+        help="Resume a previous session from its event log. Run nedster --sessions to list available."
+    )
+
+    parser.add_argument(
+        "--daemon", nargs="?", const="sentinel,trader,file-watch",
+        help="Start daemon mode"
+    )
     args = parser.parse_args()
+    
+    if args.resume:
+        from memory import SessionLog
+        log = SessionLog.wake(args.resume)
+        events = log.get_events(last_n=10)
+        if events:
+            print(f"[Resume] Session {args.resume[:8]}...")
+            print(f"         {len(events)} events loaded")
+            last_inputs = [e for e in events if e["type"] == "user_input"]
+            if last_inputs:
+                last = last_inputs[-1]["data"]["text"]
+                print(f"         Last input: {last[:60]}...")
+        else:
+            print(f"[Resume] No events found for {args.resume}")
+
+    if args.daemon:
+        from daemon import start_daemon_manager
+        modes = ["sentinel", "trader", "file-watch"] if args.daemon == "all" else args.daemon.split(",")
+        start_daemon_manager(modes)
+        print(f"[Nedster] Daemon mode: {', '.join(modes)}")
+        print("[Nedster] Alerts -> ~/.aria/daemon_alerts/")
+
 
     global _KEEP_VRAM
     _KEEP_VRAM = args.keep_vram
