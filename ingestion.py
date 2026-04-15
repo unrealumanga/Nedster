@@ -44,7 +44,7 @@ def get_text_from_file(filepath):
     return text
 
 
-def chunk_text(text, filename, chunk_size=400, overlap=50):
+def chunk_text(text, filename, chunk_size=1200, overlap=200):
     enc = tiktoken.get_encoding("cl100k_base")
     # Split by double newline for semantic paragraph boundaries
     paragraphs = text.split("\n\n")
@@ -175,7 +175,7 @@ def ingest_folder(folder_path):
         if not text.strip():
             continue
 
-        chunks = chunk_text(text, filename=filename, chunk_size=400, overlap=50)
+        chunks = chunk_text(text, filename=filename, chunk_size=1200, overlap=200)
         total_chunks_ingested += len(chunks)
 
         embed_file_chunks(chunks, embedder, collection, filename)

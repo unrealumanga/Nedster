@@ -279,10 +279,10 @@ class RAGPipeline:
         enc = tiktoken.get_encoding("cl100k_base")
 
         rag_parts = []
-        rag_budget = 1800
+        rag_budget = 8000
         used = 0
         for doc_text, score, meta in top_docs:
-            if score < 0.25:  # skip low-relevance chunks
+            if score < 0.20:  # skip low-relevance chunks (relaxed for code files)
                 continue
             chunk = (f"[Source: {meta.get('source_file','?')}, "
                      f"Score: {score:.2f}]\n{doc_text}\n---")
@@ -419,7 +419,7 @@ class RAGPipeline:
             ctx_tokens = len(enc.encode(context_str)) if context_str else 0
             sys_tokens = len(enc.encode(system_prompt))
             total = sys_tokens + mem_tokens + ctx_tokens
-            budget = 4096
+            budget = int(os.environ.get("TURBOQUANT_CONTEXT_SIZE", "262144"))
             if total > budget * 0.80:
                 print(f"[Context: {total}/{budget} tokens — trimming RAG]")
                 top_docs = top_docs[:2]
@@ -465,15 +465,48 @@ class RAGPipeline:
         # Ollama tip: keep Ollama server warm (don't stop between queries)
         # Context tip: --think flag adds ~500 reasoning tokens, disable for fast answers
         # Temperature 0.1 strongly anchors the model to English and prevents hallucination
-        options = {"num_ctx": 4096, "temperature": 0.1}
+        options = {"num_ctx": int(os.environ.get("TURBOQUANT_CONTEXT_SIZE", "262144")), "temperature": 0.1}
         if not think:
             options["think"] = False  # skip chain-of-thought to save tokens
 
         try:
             print(f"Generating answer (Think Mode: {think})...\n")
-            response = ollama.chat(
-                model=self.model, messages=messages, stream=True, options=options
-            )
+            
+            # Check if TurboQuant server should be used via OpenAI API
+            use_turboquant = os.environ.get("USE_TURBOQUANT", "0") == "1"
+            
+            if use_turboquant:
+                try:
+                    import openai
+                    print("[\033[36mRunning via TurboQuant KV Compression Server\033[0m]")
+                    client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="sk-turboquant")
+                    # convert messages for OpenAI
+                    oai_msgs = []
+                    for m in messages:
+                        oai_msgs.append({"role": m["role"], "content": m["content"]})
+                    
+                    response_stream = client.chat.completions.create(
+                        model=self.model,
+                        messages=oai_msgs,
+                        stream=True,
+                        temperature=0.1
+                    )
+                    
+                    # mock Ollama stream response format
+                    def turboquant_stream_adapter(stream):
+                        for chunk in stream:
+                            if chunk.choices and chunk.choices[0].delta.content:
+                                yield {"message": {"content": chunk.choices[0].delta.content}}
+                                
+                    response = turboquant_stream_adapter(response_stream)
+                except ImportError:
+                    print("Please run: pip install openai")
+                    use_turboquant = False
+            
+            if not use_turboquant:
+                response = ollama.chat(
+                    model=self.model, messages=messages, stream=True, options=options
+                )
 
             import re
             # State machine to strip <think>...</think> and emoji from stream
@@ -522,7 +555,7 @@ class RAGPipeline:
                     _token_count += len(visible.split())
 
             # After stream: show token count
-            print(f"\n[\033[90m~{_token_count} tokens | ctx {_token_count*100//4096}%\033[0m]")
+            print(f"\n[\033[90m~{_token_count} tokens | ctx {_token_count*100//int(os.environ.get('TURBOQUANT_CONTEXT_SIZE', '262144'))}%\033[0m]")
 
             # Strip any remaining think tags from full_response for memory storage
             full_response = re.sub(r"<think>.*?</think>", "", full_response, flags=re.DOTALL).strip()
@@ -582,9 +615,20 @@ class RAGPipeline:
                     }
                 )
 
-                response = ollama.chat(
-                    model=self.model, messages=messages, stream=True, options=options
-                )
+                if use_turboquant:
+                    oai_msgs.append({"role": "assistant", "content": full_response})
+                    oai_msgs.append({"role": "user", "content": f"Tool Results:\n{tool_results_str}\n\nContinue."})
+                    response_stream = client.chat.completions.create(
+                        model=self.model,
+                        messages=oai_msgs,
+                        stream=True,
+                        temperature=0.1
+                    )
+                    response = turboquant_stream_adapter(response_stream)
+                else:
+                    response = ollama.chat(
+                        model=self.model, messages=messages, stream=True, options=options
+                    )
 
                 import re
                 # State machine to strip <think>...</think> and emoji from stream
@@ -633,7 +677,7 @@ class RAGPipeline:
                         _token_count += len(visible.split())
     
                 # After stream: show token count
-                print(f"\n[\033[90m~{_token_count} tokens | ctx {_token_count*100//4096}%\033[0m]")
+                print(f"\n[\033[90m~{_token_count} tokens | ctx {_token_count*100//int(os.environ.get('TURBOQUANT_CONTEXT_SIZE', '262144'))}%\033[0m]")
     
                 # Strip any remaining think tags from full_response for memory storage
                 full_response = re.sub(r"<think>.*?</think>", "", full_response, flags=re.DOTALL).strip()

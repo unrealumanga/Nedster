@@ -1,7 +1,7 @@
 FROM qwen3.5:9b
 
 PARAMETER num_thread 8
-PARAMETER num_ctx 4096
+PARAMETER num_ctx 262144
 PARAMETER num_predict 2048
 PARAMETER temperature 0.05
 PARAMETER repeat_penalty 1.05

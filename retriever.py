@@ -172,7 +172,7 @@ class Retriever:
         # 1. Vector Search (Semantic)
         if self.doc_collection:
             doc_results = self.doc_collection.query(
-                query_embeddings=[query_embedding], n_results=15
+                query_embeddings=[query_embedding], n_results=30
             )
             if doc_results.get("documents") and doc_results["documents"]:
                 docs = doc_results["documents"][0]
@@ -187,7 +187,7 @@ class Retriever:
             bm25_scores = self.bm25.get_scores(tokenized_query)
             top_n_idx = sorted(
                 range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
-            )[:15]
+            )[:30]
             for idx in top_n_idx:
                 if bm25_scores[idx] > 0:
                     d = self.corpus_docs[idx]
@@ -245,13 +245,13 @@ class Retriever:
         if not all_docs:
             return []
 
-        # 4. Rerank combined unique results (Vector + BM25 + Memory) -> return top 4
+        # 4. Rerank combined unique results (Vector + BM25 + Memory) -> return top 10
         ranked_results = self.reranker.rerank(query, all_docs, all_metas)
-        top_4 = ranked_results[:4]
+        top_10 = ranked_results[:10]
 
         # Print retrieved chunks with filenames + reranker scores
         print("\n--- Retrieved & Reranked Context ---")
-        for idx, (doc, score, meta) in enumerate(top_4):
+        for idx, (doc, score, meta) in enumerate(top_10):
             source = (
                 meta.get("source_file", "Unknown")
                 if meta and isinstance(meta, dict)
@@ -260,4 +260,4 @@ class Retriever:
             print(f"[{idx + 1}] Source: {source} | Score: {score:.2f}")
         print("------------------------------------\n")
 
-        return top_4
+        return top_10
