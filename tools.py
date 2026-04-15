@@ -438,12 +438,18 @@ def parse_tool_calls(text: str) -> list:
     - Broken 1: <tool name="bash"><parameter=cmd>ls</parameter>
     - Broken 2: <tool_call>{"name": "bash", "cmd": "ls"}</tool_call>
     - Broken 3: ```bash\nls\n```  (markdown code blocks)
+
+    FIX: The original had dead code after early `return results` on Format 1.
+    Formats 2, 3, 4 were only reachable if Format 1 found nothing, but
+    Format 4 (bare ```bash``` fallback) was placed AFTER a `return results`
+    on line 3454 and was NEVER reached. Consolidated into a single-pass approach
+    that collects all formats before returning.
     """
     import re, json
 
     results = []
 
-    # Format 1: Correct JSON format
+    # Format 1: Correct JSON format  <tool name="X">{json}</tool>
     pattern1 = re.compile(
         r'<tool\s+name=["\']([^"\']+)["\']>\s*(.*?)\s*</tool>',
         re.DOTALL | re.IGNORECASE,
@@ -462,15 +468,9 @@ def parse_tool_calls(text: str) -> list:
             args = _parse_kv(args_raw)
         results.append({"name": name, "args": args})
 
+    # If we found Format 1 calls, return early (avoid double-counting)
     if results:
         return results
-        
-    # Catch pure markdown bash blocks if no XML tool found
-    bash_blocks = re.findall(r'```(?:bash|sh)\n(.*?)\n```', text, re.DOTALL)
-    for cmd in bash_blocks:
-        results.append({"name": "run_bash", "args": {"cmd": cmd.strip()}})
-        
-
 
     # Format 2: Broken <parameter=X> format
     pattern2 = re.compile(
@@ -485,15 +485,8 @@ def parse_tool_calls(text: str) -> list:
 
     if results:
         return results
-        
-    # Catch pure markdown bash blocks if no XML tool found
-    bash_blocks = re.findall(r'```(?:bash|sh)\n(.*?)\n```', text, re.DOTALL)
-    for cmd in bash_blocks:
-        results.append({"name": "run_bash", "args": {"cmd": cmd.strip()}})
-        
 
-
-    # Format 3: tool_call JSON blob
+    # Format 3: <tool_call>{json}</tool_call>
     pattern3 = re.compile(
         r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL | re.IGNORECASE
     )
@@ -505,7 +498,22 @@ def parse_tool_calls(text: str) -> list:
         except Exception:
             pass
 
-    # Format 5: Malformed closing tag - missing slash
+    if results:
+        return results
+
+    # Format 4: Bare ```bash``` or ```sh``` code blocks — treat as run_bash
+    # FIX: This was placed AFTER a `return results` in the original and was
+    # therefore dead code. Moved here so it actually executes.
+    bash_blocks = re.findall(r'```(?:bash|sh|shell)\n(.*?)\n```', text, re.DOTALL)
+    for cmd in bash_blocks:
+        cmd = cmd.strip()
+        if cmd:
+            results.append({"name": "run_bash", "args": {"cmd": cmd}})
+
+    if results:
+        return results
+
+    # Format 5: Malformed closing tag - missing slash  <tool name="X">...</tool> vs <tool>
     pattern5 = re.compile(
         r'<tool\s+name=["\']([^"\']+)["\']>(.*?)<tool>', re.DOTALL | re.IGNORECASE
     )
@@ -523,7 +531,7 @@ def parse_tool_calls(text: str) -> list:
             args = _parse_kv(args_raw)
         results.append({"name": name, "args": args})
 
-    # Format 6: create file variant treated as tool call
+    # Format 6: <create file="path">content</create>
     pattern_create = re.compile(
         r'<(?:tool\s+)?create\s+file=["\']?([^"\'>\s]+)["\']?>(.*?)</(?:tool|create)>',
         re.DOTALL | re.IGNORECASE,
@@ -535,7 +543,7 @@ def parse_tool_calls(text: str) -> list:
             {"name": "write_file", "args": {"path": path, "content": content}}
         )
 
-    # Format 7: self closing tag
+    # Format 7: self-closing tag  <tool name="X" />
     pattern_self_close = re.compile(
         r'<tool\s+name=["\']([^"\']+)["\']\s*/>', re.DOTALL | re.IGNORECASE
     )
@@ -544,17 +552,6 @@ def parse_tool_calls(text: str) -> list:
         results.append({"name": name, "args": {}})
 
     return results
-
-    # Format 4: Bare ```bash``` code blocks (treat as run_bash)
-    pattern4 = re.compile(r"```(?:bash|sh|shell)\n(.*?)```", re.DOTALL)
-    for m in pattern4.finditer(text):
-        cmd = m.group(1).strip()
-        if cmd:
-            results.append({"name": "run_bash", "args": {"cmd": cmd}})
-
-    return results
-
-
 class ContinuityWatchdog:
     """
     Prevents Aria from going silent mid-session.

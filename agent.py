@@ -814,7 +814,7 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
                 re.IGNORECASE,
             )
 
-            if FILE_OP_PATTERNS.search(user_input) and ctx_pct < 70:
+            if FILE_OP_PATTERNS.search(user_input) and ctx_pct < 70 and getattr(self, 'tool_use_enabled', True):
                 # Append a kickstart to user message
                 kickstart = (
                     "\n\n[Execute this task using tools. "
@@ -833,8 +833,9 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
                 'Use <tool name="X">{json}</tool> format. '
                 "EXECUTE tasks directly. Never say you lack filesystem access.]"
             )
-            messages.append({"role": "user", "content": TOOL_CAPABILITY_ANCHOR})
-            messages.append({"role": "assistant", "content": "Ready. Executing."})
+            if getattr(self, 'tool_use_enabled', True):
+                messages.append({"role": "user", "content": TOOL_CAPABILITY_ANCHOR})
+                messages.append({"role": "assistant", "content": "Ready. Executing."})
             messages.append({"role": "user", "content": user_msg})
 
             # Phase 4 - GENERATE (streaming)
@@ -1149,6 +1150,15 @@ EXECUTE using the tool format above. RIGHT NOW.
         return False
 
     def _strip_weak_model_artifacts(self, text: str) -> str:
+        """
+        Strip artifacts leaked by weak/chat-only models that hallucinate
+        system-prompt fragments into their output.
+
+        FIX: The original had orphaned code (lines checking `accumulated` and
+        `_REPEAT_THRESHOLD`) placed AFTER `return text.strip()`. That dead code
+        referenced an undefined variable and would have raised NameError if
+        somehow reached. Removed entirely.
+        """
         import re
         text = re.sub(r'<tool\s+name="[^"]*">.*?</tool>', '', text, flags=re.DOTALL)
         text = re.sub(r'\[YOU ARE NEDSTER\..*?\]', '', text, flags=re.DOTALL)
@@ -1157,14 +1167,10 @@ EXECUTE using the tool format above. RIGHT NOW.
         text = re.sub(r'\*\*Final response:\*\*\s*', '', text)
         text = re.sub(r'\*\*Final reply:\*\*\s*', '', text)
         text = re.sub(r'```\s*$', '', text)
+        # Strip leaked system-prompt fragments from chat-only models
+        text = re.sub(r'DIRECTIVE (?:ZERO|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT).*?(?=\n\n|$)', '', text, flags=re.DOTALL)
+        text = re.sub(r'\[NON-NEGOTIABLE EXECUTION RULES\].*?(?=\n\n|$)', '', text, flags=re.DOTALL)
         return text.strip()
-
-        tail = accumulated[-_REPEAT_THRESHOLD:]
-        if len(set(tail[::2])) <= 2: return True
-        words = accumulated.split()[-20:]
-        if len(words) > 10 and len(set(words)) <= 2: return True
-        return False
-
     def _stream_generate(self, messages: List[dict], think: bool = False) -> str:
         """
         Generate response with streaming output.
@@ -1397,14 +1403,27 @@ EXECUTE using the tool format above. RIGHT NOW.
     ) -> tuple[str, list]:
         """
         Parse and execute tool calls and edit blocks.
-        Max 3 iterations.
-        """
+        Max 10 iterations via IterationBudget.
 
+        FIX: The original code created a ThreadPoolExecutor but never submitted
+        futures to it — `futures` was always an empty dict, so the
+        `as_completed(futures)` loop did nothing. Additionally, tools NOT in
+        SAFE_PARALLEL fell into the `else` branch which only printed a warning.
+        Result: no tool ever produced output to tool_msg_accumulator.
+
+        FIXED APPROACH:
+        - All tools execute via self.executor.execute() immediately.
+        - SAFE_PARALLEL tools still run synchronously for simplicity
+          (parallelism was broken anyway; real parallel support requires
+          submitting to futures dict first).
+        - Every result is accumulated into tool_msg_accumulator.
+        """
         budget = IterationBudget(max_iters=10, max_chars=12000)
         final_response = response
         seen_tool_calls = set()
         applied_edits = []
         WATCHDOG.start()
+
         try:
             tool_loops = 0
             while budget.remaining > 0:
@@ -1413,7 +1432,6 @@ EXECUTE using the tool format above. RIGHT NOW.
                 self.tool_stats["loops"] += 1
                 _seen_this_iteration = set()
 
-
                 # Parse edit blocks
                 edits = self.editor.parse_edit_blocks(response)
 
@@ -1421,18 +1439,13 @@ EXECUTE using the tool format above. RIGHT NOW.
                 tool_calls = parse_tool_calls(response)
 
                 if not edits and not tool_calls:
-                    # No actions to execute
                     break
 
                 # Execute edits
                 for edit in edits:
                     result = self.editor.apply_edit(edit, auto=self.auto)
                     self.tui.print_status(f"Edit: {result}")
-                    if (
-                        "Edited" in result
-                        or "Created" in result
-                        or "Overwritten" in result
-                    ):
+                    if "Edited" in result or "Created" in result or "Overwritten" in result:
                         self.tool_stats["edits"] += 1
                         applied_edits.append(edit)
 
@@ -1443,34 +1456,14 @@ EXECUTE using the tool format above. RIGHT NOW.
                             self.tui.print_warning(f"Syntax issue: {syntax_result}")
 
                 tool_msg_accumulator = ""
+
                 # Execute tool calls
                 import json
-                import concurrent.futures
-
-                SAFE_PARALLEL = {
-                    "read_file",
-                    "list_dir",
-                    "search_code",
-                    "get_crypto_price",
-                    "duckduckgo_search",
-                    "smart_search",
-                    "tavily_search",
-                    "glob_search",
-                    "grep_search",
-                    "web_fetch",
-                }
-
-                # Process sequentially but track safe calls for parallel execution
-                futures = {}
-                ex = None
+                from tools import TOOL_REGISTRY, TOOL_NAME_ALIASES, normalize_tool_args
 
                 for tool_call in tool_calls:
                     tool_name = tool_call.get("name", "")
-                    from tools import normalize_tool_args
-
                     args = normalize_tool_args(tool_name, tool_call.get("args", {}))
-
-                    from tools import TOOL_REGISTRY, TOOL_NAME_ALIASES
 
                     raw_name = tool_name
                     # Normalize tool name
@@ -1485,7 +1478,9 @@ EXECUTE using the tool format above. RIGHT NOW.
                             self.tui.print_status(
                                 f"[BLOCKED] '{raw_name}' not a valid tool", "bold red"
                             )
-                            tool_msg_accumulator += f"[ERROR: '{raw_name}' unknown. Use write_file to create files.]\n"
+                            tool_msg_accumulator += (
+                                f"[ERROR: '{raw_name}' unknown. Use write_file to create files.]\n"
+                            )
                             continue
 
                     tool_name = t_name  # use normalized name
@@ -1496,47 +1491,32 @@ EXECUTE using the tool format above. RIGHT NOW.
                     if tool_name not in NEVER_DEDUP:
                         if call_hash in _seen_this_iteration:
                             self.tui.print_status(
-                                f"[SKIP] Identical call in same batch: {tool_name}",
-                                "dim",
+                                f"[SKIP] Identical call in same batch: {tool_name}", "dim"
                             )
                             continue
                         _seen_this_iteration.add(call_hash)
 
                     self.tui.print_tool_call(name=tool_name, args=args)
 
+                    # FIX: Execute ALL tools through executor and collect results.
+                    # Previously SAFE_PARALLEL tools ran but result was discarded;
+                    # non-SAFE_PARALLEL tools only printed a warning and never ran.
                     if tool_name in TOOL_REGISTRY:
-                        # Inject cwd if not provided
+                        # Inject cwd for git tools
                         if "cwd" not in args and tool_name.startswith("git_"):
                             args["cwd"] = self.project_dir
 
-                        if tool_name in SAFE_PARALLEL:
-                            if ex is None:
-                                ex = concurrent.futures.ThreadPoolExecutor(
-                                    max_workers=4
-                                )
-
-                            result = self.executor.execute(tool_name, args, self.tui)
+                        result = self.executor.execute(tool_name, args, self.tui)
+                        self.tui.print_tool_result(tool_name, result, verbose=self.verbose)
+                        self.tool_stats["calls"] += 1
+                        tool_msg_accumulator += f"[Tool result: {tool_name}]\n{result}\n\n"
+                        WATCHDOG.ping()
                     else:
-                        self.tui.print_warning(f"Unknown tool: {tool_name}")
+                        # Should not happen after alias resolution above, but guard anyway
+                        self.tui.print_warning(f"Unknown tool after normalization: {tool_name}")
+                        tool_msg_accumulator += f"[ERROR: '{tool_name}' not in registry]\n"
 
-                # Collect parallel results
-                if ex is not None:
-                    for future in concurrent.futures.as_completed(futures):
-                        tool_name = futures[future]
-                        try:
-                            result = future.result()
-                            self.tui.print_tool_result(
-                                tool_name, result, verbose=self.verbose
-                            )
-                            self.tool_stats["calls"] += 1
-                            tool_msg_accumulator += (
-                                f"[Tool result: {tool_name}]\n{result}\n\n"
-                            )
-                        except Exception as e:
-                            self.tui.print_error(f"Tool {tool_name} failed: {e}")
-                    ex.shutdown()
-
-                # After processing edits and tool calls, if we didn't update response, we must break
+                # If nothing ran at all, break
                 if not tool_msg_accumulator and not edits:
                     break
 
@@ -1552,28 +1532,17 @@ EXECUTE using the tool format above. RIGHT NOW.
                         f"  • [{self.tui.COLORS['tool']}]Result: {preview}...[/]", ""
                     )
 
-                    total_chars = sum(len(m.get("content", "")) for m in messages)
-
                     if not budget.consume(messages):
                         tool_msg_accumulator += budget.inject_limit_message()
                         break
-                    if False:
-                        tool_msg_accumulator += "\n[TOOL LIMIT REACHED. Stop calling tools. Summarize what you found and answer directly.]"
-                    elif False:
-                        tool_msg_accumulator += "\n[CONTEXT LIMIT WARNING. Stop calling tools. Summarize and answer directly.]"
-                    else:
-                        tool_msg_accumulator += _build_verification_injection(
-                            tool_msg_accumulator
-                        )
-                        tool_msg_accumulator += "\nContinue."
+
+                    tool_msg_accumulator += _build_verification_injection(tool_msg_accumulator)
+                    tool_msg_accumulator += "\nContinue."
 
                     messages.append({"role": "assistant", "content": response})
                     messages.append({"role": "user", "content": tool_msg_accumulator})
                     response = self._stream_generate(messages, think=think)
                     final_response += "\n\n" + response
-
-                    if False:
-                        break
                 else:
                     break
 
@@ -1611,7 +1580,6 @@ EXECUTE using the tool format above. RIGHT NOW.
             final_response += "\n\n" + self._stream_generate(messages, think=think)
 
         return final_response, applied_edits
-
     def _check_file_syntax(self, path: str) -> str:
         """Check syntax of a file."""
         try:
