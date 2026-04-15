@@ -13,11 +13,15 @@
 
 [![Local AI](https://img.shields.io/badge/AI-100%25%20Local-00E676?style=flat-square)](#)
 [![VRAM](https://img.shields.io/badge/VRAM-8GB%2B-6200EA?style=flat-square)](#)
+[![Context](https://img.shields.io/badge/Context-256K-FF5722?style=flat-square)](#)
+[![TurboQuant](https://img.shields.io/badge/KV_Compression-TurboQuant-3F51B5?style=flat-square)](#)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](#)
 
 </div>
 
-Nedster is a highly autonomous, CLI-based AI software engineer designed to run entirely locally (tested and optimized for consumer hardware like the RTX 3060 Ti with 8GB VRAM). Powered by a heavily customized Ollama model (`aria-qwen`), it doesn't just chat—it *acts*. It searches your codebase, edits files precisely, scaffolds entire projects, and manages its own memory without ever sending a single line of your code to the cloud.
+Nedster is a highly autonomous, CLI-based AI software engineer designed to run entirely locally (tested and optimized for consumer hardware like the RTX 3060 Ti with 8GB VRAM). Powered by a heavily customized Ollama model (`aria-qwen`) and augmented with **Google's TurboQuant 4-bit KV Cache Compression**, it doesn't just chat—it *acts*. It searches your codebase, edits files precisely, scaffolds entire projects, and manages its own memory without ever sending a single line of your code to the cloud.
+
+With TurboQuant integration, Nedster breaks the local VRAM barrier, allowing for a **massive 256K Context Window** on an 8GB GPU. You can feed it huge log files, entire codebases, and extensive documentation via RAG without triggering out-of-memory errors.
 
 Inspired by premium agents like Devin and Claude Code, but built for the privacy-conscious developer who wants maximum autonomy on their own hardware.
 
@@ -88,7 +92,7 @@ Nedster's true power lies in its adaptability. It comes bundled with two powerfu
 1. Download Ollama for Windows and ensure Python 3.10+ and Git are installed.
 2. Clone the repository and open the folder.
 3. Double-click `setup.bat` (this builds the venv, installs dependencies, and compiles the custom `aria-qwen` model).
-4. Double-click `start.bat` to launch Nedster!
+4. Run `start.bat` for standard execution, OR run **`start_turboquant.bat`** to boot Nedster with the 256K Context Window and TurboQuant Server enabled!
 
 ---
 
@@ -112,3 +116,9 @@ Inside the Nedster REPL, you can talk to it naturally:
 ### 📦 Where are the model weights?
 
 This repository contains the **core Nedster agent application code** (the orchestrator, RAG system, tools, and UI). It does **not** contain the raw `.gguf` weight files, as they are >6 GB in size. When you run the setup scripts, Nedster automatically triggers Ollama to pull the required base weights from its registry and dynamically compiles them using the `Modelfile` to create the specialized `aria-qwen` agent locally on your machine.
+
+---
+
+<div align="center">
+  <b>#Nedster #TurboQuant #RAG #LocalLLM #Ollama #Qwen #256KContext #KVCacheCompression #AI #CodingAgent</b>
+</div>
