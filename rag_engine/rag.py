@@ -17,7 +17,7 @@ from journal import (
 class RAGPipeline:
     def __init__(self):
         self.retriever = Retriever()
-        self.model = "aria-qwen"
+        self.model = os.environ.get("MODEL", "qwen3.5:9b")
         self.memory = MemoryManager(llm_model_name=self.model)
         self.personality = load_personality()
         self.tool_stats = {"calls": 0, "loops": 0}

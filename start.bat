@@ -51,11 +51,10 @@ set OLLAMA_NUM_THREADS=8
 set OMP_NUM_THREADS=8
 
 :: Build the custom Aria model from Modelfile (only if not already built)
-ollama list | findstr /I "aria-qwen" >nul
+ollama list | findstr /I "qwen3.5:9b" >nul
 if %ERRORLEVEL% neq 0 (
-    echo Building Aria personality model...
-    ollama create aria-qwen -f Modelfile
-    echo Aria model created.
+    echo Pulling base model...
+    ollama pull qwen3.5:9b
 )
 
 :: Start Ollama server in background if not running
@@ -68,7 +67,7 @@ if %ERRORLEVEL% neq 0 (
 
 :: Warm up the model
 echo Warming up model...
-start /B ollama run aria-qwen "ping" >nul 2>&1
+start /B ollama run qwen3.5:9b "ping" >nul 2>&1
 echo Model warm.
 
 :: Check Virtual Environment

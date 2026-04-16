@@ -51,7 +51,7 @@ from direct_executor import _try_direct_execute
 
 
 _KEEP_VRAM = False
-_ACTIVE_MODEL = "aria-qwen"
+_ACTIVE_MODEL = "qwen3.5:9b"
 
 
 def _release_vram():
@@ -143,8 +143,8 @@ def print_stats(project_dir: str = "."):
         print("ChromaDB: 0 vectors stored (or not initialized)")
 
     # Token budget
-    print(f"\nToken Budget: 4096 (aria-qwen)")
-    print(f"Model: aria-qwen (Qwen3.5:9b)")
+    print(f"Token Budget: 4096 (qwen3.5:9b)")
+    print(f"Model: qwen3.5:9b")
 
 
 def cmd_stats(project_dir: str = "."):

@@ -1,10 +1,10 @@
 @echo off
 setlocal enabledelayedexpansion
 
-echo === Nedster with TurboQuant Backend ===
+echo === Nedster with Local Ollama Backend (Qwen3.5:9b) ===
 echo.
-echo TurboQuant compresses KV Cache to 4-bits.
-echo This allows for massive context windows (16K+) on 8GB VRAM.
+echo Bypassing TurboQuant Server. 
+echo Utilizing the local Ollama instance directly.
 echo.
 
 :: Check Virtual Environment
@@ -16,31 +16,24 @@ if not exist "venv\Scripts\activate.bat" (
 
 call venv\Scripts\activate.bat
 
-:: Install required turboquant & openai if not present
-python -c "import turboquant" >nul 2>&1
+:: Make sure Ollama is running
+tasklist /FI "IMAGENAME eq ollama.exe" | find /I "ollama.exe" >nul
 if %ERRORLEVEL% neq 0 (
-    echo Installing TurboQuant and OpenAI...
-    pip install turboquant[server] openai
+    echo Starting Ollama server...
+    start /B ollama serve
+    timeout /T 3 /NOBREAK >nul
 )
 
 :: Model selection
-set MODEL=DavidAU/Qwen3.5-9B-Claude-4.6-HighIQ-INSTRUCT
-echo Using Model: %MODEL%
+set MODEL=qwen3.5:9b
+echo Using Local Ollama Model: %MODEL%
 
-:: Start TurboQuant Server
-echo.
-echo Starting TurboQuant Inference Server on port 8000...
-echo Keep this window open!
-start /B turboquant-server --model %MODEL% --bits 4 --port 8000
-
-echo Waiting for server to spin up...
-timeout /T 15 /NOBREAK >nul
-
-:: Set Env Vars for Nedster
-set USE_TURBOQUANT=1
+:: Set Env Vars for Nedster to bypass TurboQuant but keep large context
+set USE_TURBOQUANT=0
 set TURBOQUANT_CONTEXT_SIZE=262144
+set OLLAMA_FLASH_ATTENTION=1
 
-echo === Nedster is ready with TurboQuant ===
+echo === Nedster is ready ===
 echo Launching nedster...
 
 python nedster.py
