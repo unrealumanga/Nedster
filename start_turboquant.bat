@@ -24,7 +24,7 @@ if %ERRORLEVEL% neq 0 (
 )
 
 :: Model selection
-set MODEL=Qwen/Qwen3.5-9B-Instruct
+set MODEL=DavidAU/Qwen3.5-9B-Claude-4.6-HighIQ-INSTRUCT
 echo Using Model: %MODEL%
 
 :: Start TurboQuant Server
