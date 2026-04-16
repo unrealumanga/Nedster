@@ -111,13 +111,13 @@ def main():
     args = parser.parse_args()
 
     if args.command == "ingest":
-        from ingestion import ingest_folder
+        from rag_engine.ingestion import ingest_folder
 
         ingest_folder(args.folder)
 
     elif args.command == "chat":
         check_ollama()
-        from rag import RAGPipeline
+        from rag_engine.rag import RAGPipeline
 
         pipeline = RAGPipeline()
         import os
@@ -176,7 +176,7 @@ def main():
 
     elif args.command == "query":
         check_ollama()
-        from rag import RAGPipeline
+        from rag_engine.rag import RAGPipeline
 
         pipeline = RAGPipeline()
         lower_input = args.text.lower()
@@ -192,7 +192,7 @@ def main():
 
     elif args.command == "plan":
         check_ollama()
-        from rag import RAGPipeline
+        from rag_engine.rag import RAGPipeline
 
         pipeline = RAGPipeline()
         pipeline.plan_and_execute(args.text, think=args.think)
@@ -205,7 +205,7 @@ def main():
         # So maybe we should instantiate pipeline and print its tool_stats?
         # Or print it in print_stats if passed?
         try:
-            from rag import RAGPipeline
+            from rag_engine.rag import RAGPipeline
 
             p = RAGPipeline()
             print(f"Tool Stats: {p.tool_stats}")

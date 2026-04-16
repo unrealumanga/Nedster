@@ -3,7 +3,7 @@ import sys
 import os
 import ollama
 from datetime import datetime
-from retriever import Retriever
+from rag_engine.retriever import Retriever
 from memory import MemoryManager
 from personality import load_personality, build_system_prompt
 from journal import (

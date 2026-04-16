@@ -2493,14 +2493,3 @@ def _safe_write_file(path: str, content: str = "",
         return f"[Error] write_file failed: {e}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-
-# ── nedster_fixer: re-register write_file with safe version ──────────────────
-try:
-    for _alias in ("write_file","create_file","create file","create","write",
-                   "make_file","new_file","_create_file"):
-        TOOL_REGISTRY[_alias] = lambda **kw: _safe_write_file(**kw)
-except Exception:
-    pass
-# ─────────────────────────────────────────────────────────────────────────────

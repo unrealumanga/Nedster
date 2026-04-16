@@ -45,7 +45,7 @@ from typing import Optional, Dict, List
 
 from context_loader import ContextLoader
 from editor import FileEditor
-from rag_engine.retriever import Retriever
+from retriever import Retriever
 from memory import MemoryManager
 from tools import TOOL_REGISTRY, parse_tool_calls, WATCHDOG
 from tui import NedsterTUI
@@ -266,7 +266,7 @@ class NedsterAgent:
         if _is_weak_model(getattr(self, 'model', '')):
             return WEAK_MODEL_SYSTEM_PROMPT
         # [/fixer] end weak model guard
-        if model_tier == "★☆☆":
+                if model_tier == "★☆☆":
             return (
                 "You are Nedster, a helpful local AI assistant for H2. "
                 "Answer questions directly and concisely. "
@@ -300,19 +300,7 @@ RESPONSE RULES — ABSOLUTE:
         
         return system_prompt
 
-    NEDSTER_SYSTEM_PROMPT = """CRITICAL RESPONSE RULES (non-negotiable):
-You MUST follow these rules in EVERY response:
-1. After using tools: give a 1-2 sentence result. STOP. Do NOT ask what to do next.
-2. Never output numbered option menus like "1. Option A  2. Option B"
-3. Never say "What would you like to do?" or "What specific functionality?"
-4. Never narrate tool calls ("Let me check..." / "I will now read...")
-5. Short input = short response. "done?" gets yes/no + 1 line max.
-6. The activity feed already shows tool calls. Never repeat them in text.
-7. After scaffold/build: state what was created. Stop.
-   BAD: [runs scaffold then says nothing]
-   GOOD: "Scaffolded great-zip/ with Cargo.toml and src/main.rs. Run: cargo build"
-
-DIRECTIVE ZERO — LANGUAGE:
+    NEDSTER_SYSTEM_PROMPT = """DIRECTIVE ZERO — LANGUAGE:
 English only. Every word, every thought.
 
 DIRECTIVE ONE — IDENTITY:
@@ -548,7 +536,7 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
                     for fpath in queue[:10]:
                         if os.path.exists(fpath):
                             try:
-                                from rag_engine.ingestion import get_text_from_file, chunk_text, embed_file_chunks
+                                from ingestion import get_text_from_file, chunk_text, embed_file_chunks
                                 import chromadb
                                 client = chromadb.PersistentClient(path="./chroma_db")
                                 coll = client.get_or_create_collection("rag_docs")

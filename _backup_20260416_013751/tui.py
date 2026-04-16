@@ -192,25 +192,3 @@ class NedsterTUI:
         self.console.print(f"┌{'─' * width}┐", style="color(244)")
         self.console.print(f"│{msg.ljust(width)}│", style="color(244)")
         self.console.print(f"└{'─' * width}┘", style="color(244)")
-
-
-
-# ── nedster_fixer: output strip ───────────────────────────────────────────────
-
-def _strip_model_artifacts(text: str) -> str:
-    """Remove hallucinated tool XML and identity anchors from model output."""
-    import re as _re
-    # Raw tool call XML echoed by weak models
-    text = _re.sub(r'<tool\s+name="[^"]*">.*?</tool>', '', text, flags=_re.DOTALL)
-    # [YOU ARE NEDSTER. ...] echoed from system prompt
-    text = _re.sub(r'\[YOU ARE NEDSTER\..*?\]', '', text, flags=_re.DOTALL)
-    text = _re.sub(r'YOU ARE NEDSTER[.,][^\n]*', '', text)
-    # === FILE: ... === echoed format markers
-    text = _re.sub(r'={3,}\s*FILE:.*?={3,}', '', text, flags=_re.DOTALL)
-    # **Final response:** / **Final reply:**
-    text = _re.sub(r'\*\*Final (?:response|reply):\*\*\s*', '', text)
-    # Trailing open code fence
-    text = _re.sub(r'```\s*$', '', text)
-    return text.strip()
-
-# ─────────────────────────────────────────────────────────────────────────────

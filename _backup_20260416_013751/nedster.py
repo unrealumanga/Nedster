@@ -884,14 +884,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-# ── nedster_fixer: context window defaults ───────────────────────────────────
-NEDSTER_GEN_OPTIONS = {
-    "num_ctx": 16384,
-    "num_predict": 1024,
-    "temperature": 0.05,
-    "top_p": 0.9,
-}
-# ─────────────────────────────────────────────────────────────────────────────

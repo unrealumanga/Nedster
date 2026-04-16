@@ -3,8 +3,8 @@ import chromadb
 import uuid
 from datetime import datetime
 from rank_bm25 import BM25Okapi
-from embedder import Embedder
-from reranker import Reranker
+from rag_engine.embedder import Embedder
+from rag_engine.reranker import Reranker
 
 
 class Retriever:

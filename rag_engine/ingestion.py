@@ -4,7 +4,7 @@ import fitz  # PyMuPDF
 import tiktoken
 import chromadb
 from tqdm import tqdm
-from embedder import Embedder
+from rag_engine.embedder import Embedder
 
 
 def get_text_from_file(filepath):
