@@ -357,10 +357,10 @@ run_bash  - for installs, builds, verification
 run_tests - after edits that affect logic
 git_*     - after successful task completion
 
-DIRECTIVE SIX — NEDSTER.md:
+DIRECTIVE SIX — nedster_state.json:
 On task completion, extract any project facts:
   architecture decisions, dependencies added, patterns used.
-Append to NEDSTER.md silently. Say: "Project memory updated."
+Append to nedster_state.json silently. Say: "Project memory updated."
 
 DIRECTIVE SEVEN — HARDWARE:
 H2 hardware: RTX 3060 Ti 8GB, i7-11700k, 64GB, Pop!OS.
@@ -439,7 +439,7 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
     def _boot_project(self):
         """
         1. context_loader.scan_project()
-        2. Read NEDSTER.md - inject into system prompt
+        2. Read nedster_state.json - inject into system prompt
         3. Load milestones (existing logic)
         4. probe_tools() - tool inventory
         5. Print boot summary
@@ -458,7 +458,7 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
         except Exception:
             pass
 
-        # Read NEDSTER.md
+        # Read nedster_state.json
         nedster_md = self.context_loader.read_nedster_md()
 
         # Print tool status
@@ -523,7 +523,7 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
         )
 
         if nedster_md:
-            self.tui.print_status("Project memory: NEDSTER.md loaded")
+            self.tui.print_status("Project memory: nedster_state.json loaded")
 
         from daemon import read_pending_alerts
         alerts = read_pending_alerts()
@@ -932,7 +932,7 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
             # Phase 6 - POST
             self.memory.add_turn(user_msg_raw, full_response)
 
-            # Auto-ingest new files and update NEDSTER.md
+            # Auto-ingest new files and update nedster_state.json
             if applied_edits:
                 for edit in applied_edits:
                     path = edit.get("path")
@@ -964,10 +964,10 @@ RULE 6 — You are NOT done until list_dir confirms files exist.
                             except Exception as e:
                                 self.tui.print_warning(f"Ingestion failed: {e}")
 
-                # Update NEDSTER.md with recent changes
+                # Update nedster_state.json with recent changes
                 if len(applied_edits) > 0:
                     try:
-                        nedster_path = os.path.join(str(self.project_dir), "NEDSTER.md")
+                        nedster_path = os.path.join(str(self.project_dir), "nedster_state.json")
                         if os.path.exists(nedster_path):
                             prompt = (
                                 "Summarize these file changes concisely as 1-2 bullet points for the project log:\n"
@@ -1323,9 +1323,9 @@ EXECUTE using the tool format above. RIGHT NOW.
             self.model_size_gb = size_gb
 
         full_response = self._strip_weak_model_artifacts(full_response)
-                # [fixer] summary gate
-        if _needs_summary(full_response, tool_results_str if 'tool_results_str' in dir() else ''):
-            full_response = full_response.rstrip() + '\n' + _generate_completion_summary(self.model, user_input if 'user_input' in dir() else '', tool_results_str if 'tool_results_str' in dir() else '')
+        # [fixer] summary gate
+        if self._needs_summary(full_response, tool_results_str if 'tool_results_str' in dir() else ''):
+            full_response = full_response.rstrip() + '\n' + self._generate_summary(user_input if 'user_input' in dir() else '', tool_results_str if 'tool_results_str' in dir() else '')
         return full_response
 
 

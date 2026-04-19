@@ -1,7 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 
-echo === Nedster with Local Ollama Backend (Qwen3.5:9b) ===
+echo === Nedster with Local Ollama Backend ===
 echo.
 echo Bypassing TurboQuant Server. 
 echo Utilizing the local Ollama instance directly.
@@ -25,13 +25,18 @@ if %ERRORLEVEL% neq 0 (
 )
 
 :: Model selection
-set MODEL=qwen3.5:9b
-echo Using Local Ollama Model: %MODEL%
+if "%~1"=="" (
+    set MODEL=aria-lfm2
+) else (
+    set MODEL=%~1
+)
+echo Using Local Ollama Model: !MODEL!
 
 :: Set Env Vars for Nedster to bypass TurboQuant but keep large context
 set USE_TURBOQUANT=0
 set TURBOQUANT_CONTEXT_SIZE=262144
 set OLLAMA_FLASH_ATTENTION=1
+set OLLAMA_KV_CACHE_TYPE=q4_0
 
 echo === Nedster is ready ===
 echo Launching nedster...

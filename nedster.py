@@ -1,3 +1,9 @@
+import os
+# Fix for Windows: python client cannot connect to 0.0.0.0
+if os.environ.get("OLLAMA_HOST") == "0.0.0.0":
+    os.environ["OLLAMA_HOST"] = "127.0.0.1"
+    os.environ["OLLAMA_HOST_OVERRIDE_NEDSTER"] = "1"
+
 import sys
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -20,6 +26,7 @@ MODEL_TIERS = {
 }
 
 def _get_tier(name: str):
+    if name.lower().startswith("aria-"): return ("★★★", "Full — Modelfile-baked persona")
     for k, v in MODEL_TIERS.items():
         if k.lower() in name.lower(): return v
     return ("★★☆", "Unknown capability")
@@ -33,7 +40,7 @@ Usage:
   nedster --auto                 → no confirmation, full auto mode
   nedster --think                → enable Qwen think mode
   nedster "fix the bug in foo.py" → one-shot task
-  nedster init                   → create NEDSTER.md in cwd
+  nedster init                   → create nedster_state.json in cwd
   nedster stats                  → show context, VRAM, vector stats
   nedster reset                  → wipe ChromaDB
 """
@@ -151,19 +158,19 @@ def cmd_stats(project_dir: str = "."):
     """Show stats — pass project_dir so print_stats can find todos."""
     print_stats(project_dir)
 def cmd_init(project_dir: str):
-    """Create NEDSTER.md in cwd."""
+    """Create nedster_state.json in cwd."""
     from context_loader import ContextLoader
 
     loader = ContextLoader(project_dir)
     loader._create_nedster_md()
 
-    nedster_path = Path(project_dir) / "NEDSTER.md"
+    nedster_path = Path(project_dir) / "nedster_state.json"
     if nedster_path.exists():
         tui = NedsterTUI()
-        tui.print_success(f"NEDSTER.md created at {nedster_path}")
+        tui.print_success(f"nedster_state.json created at {nedster_path}")
     else:
         tui = NedsterTUI()
-        tui.print_error("Failed to create NEDSTER.md")
+        tui.print_error("Failed to create nedster_state.json")
 
 
 def cmd_reset():
@@ -277,6 +284,8 @@ MODEL_CAPABILITY = {
 
 
 def _get_model_capability(model_name: str) -> str:
+    if model_name.lower().startswith("aria-"):
+        return "full"
     for key, cap in MODEL_CAPABILITY.items():
         if key.lower() in model_name.lower():
             return cap
@@ -735,7 +744,7 @@ def handle_slash_command(cmd: str, agent, project_dir: str, auto: bool, think: b
 
     elif command == "/reload":
         agent.context_loader.read_nedster_md()
-        tui.print_success("NEDSTER.md and personality reloaded.")
+        tui.print_success("nedster_state.json and personality reloaded.")
 
     elif command == "/compact":
         agent.memory._compress_session()
@@ -802,7 +811,7 @@ def main():
         "command",
         nargs="?",
         choices=["init", "stats", "reset"],
-        help="Commands: init (create NEDSTER.md), stats, reset (wipe ChromaDB)",
+        help="Commands: init (create nedster_state.json), stats, reset (wipe ChromaDB)",
     )
 
     parser.add_argument(

@@ -229,15 +229,25 @@ class MemoryManager:
 
     def _boot_milestones(self):
         """Silently load previous session context on startup."""
-        path = os.path.expanduser("~/.aria/milestones.md")
+        import json
+        path = os.path.expanduser("~/.aria/milestones.jsonl")
         if not os.path.exists(path):
             return
         try:
-            with open(path) as f:
+            with open(path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
             if len(lines) < 3:
                 return
-            recent = "".join(lines[-60:]).strip()
+            
+            recent_entries = []
+            for line in lines[-60:]:
+                try:
+                    entry = json.loads(line)
+                    recent_entries.append(f"[{entry.get('timestamp')}] {entry.get('event')}")
+                except json.JSONDecodeError:
+                    continue
+                    
+            recent = "\n".join(recent_entries).strip()
             if recent:
                 self.session_summary = (
                     "[Previous sessions context — use naturally, don't announce]\n"

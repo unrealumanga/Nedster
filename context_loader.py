@@ -219,41 +219,48 @@ class ContextLoader:
         return '\n\n'.join(blocks)
 
     def read_nedster_md(self) -> str:
-        path = self.root / "NEDSTER.md"
+        import json
+        path = self.root / "nedster_state.json"
         if not path.exists(): return ""
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
-        STRIP = ["<|im_", "════", "══ STEP", "I need more context"]
-        for s in STRIP:
-            content = "\n".join(l for l in content.split("\n") if s not in l)
         return content[:2000].strip()
 
     def update_nedster_md(self, new_facts: str, session_id: str = '') -> None:
         """
-        Append new facts to NEDSTER.md under
-        ## Session {datetime}
-        Extracted by LLM at session end (like milestones.md).
+        Append new facts to nedster_state.json under
+        recent_changes.
         """
+        import json
         from datetime import datetime
 
-        nedster_path = self.root / 'NEDSTER.md'
+        nedster_path = self.root / 'nedster_state.json'
 
         # Create if not exists
         if not nedster_path.exists():
             self._create_nedster_md()
 
         try:
-            with open(nedster_path, 'a', encoding='utf-8') as f:
-                session = session_id or datetime.now().strftime('%Y-%m-%d %H:%M')
-                f.write(f"\n## Session {session}\n{new_facts}\n")
+            with open(nedster_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            session = session_id or datetime.now().strftime('%Y-%m-%d %H:%M')
+            if "recent_changes" not in data:
+                data["recent_changes"] = []
+            
+            data["recent_changes"].append(f"[{session}] {new_facts}")
+            
+            with open(nedster_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
         except Exception as e:
-            print(f"[ContextLoader] Failed to update NEDSTER.md: {e}")
+            print(f"[ContextLoader] Failed to update nedster_state.json: {e}")
 
     def _create_nedster_md(self) -> None:
-        """Create NEDSTER.md template."""
+        """Create nedster_state.json template."""
+        import json
         from datetime import datetime
 
-        nedster_path = self.root / 'NEDSTER.md'
+        nedster_path = self.root / 'nedster_state.json'
 
         # Auto-detect info
         language = self._detect_primary_language()
@@ -261,24 +268,22 @@ class ContextLoader:
         test_runner = self._detect_test_runner()
         deps = self._detect_dependencies()
 
-        content = f"""# NEDSTER Project Memory
-## Project: {self.root.name}
-## Language: {language}
-## Entry Point: {entry_point}
-## Test Runner: {test_runner}
-## Key Dependencies: {deps}
-## Architecture Notes:
-(populated by agent over time)
-## Decisions:
-(populated by agent over time)
-## Sessions:
-(populated automatically)
-"""
+        template = {
+            "project": self.root.name,
+            "language": language,
+            "entry_point": entry_point,
+            "test_runner": test_runner,
+            "key_dependencies": deps,
+            "architecture_notes": [],
+            "decisions": [],
+            "recent_changes": []
+        }
+        
         try:
             with open(nedster_path, 'w', encoding='utf-8') as f:
-                f.write(content)
+                json.dump(template, f, indent=2)
         except Exception as e:
-            print(f"[ContextLoader] Failed to create NEDSTER.md: {e}")
+            print(f"[ContextLoader] Failed to create nedster_state.json: {e}")
 
     def _detect_primary_language(self) -> str:
         """Detect primary language by file count."""
