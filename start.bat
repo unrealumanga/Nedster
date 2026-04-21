@@ -80,8 +80,37 @@ if not exist "venv\Scripts\activate.bat" (
 echo === Aria is ready ===
 echo Launching nedster...
 
-:: Automatically start the REPL
 call venv\Scripts\activate.bat
-python nedster.py
+
+:menu
+cls
+echo ===========================
+echo   Nedster - Main Menu
+echo ===========================
+echo 1) Start Interactive TUI Agent
+echo 2) Start Web Dashboard
+echo 3) Replay a Session
+echo 4) Run a one-shot command
+echo 5) Run a swarm command
+echo.
+
+set /p choice="Choose an option [1]: "
+if not defined choice set choice=1
+
+if %choice%==1 (
+    python nedster.py repl
+) else if %choice%==2 (
+    call start_web.bat
+) else if %choice%==3 (
+    python nedster.py replay
+) else if %choice%==4 (
+    set /p prompt="Enter your one-shot command: "
+    python nedster.py oneshot "%prompt%"
+) else if %choice%==5 (
+    set /p prompt="Enter your swarm command: "
+    python nedster.py swarm "%prompt%"
+) else (
+    echo Invalid option. Exiting.
+)
 
 pause

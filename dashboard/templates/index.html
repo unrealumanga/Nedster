@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Nedster Dashboard</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background-color: #1a1a1a;
+        color: #e0e0e0;
+        margin: 0;
+        padding: 2rem;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 2rem;
+      }
+      .card {
+        background-color: #2a2a2a;
+        padding: 1.5rem;
+        border-radius: 8px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
+      }
+      h1,
+      h2 {
+        color: #00aaff;
+        border-bottom: 1px solid #444;
+        padding-bottom: 0.5rem;
+      }
+      h1 {
+        font-size: 2rem;
+      }
+      h2 {
+        font-size: 1.2rem;
+        margin-top: 0;
+      }
+      .stat {
+        display: flex;
+        justify-content: space-between;
+        font-size: 1rem;
+        padding: 0.2rem 0;
+      }
+      .stat span:first-child {
+        color: #aaa;
+      }
+      .log-container {
+        height: 400px;
+        overflow-y: auto;
+        background-color: #111;
+        padding: 1rem;
+        border-radius: 4px;
+        font-family: "SF Mono", "Fira Code", monospace;
+        font-size: 0.8rem;
+      }
+      .log-event {
+        margin-bottom: 0.5rem;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+      }
+      .log-event .type {
+        color: #ffab00;
+      }
+      .log-event .data {
+        color: #ccc;
+      }
+    </style>
+  </head>
+  <body hx-get="/" hx-trigger="every 2s" hx-swap="innerHTML">
+    <h1>🤖 Nedster Web Dashboard</h1>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Project State</h2>
+        <div class="stat">
+          <span>Project:</span> <span>{{ project_name }}</span>
+        </div>
+        <div class="stat"><span>Model:</span> <span>{{ model }}</span></div>
+        <div class="stat">
+          <span>Last Update:</span> <span>{{ last_updated }}</span>
+        </div>
+      </div>
+      <div class="card">
+        <h2>System Monitor</h2>
+        <div class="stat"><span>VRAM:</span> <span>{{ vram }}</span></div>
+        <div class="stat"><span>CPU:</span> <span>{{ cpu }}</span></div>
+        <div class="stat"><span>RAM:</span> <span>{{ ram }}</span></div>
+      </div>
+    </div>
+
+    <div class="card" style="grid-column: 1 / -1; margin-top: 2rem">
+      <h2>Live Event Log (Last 20)</h2>
+      <div class="log-container">
+        {% for event in log_events %}
+        <div class="log-event">
+          <span class="type">[{{ event.type }}]</span>
+          <span class="data">{{ event.data | tojson(indent=2) }}</span>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </body>
+</html>

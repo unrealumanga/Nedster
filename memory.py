@@ -1,14 +1,15 @@
-
 class SessionLog:
     """
     Durable append-only event log. Lives outside agent.py.
     Survives harness crashes. Enables wake/resume.
     Pattern: Anthropic Managed Agents session architecture.
     """
+
     def __init__(self, session_id: str):
         import os, json
         from pathlib import Path
         from datetime import datetime
+
         self.session_id = session_id
         log_dir = Path.home() / ".aria" / "session_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -18,6 +19,7 @@ class SessionLog:
 
     def _load(self):
         import json
+
         if self.log_path.exists():
             with open(self.log_path) as f:
                 for line in f:
@@ -30,11 +32,8 @@ class SessionLog:
         """Write event to durable log immediately."""
         import json
         from datetime import datetime
-        event = {
-            "type": event_type,
-            "ts": datetime.now().isoformat(),
-            "data": data
-        }
+
+        event = {"type": event_type, "ts": datetime.now().isoformat(), "data": data}
         self._events.append(event)
         with open(self.log_path, "a") as f:
             f.write(json.dumps(event) + "\n")
@@ -51,6 +50,7 @@ class SessionLog:
     def wake(cls, session_id: str) -> "SessionLog":
         """Resume a crashed session from its event log."""
         return cls(session_id)
+
 
 # File: memory.py
 import ollama
@@ -82,9 +82,9 @@ def _strip_poison(summary: str) -> str:
 
 
 class MemoryManager:
-
     def _init_session_db(self):
         import sqlite3, os
+
         db_path = os.path.expanduser("~/.aria/sessions.db")
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
@@ -93,28 +93,31 @@ class MemoryManager:
             USING fts5(session_id, date, topic, content)
         """)
         self._db.commit()
-    
+
     def save_to_search_db(self, session_id: str, topic: str, content: str):
         from datetime import datetime
+
         self._db.execute(
             "INSERT INTO sessions VALUES (?,?,?,?)",
-            (session_id, datetime.now().isoformat(), topic, content[:5000])
+            (session_id, datetime.now().isoformat(), topic, content[:5000]),
         )
         self._db.commit()
-    
+
     def search_sessions(self, query: str, limit: int = 5) -> list[dict]:
         try:
             cursor = self._db.execute(
                 "SELECT session_id, date, topic, content "
                 "FROM sessions WHERE sessions MATCH ? "
                 "ORDER BY rank LIMIT ?",
-                (query, limit)
+                (query, limit),
             )
-            return [{"session_id": r[0], "date": r[1],
-                     "topic": r[2], "snippet": r[3][:200]}
-                    for r in cursor.fetchall()]
+            return [
+                {"session_id": r[0], "date": r[1], "topic": r[2], "snippet": r[3][:200]}
+                for r in cursor.fetchall()
+            ]
         except Exception:
             return []
+
     def __init__(self, llm_model_name: str):
         self.model = llm_model_name
         self.short_term = []  # raw message dicts [{role, content}]
@@ -230,6 +233,7 @@ class MemoryManager:
     def _boot_milestones(self):
         """Silently load previous session context on startup."""
         import json
+
         path = os.path.expanduser("~/.aria/milestones.jsonl")
         if not os.path.exists(path):
             return
@@ -238,15 +242,17 @@ class MemoryManager:
                 lines = f.readlines()
             if len(lines) < 3:
                 return
-            
+
             recent_entries = []
             for line in lines[-60:]:
                 try:
                     entry = json.loads(line)
-                    recent_entries.append(f"[{entry.get('timestamp')}] {entry.get('event')}")
+                    recent_entries.append(
+                        f"[{entry.get('timestamp')}] {entry.get('event')}"
+                    )
                 except json.JSONDecodeError:
                     continue
-                    
+
             recent = "\n".join(recent_entries).strip()
             if recent:
                 self.session_summary = (
@@ -262,3 +268,49 @@ class MemoryManager:
             if msg["role"] == "assistant":
                 return msg["content"][:500]
         return ""
+
+    def get_context_percentage(self, max_tokens=8192):
+        """Calculates the current context window usage."""
+        # Get all messages that would be sent to the model
+        messages_to_send = self.get_context_messages()
+        total_chars = sum(len(m.get("content", "")) for m in messages_to_send)
+        # Rough approximation: 4 chars per token
+        current_tokens = total_chars / 4
+        return int((current_tokens / max_tokens) * 100)
+
+    def load_session_from_log(self, log_path: str):
+        """Clears current memory and loads a session from a .jsonl log file."""
+        import json
+
+        self.clear()
+
+        # Re-initialize with the new session ID from the filename
+        self.session_id = os.path.basename(log_path).replace(".jsonl", "")
+
+        reconstructed_turns = []
+        try:
+            with open(log_path, "r") as f:
+                for line in f:
+                    event = json.loads(line)
+                    if event["type"] == "user_input":
+                        reconstructed_turns.append(
+                            {"role": "user", "content": event["data"]["text"]}
+                        )
+                    # This assumes the full response is logged, not just chunks
+                    # A more robust implementation would reconstruct from chunks
+                    elif event["type"] == "llm_response":
+                        reconstructed_turns.append(
+                            {"role": "assistant", "content": event["data"]["text"]}
+                        )
+
+            self.short_term = reconstructed_turns
+            self.turn_count = len(reconstructed_turns) // 2
+
+            # Auto-compress if the loaded session is large
+            if len(self.short_term) > 20:
+                self._compress_session()
+
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to load session {log_path}: {e}")
+            return False

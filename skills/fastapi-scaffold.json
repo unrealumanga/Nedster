@@ -1,0 +1,10 @@
+{
+  "name": "fastapi_scaffold",
+  "description": "Scaffolds a complete FastAPI project with SQLite and Alembic.",
+  "entry_point": "scaffold.py",
+  "files": {
+    "scaffold.py": "https://raw.githubusercontent.com/user/repo/main/fastapi-scaffold/scaffold.py",
+    "templates/main.py.j2": "https://raw.githubusercontent.com/user/repo/main/fastapi-scaffold/templates/main.py.j2",
+    "templates/models.py.j2": "https://raw.githubusercontent.com/user/repo/main/fastapi-scaffold/templates/models.py.j2"
+  }
+}

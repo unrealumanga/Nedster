@@ -86,14 +86,12 @@ class NedsterTUI:
             self.console.print("\n[Cancelled]", style=self.COLORS["warning"])
             return False
 
-
     def print_response(self, text: str):
         """Print agent response, stripping raw tool XML."""
         import re
+
         # Remove tool call blocks — activity feed handles display
-        clean = re.sub(
-            r'<tool\s+name="[^"]*">.*?</tool>\s*',
-            '', text, flags=re.DOTALL)
+        clean = re.sub(r'<tool\s+name="[^"]*">.*?</tool>\s*', "", text, flags=re.DOTALL)
         # Remove any trailing whitespace artifacts
         clean = clean.strip()
         if clean:
@@ -113,6 +111,29 @@ class NedsterTUI:
         else:
             self.console.print(f"[{style}][Nedster] {msg}[/]")
 
+    def print_boot_logo(self):
+        """Prints the ASCII logo."""
+        self.console.print(
+            "[bold cyan] ██   ██  ███████  ██████   ███████  ███████  ███████  ██████  [/]"
+        )
+        self.console.print(
+            "[bold cyan] ███  ██  ██       ██   ██  ██         ███    ██       ██   ██ [/]"
+        )
+        self.console.print(
+            "[bold cyan] ██ █ ██  █████    ██   ██  ███████    ███    █████    ██████  [/]"
+        )
+        self.console.print(
+            "[bold cyan] ██  ███  ██       ██   ██       ██    ███    ██       ██  ██  [/]"
+        )
+        self.console.print(
+            "[bold cyan] ██   ██  ███████  ██████   ███████    ███    ███████  ██   ██ [/]"
+        )
+        self.console.print("                      [dim]Unchained Local AI[/]\n")
+
+    def print_status_bar(self, text: str):
+        """Prints a simple, single-line status bar."""
+        self.console.print(Panel(text, style="dim", border_style="dim", padding=(0, 1)))
+
     def print_boot(
         self,
         project: str,
@@ -129,11 +150,21 @@ class NedsterTUI:
         auto: bool,
     ) -> None:
         """Print detailed boot screen."""
-        self.console.print("[bold cyan] ██   ██  ███████  ██████   ███████  ███████  ███████  ██████  [/]")
-        self.console.print("[bold cyan] ███  ██  ██       ██   ██  ██         ███    ██       ██   ██ [/]")
-        self.console.print("[bold cyan] ██ █ ██  █████    ██   ██  ███████    ███    █████    ██████  [/]")
-        self.console.print("[bold cyan] ██  ███  ██       ██   ██       ██    ███    ██       ██  ██  [/]")
-        self.console.print("[bold cyan] ██   ██  ███████  ██████   ███████    ███    ███████  ██   ██ [/]")
+        self.console.print(
+            "[bold cyan] ██   ██  ███████  ██████   ███████  ███████  ███████  ██████  [/]"
+        )
+        self.console.print(
+            "[bold cyan] ███  ██  ██       ██   ██  ██         ███    ██       ██   ██ [/]"
+        )
+        self.console.print(
+            "[bold cyan] ██ █ ██  █████    ██   ██  ███████    ███    █████    ██████  [/]"
+        )
+        self.console.print(
+            "[bold cyan] ██  ███  ██       ██   ██       ██    ███    ██       ██  ██  [/]"
+        )
+        self.console.print(
+            "[bold cyan] ██   ██  ███████  ██████   ███████    ███    ███████  ██   ██ [/]"
+        )
         self.console.print("                      [dim]Unchained Local AI[/]\n")
 
         think_str = "ON" if think else "OFF"
@@ -175,42 +206,34 @@ class NedsterTUI:
         """Print thinking content in dim italic."""
         self.console.print(content, style=self.COLORS["thinking"])
 
-    def print_status_bar(
-        self,
-        project: str,
-        model: str,
-        model_size_gb: float,
-        ctx_pct: int,
-        calls: int,
-        edits: int,
-        think: bool,
-    ):
-        think_str = "ON" if think else "OFF"
-        size_str = f"({model_size_gb:.1f} GB)" if model_size_gb > 0 else ""
-        msg = f" Nedster · {project} · {model} {size_str} · ctx {ctx_pct}% · {calls} calls · {edits} edits · think {think_str} "
+    def print_status_bar(self, text: str):
+        """Prints a single-line status bar with the provided text."""
         width = 85
+        panel_text = text.ljust(width)
         self.console.print(f"┌{'─' * width}┐", style="color(244)")
-        self.console.print(f"│{msg.ljust(width)}│", style="color(244)")
+        self.console.print(f"│{panel_text}│", style="color(244)")
         self.console.print(f"└{'─' * width}┘", style="color(244)")
-
 
 
 # ── nedster_fixer: output strip ───────────────────────────────────────────────
 
+
 def _strip_model_artifacts(text: str) -> str:
     """Remove hallucinated tool XML and identity anchors from model output."""
     import re as _re
+
     # Raw tool call XML echoed by weak models
-    text = _re.sub(r'<tool\s+name="[^"]*">.*?</tool>', '', text, flags=_re.DOTALL)
+    text = _re.sub(r'<tool\s+name="[^"]*">.*?</tool>', "", text, flags=_re.DOTALL)
     # [YOU ARE NEDSTER. ...] echoed from system prompt
-    text = _re.sub(r'\[YOU ARE NEDSTER\..*?\]', '', text, flags=_re.DOTALL)
-    text = _re.sub(r'YOU ARE NEDSTER[.,][^\n]*', '', text)
+    text = _re.sub(r"\[YOU ARE NEDSTER\..*?\]", "", text, flags=_re.DOTALL)
+    text = _re.sub(r"YOU ARE NEDSTER[.,][^\n]*", "", text)
     # === FILE: ... === echoed format markers
-    text = _re.sub(r'={3,}\s*FILE:.*?={3,}', '', text, flags=_re.DOTALL)
+    text = _re.sub(r"={3,}\s*FILE:.*?={3,}", "", text, flags=_re.DOTALL)
     # **Final response:** / **Final reply:**
-    text = _re.sub(r'\*\*Final (?:response|reply):\*\*\s*', '', text)
+    text = _re.sub(r"\*\*Final (?:response|reply):\*\*\s*", "", text)
     # Trailing open code fence
-    text = _re.sub(r'```\s*$', '', text)
+    text = _re.sub(r"```\s*$", "", text)
     return text.strip()
+
 
 # ─────────────────────────────────────────────────────────────────────────────

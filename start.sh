@@ -90,4 +90,39 @@ echo "Heartbeat PID: $HEARTBEAT_PID"
 echo "Python: $(which python3)"
 echo ""
 echo "Starting chat..."
-python3 nedster.py
+
+echo "==========================="
+echo "  Nedster - Main Menu"
+echo "==========================="
+echo "1) Start Interactive TUI Agent"
+echo "2) Start Web Dashboard"
+echo "3) Replay a Session"
+echo "4) Run a one-shot command"
+echo "5) Run a swarm command"
+echo ""
+read -p "Choose an option [1]: " choice
+choice=${choice:-1}
+
+case $choice in
+    1)
+        python3 nedster.py repl
+        ;;
+    2)
+        ./start_web.sh
+        ;;
+    3)
+        python3 nedster.py replay
+        ;;
+    4)
+        read -p "Enter your one-shot command: " prompt
+        python3 nedster.py oneshot "$prompt"
+        ;;
+    5)
+        read -p "Enter your swarm command: " prompt
+        python3 nedster.py swarm "$prompt"
+        ;;
+    *)
+        echo "Invalid option. Exiting."
+        exit 1
+        ;;
+esac
