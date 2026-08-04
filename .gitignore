@@ -3,6 +3,7 @@ __pycache__/
 venv/
 .venv/
 *.pyc
+*.egg-info/
 
 # Database
 chroma_db/
@@ -24,6 +25,7 @@ session_memory.md
 *.bak
 patch_*.py
 fix_*.py
-test_*.py
+/test_*.py
+!tests/test_*.py
 .env
 theme_guide.md

@@ -1,0 +1,40 @@
+[models]
+# "auto" scores the models already installed in Ollama against the detected hardware tier.
+ollama_url = "http://127.0.0.1:11434"
+router = "auto"
+coder = "auto"
+reasoner = "auto"
+critic = "auto"
+router_keep_alive = "-1"
+worker_keep_alive = "90s"
+local_thinking = true
+
+# Local-only is the default. Enable this deliberately and export OPENAI_API_KEY to add a
+# quality-first oracle without sending routine project work to the cloud.
+cloud_oracle_enabled = false
+cloud_model = "gpt-5.6-sol"
+cloud_reasoning_effort = "high"
+cloud_reasoning_mode = "standard" # set to "pro" only after an eval shows value
+cloud_reasoning_context = "current_turn"
+
+[sandbox]
+backend = "auto"                 # Linux: bubblewrap -> gVisor -> Podman -> Docker
+network = "deny"
+max_seconds = 120
+max_output_chars = 100000
+allow_unsafe_fallback = false
+docker_image = "python:3.13-slim"
+firecracker_wrapper = ""
+
+[policy]
+# With autonomous=false, only read operations are automatically authorized.
+autonomous = false
+max_auto_risk = "write"
+allowed_commands = ["python", "python3", "pytest", "git", "rg", "ruff", "uv", "npm", "node", "cargo", "go"]
+denied_fragments = ["rm -rf /", "Remove-Item -Recurse", "format ", "mkfs", "shutdown", "reboot", ":(){:|:&};:"]
+
+[runtime]
+state_dir = "~/.nedster/ironclad"
+max_worker_turns = 8
+max_parallel_workers = 2
+ledger_key_env = "NEDSTER_LEDGER_KEY"

@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=78", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nedster-agent"
+version = "3.0.0a1"
+description = "Ironclad local-first router/worker coding agent with hardware-aware inference and capability-gated tools"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "unrealumanga" }]
+keywords = ["local-llm", "coding-agent", "ollama", "llama-cpp", "tui", "sandbox"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Build Tools",
+]
+dependencies = [
+  "httpx>=0.27,<1",
+  "psutil>=5.9,<8",
+  "rich>=13.9,<15",
+  "textual>=1.0,<3",
+]
+
+[project.optional-dependencies]
+legacy = [
+  "click>=8,<9",
+  "ollama>=0.3",
+  "prompt-toolkit>=3",
+  "python-dotenv>=1",
+]
+rag = [
+  "chromadb>=0.5",
+  "sentence-transformers>=2.7",
+  "rank-bm25>=0.2.2",
+]
+dev = [
+  "pytest>=8,<10",
+  "pytest-asyncio>=0.24,<2",
+  "ruff>=0.12,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/unrealumanga/Nedster"
+Repository = "https://github.com/unrealumanga/Nedster"
+Issues = "https://github.com/unrealumanga/Nedster/issues"
+
+[project.scripts]
+nedster-ironclad = "ironclad.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ironclad*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
