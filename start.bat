@@ -41,7 +41,7 @@ goto :eof
 
 :run
 REM ── Normal start ───────────────────────────────────────────
-echo === Aria RAG Stack - Starting (Windows) ===
+echo === Nedster Ironclad - Starting (Windows) ===
 
 :: Speed env vars for Ollama
 set OLLAMA_FLASH_ATTENTION=1
@@ -50,7 +50,7 @@ set OLLAMA_NUM_PARALLEL=1
 set OLLAMA_NUM_THREADS=8
 set OMP_NUM_THREADS=8
 
-:: Build the custom Aria model from Modelfile (only if not already built)
+:: Ensure the upstream base for the canonical Nedster model is installed.
 ollama list | findstr /I "qwen3.5:9b" >nul
 if %ERRORLEVEL% neq 0 (
     echo Pulling base model...
@@ -65,9 +65,11 @@ if %ERRORLEVEL% neq 0 (
     timeout /T 3 /NOBREAK >nul
 )
 
+ollama create nedster -f Modelfile.nedster
+
 :: Warm up the model
 echo Warming up model...
-start /B ollama run qwen3.5:9b "ping" >nul 2>&1
+start /B ollama run nedster "ping" >nul 2>&1
 echo Model warm.
 
 :: Check Virtual Environment
@@ -77,7 +79,7 @@ if not exist "venv\Scripts\activate.bat" (
     exit /b 1
 )
 
-echo === Aria is ready ===
+echo === Nedster Ironclad is ready ===
 echo Launching nedster...
 
 call venv\Scripts\activate.bat

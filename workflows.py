@@ -10,7 +10,7 @@ import json, subprocess, os
 from pathlib import Path
 from datetime import datetime
 
-WORKFLOWS_DIR = Path.home() / ".aria" / "workflows"
+WORKFLOWS_DIR = Path.home() / ".nedster" / "workflows"
 DEFAULT_WORKFLOWS = {
     "sketchup_to_d5": {
         "name": "SketchUp -> D5 Renderer",

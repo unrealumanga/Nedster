@@ -43,7 +43,7 @@ class RAGPipeline:
         self._load_active_projects()
 
     def _load_milestones_into_context(self):
-        path = os.path.expanduser("~/.aria/milestones.md")
+        path = os.path.expanduser("~/.nedster/milestones.md")
         if os.path.exists(path):
             with open(path) as f:
                 lines = f.readlines()
@@ -77,8 +77,8 @@ class RAGPipeline:
                 },
             )
             milestones = resp["response"].strip()
-            os.makedirs(os.path.expanduser("~/.aria"), exist_ok=True)
-            with open(os.path.expanduser("~/.aria/milestones.md"), "a") as f:
+            os.makedirs(os.path.expanduser("~/.nedster"), exist_ok=True)
+            with open(os.path.expanduser("~/.nedster/milestones.md"), "a") as f:
                 f.write(
                     f"\n## {datetime.now().strftime('%Y-%m-%d %H:%M')} "
                     f"Session {self.memory.session_id}\n{milestones}\n"
@@ -700,7 +700,7 @@ class RAGPipeline:
                 import subprocess
 
                 subprocess.run(["ollama", "pull", "qwen3.5:9b"])
-                subprocess.run(["ollama", "create", "aria-qwen", "-f", "./Modelfile"])
+                subprocess.run(["ollama", "create", "nedster", "-f", "./Modelfile.nedster"])
                 print("\nModel built. Please try your query again.")
         except Exception as e:
             err_str = str(e).lower()

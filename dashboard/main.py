@@ -25,7 +25,7 @@ def get_nedster_state():
 def get_session_log():
     """Reads the latest session log."""
     try:
-        log_dir = Path.home() / ".aria" / "sessions"
+        log_dir = Path.home() / ".nedster" / "sessions"
         latest_log = sorted(log_dir.glob("*.log"), key=os.path.getmtime, reverse=True)[
             0
         ]

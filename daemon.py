@@ -5,14 +5,14 @@ Usage: nedster --daemon [mode1,mode2,...]
        nedster --daemon sentinel,trader
 
 Each daemon is a background thread polling on its own interval.
-Daemon alerts written to ~/.aria/daemon_alerts/ for pickup
+Daemon alerts written to ~/.nedster/daemon_alerts/ for pickup
 at next interactive session.
 """
 import threading, time, os, json, subprocess
 from datetime import datetime
 from pathlib import Path
 
-ALERT_DIR = Path.home() / ".aria" / "daemon_alerts"
+ALERT_DIR = Path.home() / ".nedster" / "daemon_alerts"
 
 def write_alert(daemon: str, message: str, priority: str = "normal"):
     """Write alert for pickup at next session start."""
@@ -80,7 +80,7 @@ class SentinelDaemon(DaemonBase):
                 parts = r.stdout.strip().split(",")
                 used_pct = int(parts[0]) / int(parts[1]) * 100
                 if used_pct > 92:
-                    write_alert("sentinel", f"⚠️ VRAM critical: {used_pct:.0f}% used. Run: ollama stop aria-qwen", priority="urgent")
+                    write_alert("sentinel", f"⚠️ VRAM critical: {used_pct:.0f}% used. Run: ollama stop nedster", priority="urgent")
         except Exception: pass
         
         # Check if known bots are still running in tmux
@@ -180,7 +180,7 @@ class FileWatchDaemon(DaemonBase):
     
     def _queue_for_ingest(self, filepath: str):
         """Write to ingest queue for next session pickup."""
-        queue_path = Path.home()/".aria"/"ingest_queue.json"
+        queue_path = Path.home()/".nedster"/"ingest_queue.json"
         try:
             queue = []
             if queue_path.exists():
@@ -223,7 +223,7 @@ class ScoutDaemon(DaemonBase):
         topics = self.config.get("topics", [
             "ollama new release", "qwen model update",
             "bybit API changes", "local LLM benchmark 2026",
-            "aria-qwen", "gguf quantization news",
+            "nedster", "gguf quantization news",
         ])
         try:
             from tools import duckduckgo_search
@@ -234,7 +234,7 @@ class ScoutDaemon(DaemonBase):
                     results.append(f"## {topic}\n{r[:300]}")
             
             if results:
-                journal_dir = Path.home() / ".aria" / "journal" / "research"
+                journal_dir = Path.home() / ".nedster" / "journal" / "research"
                 journal_dir.mkdir(parents=True, exist_ok=True)
                 date = datetime.now().strftime("%Y-%m-%d")
                 path = journal_dir / f"{date}-scout.md"
@@ -257,7 +257,7 @@ class SkillBuilderDaemon(DaemonBase):
         """
         import re
         # Read recent milestones for failure patterns
-        mile_path = Path.home() / ".aria" / "milestones.md"
+        mile_path = Path.home() / ".nedster" / "milestones.md"
         if not mile_path.exists(): return
         
         with open(mile_path) as f:
@@ -277,7 +277,7 @@ class SkillBuilderDaemon(DaemonBase):
                     themes.setdefault(keyword, []).append(err)
         
         # Write skill files for top themes
-        skills_dir = Path.home() / ".aria" / "skills"
+        skills_dir = Path.home() / ".nedster" / "skills"
         skills_dir.mkdir(parents=True, exist_ok=True)
         for theme, items in list(themes.items())[:3]:
             skill_path = skills_dir / f"{theme}-patterns" / "SKILL.md"

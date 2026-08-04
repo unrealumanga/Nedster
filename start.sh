@@ -23,11 +23,11 @@ if [ -f "./venv/bin/activate" ]; then
     echo "Venv activated: $VIRTUAL_ENV"
 
 # Ensure num_gpu is removed so Ollama auto-allocates memory safely
-sed -i "/^PARAMETER num_gpu/d" ./Modelfile
+sed -i "/^PARAMETER num_gpu/d" ./Modelfile.nedster
 echo "VRAM strict allocation removed. Ollama will auto-manage memory."
 
 # Rebuild model without strict num_gpu
-ollama create aria-qwen -f ./Modelfile 2>/dev/null && echo "Model rebuilt OK"
+ollama create nedster -f ./Modelfile.nedster 2>/dev/null && echo "Model rebuilt OK"
 
 
 else
@@ -42,37 +42,37 @@ if ! pgrep -x ollama > /dev/null; then
     sleep 3
 fi
 
-# Build aria-qwen model if not exists
-if ! ollama list 2>/dev/null | grep -q "aria-qwen"; then
-    echo "Building aria-qwen from Modelfile..."
-    ollama create aria-qwen -f ./Modelfile
+# Build the canonical Nedster model if it is missing.
+if ! ollama list 2>/dev/null | grep -q "nedster"; then
+    echo "Building nedster from Modelfile.nedster..."
+    ollama create nedster -f ./Modelfile.nedster
 fi
 
 # Async warm-up: don't block startup
-(ollama run aria-qwen "" > /dev/null 2>&1 || true) &
+(ollama run nedster "" > /dev/null 2>&1 || true) &
 WARMUP_PID=$!
 echo "Model warming in background (PID: $WARMUP_PID)..." 
 
 # Background heartbeat: prevent VRAM unload (ping every 240s)
 (while true; do
     sleep 200
-    ollama run aria-qwen "" > /dev/null 2>&1 || true
+    ollama run nedster "" > /dev/null 2>&1 || true
 done) &
 HEARTBEAT_PID=$!
 trap "kill $HEARTBEAT_PID 2>/dev/null; echo 'Heartbeat stopped'" EXIT
 
 # Verify imports
 python3 -c "
-import rank_bm25, chromadb, sentence_transformers, tiktoken, fitz, torch, tqdm, psutil, ollama
+import rank_bm25, chromadb, sentence_transformers, tiktoken, fitz, tqdm, psutil, ollama
 print('All imports OK')
 " || { echo "ERROR: Missing packages. Run: pip install -r requirements.txt"; exit 1; }
 
 # Create required dirs
-mkdir -p ~/.aria
+mkdir -p ~/.nedster
 mkdir -p ~/AI_Lab/archives
 mkdir -p ~/AI_Lab/quarantine
-touch ~/.aria/milestones.md
-touch ~/.aria/workflows.jsonl
+touch ~/.nedster/milestones.md
+touch ~/.nedster/workflows.jsonl
 
 echo -e "\033[1;36m"
 echo -e "\033[1;36m ██   ██  ███████  ██████   ███████  ███████  ███████  ██████  \033[0m"
@@ -82,7 +82,7 @@ echo -e "\033[1;36m ██  ███  ██       ██   ██       ██
 echo -e "\033[1;36m ██   ██  ███████  ██████   ███████    ███    ███████  ██   ██ \033[0m"
 echo -e "                      \033[38;5;245mUnchained Local AI\033[0m"
 echo ""
-echo "=== Aria RAG Stack Ready ==="
+echo "=== Nedster Ironclad Ready ==="
 echo "Flash Attention: $OLLAMA_FLASH_ATTENTION"
 echo "KV Cache: $OLLAMA_KV_CACHE_TYPE"
 echo "Keep Alive: $OLLAMA_KEEP_ALIVE"

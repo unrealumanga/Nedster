@@ -7,10 +7,11 @@ import psutil
 import subprocess
 import chromadb
 
+from core.model_registry import resolve_model
+from personality import load_personality
+
 
 def print_stats():
-    import torch
-
     # CPU RAM: X.X GB used / 64.0 GB total
     cpu_ram = psutil.virtual_memory()
     used_gb = cpu_ram.used / (1024**3)
@@ -60,8 +61,8 @@ def print_stats():
         "  KV Cache Type: ",
         os.environ.get("OLLAMA_KV_CACHE_TYPE", "NOT SET (run start.sh)"),
     )
-    print("  CPU Threads:   ", torch.get_num_threads())
-    print("  Model:          aria-qwen (Modelfile-optimized)")
+    print("  CPU Threads:   ", psutil.cpu_count(logical=True) or 1)
+    print(f"  Model:          {resolve_model()} (hardware-profiled)")
 
 
 def check_ollama():
@@ -121,7 +122,7 @@ def main():
 
         pipeline = RAGPipeline()
         import os
-        milestone_path = os.path.expanduser("~/.aria/milestones.md")
+        milestone_path = os.path.expanduser("~/.nedster/milestones.md")
         milestone_count = 0
         if os.path.exists(milestone_path):
             with open(milestone_path) as f:
@@ -136,11 +137,12 @@ def main():
         else:
             time_greeting = "Evening"
 
+        personality = load_personality()
+        name = personality.get("name", "Nedster")
         if milestone_count > 0:
-            print(f"Aria. {time_greeting}, H2. "
-                  f"({milestone_count} past sessions loaded)")
+            print(f"{name}. {time_greeting}. ({milestone_count} past sessions loaded)")
         else:
-            print("Aria. Ready.")
+            print(personality.get("greeting", f"{name}. Ready."))
         print("Type 'exit' to quit | '/clear' to reset memory | '/plan [task]' for multi-step\n")
         while True:
             try:

@@ -1,6 +1,6 @@
 """
 Ralph supervisor loop for Nedster.
-Uses qwen3-4b (2.5GB) to supervise aria-qwen (6.6GB).
+Uses a compact local model to supervise the primary Nedster worker.
 Models run SEQUENTIALLY — not simultaneously — to fit 8GB VRAM.
 
 Supervisor runs BETWEEN turns, not during streaming.

@@ -7,8 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-JOURNAL_ROOT = Path.home() / ".aria" / "journal"
-INGEST_LOG = Path.home() / ".aria" / "ingest_log.txt"
+JOURNAL_ROOT = Path.home() / ".nedster" / "journal"
+INGEST_LOG = Path.home() / ".nedster" / "ingest_log.txt"
 
 # ── Topic detection ───────────────────────────────────────────────────────────
 TOPIC_KEYWORDS = {
@@ -25,14 +25,14 @@ TOPIC_KEYWORDS = {
         "usdt",
         "signal",
     ],
-    "aria-system": [
+    "nedster-system": [
         "modelfile",
         "fix",
         "directive",
         "rag",
         "embedding",
         "chromadb",
-        "aria",
+        "nedster",
         "memory",
         "milestone",
     ],
@@ -182,7 +182,7 @@ def write_journal_entry(
     subdir = {
         "research": "research",
         "crypto-trading": "sessions",
-        "aria-system": "sessions",
+        "nedster-system": "sessions",
         "coding": "sessions",
         "system": "sessions",
     }.get(topic, "sessions")
@@ -307,7 +307,7 @@ def log_decision(
     path.write_text(content, encoding="utf-8")
 
     # Also append one-liner to milestones
-    milestones_path = Path.home() / ".aria" / "milestones.md"
+    milestones_path = Path.home() / ".nedster" / "milestones.md"
     with open(milestones_path, "a", encoding="utf-8") as f:
         f.write(f"\n[DECISION] {date_str}: {decision}")
     return path

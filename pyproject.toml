@@ -33,6 +33,7 @@ legacy = [
   "ollama>=0.3",
   "prompt-toolkit>=3",
   "python-dotenv>=1",
+  "watchdog>=4,<7",
 ]
 rag = [
   "chromadb>=0.5",

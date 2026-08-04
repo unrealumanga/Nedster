@@ -26,7 +26,7 @@ if %ERRORLEVEL% neq 0 (
 
 :: Model selection
 if "%~1"=="" (
-    set MODEL=aria-lfm2
+    set MODEL=nedster
 ) else (
     set MODEL=%~1
 )
@@ -34,7 +34,7 @@ echo Using Local Ollama Model: !MODEL!
 
 :: Set Env Vars for Nedster to bypass TurboQuant but keep large context
 set USE_TURBOQUANT=0
-set TURBOQUANT_CONTEXT_SIZE=262144
+set TURBOQUANT_CONTEXT_SIZE=65536
 set OLLAMA_FLASH_ATTENTION=1
 set OLLAMA_KV_CACHE_TYPE=q4_0
 

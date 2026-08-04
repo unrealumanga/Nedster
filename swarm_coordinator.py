@@ -6,8 +6,10 @@ import ollama
 from pathlib import Path
 import time
 
+from core.model_registry import resolve_model
+
 DB_PATH = "swarm.db"
-OLLAMA_MODEL_PRIMARY = "aria-local"
+OLLAMA_MODEL_PRIMARY = resolve_model()
 OLLAMA_MODEL_FALLBACK = "qwen3.5:9b"
 PYTHON_EXECUTABLE = "python3"
 

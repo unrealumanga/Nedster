@@ -179,7 +179,7 @@ def check_vram_before_load(model_size_mb: int) -> str:
     needed = int(model_size_mb * 1.2)
     if free >= needed:
         return f"OK — {free}MB free, {needed}MB needed"
-    return f"VRAM insufficient: {free}MB free, {needed}MB needed. Options: use CPU (device='cpu'), unload aria-qwen first (ollama stop aria-qwen), or use smaller model."
+    return f"VRAM insufficient: {free}MB free, {needed}MB needed. Options: use CPU (device='cpu'), unload nedster first (ollama stop nedster), or use a smaller model."
 
 
 from typing import List, Dict
@@ -275,7 +275,9 @@ def _win_list_dir(cmd: str) -> str:
     return r.stdout
 
 def run_bash(cmd: str, timeout: int = 45, **kwargs) -> str:
-    import subprocess, os, sys
+    import os, sys
+
+    from core.sandbox import Sandbox
     if sys.platform == "win32":
         WINDOWS_REDIRECTS = {
             "tmux new-session": lambda c: bot_runner("start", bot_name=c.split()[-1]),
@@ -290,16 +292,19 @@ def run_bash(cmd: str, timeout: int = 45, **kwargs) -> str:
     
     cmd = os.path.expanduser(cmd)
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=SESSION.active_project_dir)
-        output = result.stdout + result.stderr
+        workspace = SESSION.active_project_dir or os.getcwd()
+        result = Sandbox(workspace).run(
+            cmd,
+            timeout=timeout,
+            network=bool(kwargs.get("network", False)),
+        )
+        output = result.as_tool_output()
         if len(output) > 3000: output = output[:3000] + "\n...[truncated]"
-        exit_str = f"\n[exit code: {result.returncode}]" if result.returncode != 0 else "\n[exit 0]"
-        cwd_used = SESSION.active_project_dir or os.getcwd()
+        exit_str = f"\n[exit code: {result.exit_code}]" if result.exit_code != 0 else "\n[exit 0]"
+        cwd_used = workspace
         output_with_cwd = f"[cwd: {cwd_used}]\n{output}"
-        if not output.strip() and result.returncode == 0: return f"[OK — command ran, no output]{exit_str}"
+        if not output.strip() and result.exit_code == 0: return f"[OK — command ran, no output]{exit_str}"
         return output_with_cwd + exit_str
-    except subprocess.TimeoutExpired:
-        return f"[TIMEOUT after {timeout}s]"
     except Exception as e:
         return f"[ERROR: {e}]"
 
@@ -433,7 +438,7 @@ def _repair_json(raw: str) -> str:
 
 def parse_tool_calls(text: str) -> list:
     """
-    Extract tool calls handling ALL format variants Aria might generate:
+    Extract tool calls handling all legacy model format variants:
     - Correct:  <tool name="bash">{"cmd": "ls"}</tool>
     - Broken 1: <tool name="bash"><parameter=cmd>ls</parameter>
     - Broken 2: <tool_call>{"name": "bash", "cmd": "ls"}</tool_call>
@@ -554,7 +559,7 @@ def parse_tool_calls(text: str) -> list:
     return results
 class ContinuityWatchdog:
     """
-    Prevents Aria from going silent mid-session.
+    Prevents the local worker from going silent mid-session.
     If no output for >30s during a tool loop, prints a heartbeat.
     """
 
@@ -592,7 +597,7 @@ class ContinuityWatchdog:
 
 WATCHDOG = ContinuityWatchdog(timeout=30)
 
-TAVILY_KEY_PATH = _resolve_path("~/.aria/tavily.key")
+TAVILY_KEY_PATH = str(Path.home() / ".nedster" / "tavily.key")
 
 
 def _load_tavily_key() -> str:
@@ -614,7 +619,7 @@ def store_tavily_key(key: str) -> str:
         with open(TAVILY_KEY_PATH, "w") as f:
             f.write(key.strip())
         os.chmod(TAVILY_KEY_PATH, 0o600)  # owner read only
-        return "Tavily key stored securely at ~/.aria/tavily.key"
+        return "Tavily key stored securely at ~/.nedster/tavily.key"
     except Exception as e:
         return f"Failed to store Tavily key: {e}"
 
@@ -1913,7 +1918,7 @@ def secret_scan(path: str = ".", fix: bool = False) -> str:
 
 
 def model_bench(
-    model: str = "aria-qwen",
+    model: str = "nedster",
     prompt: str = "Write a Python fibonacci function.",
     runs: int = 3,
 ) -> str:
@@ -2087,7 +2092,7 @@ def context_inject(mode: str = "project", path: str = ".", query: str = "") -> s
         return "\n\n".join(parts)
 
     elif mode == "session":
-        mile_path = _resolve_path("~/.aria/milestones.md")
+        mile_path = str(Path.home() / ".nedster" / "milestones.md")
         if not os.path.exists(mile_path):
             return "No session history found."
         with open(mile_path) as f:

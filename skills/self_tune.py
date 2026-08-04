@@ -64,13 +64,13 @@ class RunLoRATraining(NedsterSkill):
         "type": "object",
         "properties": {
             "dataset_path": {"type": "string"},
-            "base_model": {"type": "string", "default": "aria-local"},
+            "base_model": {"type": "string", "default": "nedster"},
             "confirmed": {"type": "boolean", "description": "Must be true; never auto-trains."},
         },
         "required": ["dataset_path", "confirmed"],
     }
 
-    async def run(self, dataset_path: str, base_model: str = "aria-local", confirmed: bool = False) -> dict:
+    async def run(self, dataset_path: str, base_model: str = "nedster", confirmed: bool = False) -> dict:
         if not confirmed:
             return {"status": "blocked", "msg": "Fine-tuning requires explicit user confirmation."}
         # Real training invocation left to your local peft/transformers pipeline;

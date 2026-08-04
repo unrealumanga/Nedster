@@ -9,7 +9,7 @@
 
 Nedster Ironclad is the 2026 evolution of the project: a small resident router plans work, role-specific local workers execute bounded manifests, a separate critic checks the evidence, and the Python runtime—not model text—owns every side effect.
 
-The classic `nedster.py` interface remains available while Ironclad matures. The new runtime is intentionally marked **3.0 alpha**; its security claims below distinguish implemented controls from roadmap work.
+The classic `nedster.py` interface remains available while Ironclad matures. It now uses a bounded multi-turn tool loop, honest replay outcomes, stall detection, one canonical `nedster` model tag, and a graded command policy. The new runtime is intentionally marked **3.0 alpha**; its security claims below distinguish implemented controls from roadmap work.
 
 ## Why this architecture now?
 
@@ -176,6 +176,15 @@ python -m compileall -q ironclad
 ```
 
 CI runs on Linux, Windows, and macOS with Python 3.11 and 3.13. The classic interface is still available through `python nedster.py repl` for users of the existing plugin/RAG stack.
+
+Existing installations can migrate legacy state and Ollama tags without deleting the original data:
+
+```bash
+DRY_RUN=1 ./scripts/migrate_from_aria.sh
+REMOVE_LEGACY_TAGS=1 ./scripts/migrate_from_aria.sh
+```
+
+The migration is idempotent, preserves a timestamped backup, and moves supported state to `~/.nedster` without leaving an obsolete compatibility symlink.
 
 ## What comes next
 

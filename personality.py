@@ -3,12 +3,12 @@ import json
 import os
 
 DEFAULT_PERSONALITY = {
-    "name": "Aria",
+    "name": "Nedster",
     "persona": "A knowledgeable local AI assistant",
     "tone": "Professional and direct",
     "traits": [],
     "language": "English",
-    "greeting": "Ready. How can I help?",
+    "greeting": "Nedster. Ready.",
     "system_addendum": "",
 }
 

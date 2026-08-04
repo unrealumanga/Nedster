@@ -31,8 +31,8 @@ if %ERRORLEVEL% neq 0 (
 ) else (
     echo [3/3] Pulling base model...
     ollama pull qwen3.5:9b
-    echo Building aria-qwen model...
-    ollama create aria-qwen -f Modelfile
+    echo Building nedster model...
+    ollama create nedster -f Modelfile.nedster
 )
 
 echo.

@@ -4,9 +4,9 @@ from skills.base import NedsterSkill
 
 # Ordered most-capable -> least-capable
 MODEL_LADDER = [
-    {"model": "aria-local-14b",  "min_vram_mb": 9000, "context": 32768},
-    {"model": "aria-local-7b",   "min_vram_mb": 5500, "context": 16384},
-    {"model": "aria-local-3b-q4","min_vram_mb": 2500, "context": 8192},
+    {"model": "nedster:32b", "min_vram_mb": 26000, "context": 65536},
+    {"model": "nedster:14b", "min_vram_mb": 12000, "context": 32768},
+    {"model": "nedster", "min_vram_mb": 7000, "context": 16384},
 ]
 
 class VRAMGovernor:

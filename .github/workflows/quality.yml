@@ -25,5 +25,5 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest
-      - run: python -m ruff check ironclad tests
+      - run: python -m ruff check ironclad core/agent_loop.py core/loop_adapter.py core/model_registry.py core/sandbox.py core/vram.py tests
       - run: python -m ironclad --project . doctor

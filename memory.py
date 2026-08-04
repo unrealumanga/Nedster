@@ -11,7 +11,7 @@ class SessionLog:
         from datetime import datetime
 
         self.session_id = session_id
-        log_dir = Path.home() / ".aria" / "session_logs"
+        log_dir = Path.home() / ".nedster" / "session_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = log_dir / f"{session_id}.jsonl"
         self._events = []
@@ -85,7 +85,7 @@ class MemoryManager:
     def _init_session_db(self):
         import sqlite3, os
 
-        db_path = os.path.expanduser("~/.aria/sessions.db")
+        db_path = os.path.expanduser("~/.nedster/sessions.db")
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.execute("""
@@ -234,7 +234,7 @@ class MemoryManager:
         """Silently load previous session context on startup."""
         import json
 
-        path = os.path.expanduser("~/.aria/milestones.jsonl")
+        path = os.path.expanduser("~/.nedster/milestones.jsonl")
         if not os.path.exists(path):
             return
         try:

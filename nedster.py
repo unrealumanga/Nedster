@@ -16,11 +16,12 @@ from prompt_toolkit.completion import WordCompleter
 
 from tui import NedsterTUI
 from swarm_coordinator import main_swarm_entry
+from core.model_registry import resolve_model, supports_native_tools
 # from skill_manager import install_skill
 
 # --- Globals & Utils ---
 _KEEP_VRAM = False
-_ACTIVE_MODEL_NAME = "aria-local"
+_ACTIVE_MODEL_NAME = resolve_model()
 _AVAILABLE_MODELS_CACHE = []
 _AVAILABLE_SESSIONS_CACHE = []
 TIPS = [
@@ -75,7 +76,7 @@ def get_editor_input():
 
 def _get_model_capability(model_name: str) -> str:
     name_lower = model_name.lower()
-    if name_lower.startswith("aria-") or "instruct" in name_lower:
+    if supports_native_tools(model_name):
         return "full"
     if "embed" in name_lower:
         return "embed"
@@ -167,7 +168,7 @@ def handle_slash_command(cmd: str, agent, project_dir: str):
         tui.print_success(f"Switched active model to {model_to_switch}")
 
     elif command in ["/session", "/sessions", "/resume"]:
-        log_dir = Path.home() / ".aria" / "session_logs"
+        log_dir = Path.home() / ".nedster" / "session_logs"
         if not log_dir.exists():
             tui.print_warning("No session log directory found.")
             return
@@ -252,7 +253,7 @@ def ensure_git_safety(project_dir: str):
 
 def prompt_brain_selection() -> str:
     print("\n🧠 Select Nedster's Brain for this session:")
-    print("  [1] Local LLM (Ollama - aria-local)")
+    print(f"  [1] Local LLM (Ollama - {_ACTIVE_MODEL_NAME})")
     print("  [2] Cloud API (LiteLLM - Gemini/OpenAI/Anthropic)")
     while True:
         choice = input("\nChoice [1/2]: ").strip()
@@ -331,7 +332,7 @@ def cmd_repl(project_dir: str, auto: bool, think: bool):
     else:
         agent.model = _ACTIVE_MODEL_NAME
 
-    history_path = os.path.expanduser("~/.aria/nedster_history.txt")
+    history_path = os.path.expanduser("~/.nedster/nedster_history.txt")
     os.makedirs(os.path.dirname(history_path), exist_ok=True)
     history = FileHistory(history_path)
     completer = WordCompleter(
