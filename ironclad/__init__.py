@@ -1,7 +1,7 @@
-"""Nedster Ironclad: local-first router/worker agent runtime."""
+"""Compatibility package for the Nedster local runtime."""
 
-from .config import IroncladConfig, load_config
-from .orchestrator import MythosOrchestrator
+from .config import IroncladConfig, NedsterConfig, load_config
+from .orchestrator import MythosOrchestrator, NedsterRuntime
 
-__all__ = ["IroncladConfig", "MythosOrchestrator", "load_config"]
-__version__ = "3.0.0a1"
+__all__ = ["IroncladConfig", "MythosOrchestrator", "NedsterConfig", "NedsterRuntime", "load_config"]
+__version__ = "3.1.0a1"

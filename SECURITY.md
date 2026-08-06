@@ -5,7 +5,7 @@ repository file, and tool result as untrusted input.
 
 ## Supported security posture
 
-- Ironclad starts in read-only policy mode.
+- Nedster starts in read-only policy mode.
 - Every tool invocation requires a short-lived, request-bound, single-use capability.
 - File tools resolve paths beneath the selected project root.
 - Shell execution uses argv arrays with `shell=False` and an executable allowlist.

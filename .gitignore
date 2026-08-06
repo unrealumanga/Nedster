@@ -4,6 +4,9 @@ venv/
 .venv/
 *.pyc
 *.egg-info/
+build/
+dist/
+uv.lock
 
 # Database
 chroma_db/

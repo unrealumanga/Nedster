@@ -6,13 +6,13 @@ from collections.abc import Callable
 from dataclasses import asdict
 from typing import Any
 
-from .config import IroncladConfig
+from .config import NedsterConfig
 from .hardware import choose_profile, probe_hardware
 from .ledger import EventLedger, load_or_create_ledger_key
 from .models import ModelFleet, ModelScheduler
 from .prompts import (
     CRITIC_SCHEMA,
-    MYTHOS_SYSTEM,
+    NEDSTER_SYSTEM,
     PLANNER_SCHEMA,
     WORKER_SCHEMA,
     critic_prompt,
@@ -29,8 +29,8 @@ EventCallback = Callable[[dict[str, Any]], None]
 READ_ONLY_TOOLS = frozenset({"read_file", "list_files", "search_text", "git_diff"})
 
 
-class MythosOrchestrator:
-    def __init__(self, config: IroncladConfig, on_event: EventCallback | None = None):
+class NedsterRuntime:
+    def __init__(self, config: NedsterConfig, on_event: EventCallback | None = None):
         self.config = config
         self.on_event = on_event
         self.hardware = probe_hardware()
@@ -56,7 +56,7 @@ class MythosOrchestrator:
         self.fleet = await scheduler.discover()
         self._emit(
             "runtime.ready",
-            "ironclad",
+            "nedster",
             profile=self.profile.name,
             accelerator=self.hardware.accelerator,
             fleet=self.fleet.as_rows(),
@@ -78,7 +78,7 @@ class MythosOrchestrator:
         if spec.provider == "openai":
             return await self.openai.complete_json(
                 model=spec.name,
-                system=MYTHOS_SYSTEM,
+                system=NEDSTER_SYSTEM,
                 prompt=prompt,
                 schema=schema,
                 reasoning_effort=self.config.models.cloud_reasoning_effort,
@@ -87,7 +87,7 @@ class MythosOrchestrator:
             )
         return await self.ollama.complete_json(
             model=spec.name,
-            system=MYTHOS_SYSTEM,
+            system=NEDSTER_SYSTEM,
             prompt=prompt,
             schema=schema,
             thinking=spec.thinking,
@@ -214,8 +214,12 @@ class MythosOrchestrator:
             "total_steps": len(plan.steps),
             "results": results,
         }
-        self._emit("run.finished", "ironclad", summary={k: v for k, v in summary.items() if k != "results"})
+        self._emit("run.finished", "nedster", summary={k: v for k, v in summary.items() if k != "results"})
         return summary
 
     def close(self) -> None:
         self.ledger.close()
+
+
+# Compatibility for v3.0 integrations. New code should import NedsterRuntime.
+MythosOrchestrator = NedsterRuntime

@@ -4,13 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nedster-agent"
-version = "3.0.0a1"
-description = "Ironclad local-first router/worker coding agent with hardware-aware inference and capability-gated tools"
+version = "3.1.0a1"
+description = "Local-first AI coding and automation agent with automatic Ollama setup, hardware-aware models, RAG, MCP, and a friendly TUI"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "unrealumanga" }]
-keywords = ["local-llm", "coding-agent", "ollama", "llama-cpp", "tui", "sandbox"]
+keywords = [
+  "ai-agent", "local-ai", "local-llm", "coding-agent", "coding-assistant",
+  "ollama", "ollama-agent", "qwen", "rag", "mcp", "terminal-ui",
+  "autonomous-agent", "privacy", "self-hosted-ai", "agentic-coding",
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
@@ -52,10 +56,10 @@ Repository = "https://github.com/unrealumanga/Nedster"
 Issues = "https://github.com/unrealumanga/Nedster/issues"
 
 [project.scripts]
-nedster-ironclad = "ironclad.cli:main"
+nedster = "nedster_agent.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["ironclad*"]
+include = ["nedster_agent*", "ironclad*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

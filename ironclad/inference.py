@@ -9,7 +9,7 @@ from .types import HardwareProfile
 
 @dataclass(slots=True, frozen=True)
 class LlamaCppPlan:
-    """A loopback-only llama.cpp server plan tuned to an Ironclad hardware tier."""
+    """A loopback-only llama.cpp server plan tuned to a Nedster hardware tier."""
 
     command: tuple[str, ...]
     profile: str

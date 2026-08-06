@@ -1,197 +1,142 @@
-# NEDSTER // IRONCLAD
+# Nedster
 
-**A local-first router/worker coding agent with capability-gated tools, hardware-aware model scheduling, verifiable state, and a live mission-control TUI.**
+**A local-first AI coding and automation agent that sets itself up for your computer.**
 
-[![Ironclad quality](https://github.com/unrealumanga/Nedster/actions/workflows/quality.yml/badge.svg)](https://github.com/unrealumanga/Nedster/actions/workflows/quality.yml)
-![Python](https://img.shields.io/badge/Python-3.11–3.13-72F1B8)
-![Local first](https://img.shields.io/badge/default-local--only-7C5CFC)
-![Status](https://img.shields.io/badge/status-3.0_alpha-FFB86C)
+Nedster turns an Ollama model into a practical terminal agent: it inspects a project, plans a task, proposes tool calls, makes policy-approved changes, and verifies the result. The guided installer detects your GPU and RAM, installs or adopts Ollama, downloads a suitable model fleet, and creates a global `nedster` command.
 
-Nedster Ironclad is the 2026 evolution of the project: a small resident router plans work, role-specific local workers execute bounded manifests, a separate critic checks the evidence, and the Python runtime—not model text—owns every side effect.
+> Status: **3.1 alpha.** The local coding loop works today. The setup experience and general-purpose integrations are being expanded quickly; see [what works now](#what-works-now).
 
-The classic `nedster.py` interface remains available while Ironclad matures. It now uses a bounded multi-turn tool loop, honest replay outcomes, stall detection, one canonical `nedster` model tag, and a graded command policy. The new runtime is intentionally marked **3.0 alpha**; its security claims below distinguish implemented controls from roadmap work.
+## Why Nedster
 
-## Why this architecture now?
+- **Local by default.** Project context and routine inference stay on your computer. A cloud oracle is optional and never enabled merely because a key exists.
+- **Setup that understands hardware.** Nedster detects NVIDIA, AMD, Apple Silicon, system RAM, and available VRAM before recommending Fast, Balanced, or Maximum models.
+- **Better results from a harness, not only a bigger model.** Structured planning, hybrid retrieval hooks, typed tool calls, constrained execution, evidence, and a critic loop spend tokens where they matter.
+- **One familiar command.** Type `nedster` in any terminal. The current folder becomes the project; `nedster run "…"` handles one-shot automation.
+- **Model roles instead of VRAM chaos.** A small router stays responsive while a stronger worker is loaded for coding and reasoning. Stable aliases let models change without rewriting the agent.
+- **Extensible.** Nedster includes MCP server foundations and tool adapters. Creative apps and 3D workflows are valuable extensions—not a requirement for using the agent.
 
-One giant model is a poor local-agent operating system. It consumes the entire memory budget, handles cheap routing expensively, and concentrates planning, execution, and judgment in one fallible context. Ironclad uses an asymmetric swarm instead:
+## Install
 
-```text
-                         untrusted prompt / repository
-                                      │
-                         ┌────────────▼────────────┐
-                         │ resident router model   │
-                         │ typed plan + tool scope │
-                         └────────────┬────────────┘
-                                      │ manifests
-              ┌───────────────────────┼──────────────────────┐
-              ▼                       ▼                      ▼
-      coder / reasoner         read-only workers          critic
-       paged on demand          safe concurrency       evidence review
-              └───────────────────────┬──────────────────────┘
-                                      ▼
-                       capability + policy boundary
-                                      │
-                           sandboxed tool execution
-                                      │
-                        HMAC hash-chained event ledger
-```
-
-What is embedded today:
-
-- **Schema-constrained planning and tool proposals.** Ollama structured outputs replace brittle XML and regex intent parsing.
-- **Hardware-aware fleet selection.** Nedster probes NVIDIA, ROCm, Apple unified memory, RAM, and available local models before assigning router, coder, reasoner, and critic roles.
-- **Asymmetric residency.** The router uses an infinite Ollama keep-alive; worker models use a short lease so VRAM can be reclaimed.
-- **Safe swarm concurrency.** Independent read-only steps can run concurrently. Any write or execution step is serialized.
-- **Runtime-owned authority.** Each action is normalized, policy-checked, then receives a short-lived, request-bound, single-use HMAC capability. Models never mint permissions.
-- **Project confinement and isolation.** File paths are resolved beneath the selected project. Linux prefers Bubblewrap, gVisor, rootless Podman, or Docker; network access is denied by default.
-- **Verifiable state.** Every objective, plan, decision, action, and result enters a local SQLite WAL with an HMAC hash chain.
-- **Modern inference profiles.** `llama-command` emits a loopback-only llama.cpp launch plan with mmap, Flash Attention, quantized KV cache, and prompt-lookup or draft-model speculative decoding.
-- **Optional GPT-5.6 Sol oracle.** High-value reasoning can be escalated to the Responses API only when explicitly enabled. Ordinary work remains local.
-
-## Mission-control TUI
-
-```text
-╭─────────────────────────╮ ╭────────────────────────────────╮ ╭────────────────────────╮
-│ MISSION GRAPH           │ │ LIVE COGNITION + EVENT STREAM  │ │ MODEL FLEET            │
-│ 01 inspect      DONE    │ │ ◆ plan.created                 │ │ ROUTER   qwen…  ollama │
-│ 02 implement    RUNNING │ │ ◆ tool.authorized              │ │ CODER    code…  ollama │
-│ 03 verify       PENDING │ │ ◆ step.finished                │ │ CRITIC   small… ollama │
-│                         │ │                                │ ├────────────────────────┤
-│                         │ │ Describe the outcome…          │ │ RTX / RAM / VRAM       │
-╰─────────────────────────╯ ╰────────────────────────────────╯ ╰────────────────────────╯
- SAFE-ZONE // titan-32g // sandbox=docker // ready
-```
-
-The Textual interface shows the live task DAG, model fleet, security events, critic outcomes, CPU/RAM/VRAM telemetry, and current sandbox posture. Commands: `/fleet`, `/ledger`, `/clear`, `/quit`.
-
-## Quick start
-
-### Linux (recommended)
-
-```bash
-git clone https://github.com/unrealumanga/Nedster.git
-cd Nedster
-python3.11 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e .
-cp config/ironclad.toml.example config/ironclad.toml
-
-ollama serve
-# Install at least one modern tool-capable/chat model that fits your machine.
-ollama list
-
-nedster-ironclad doctor
-nedster-ironclad tui
-```
-
-Install Bubblewrap (`bwrap`) or rootless Podman for command isolation. Ironclad refuses an unsafe process fallback by default.
+Requirements: Windows, macOS, or Linux; Python 3.11+; roughly 8 GB RAM minimum. A supported GPU is recommended but not required.
 
 ### Windows
 
 ```powershell
 git clone https://github.com/unrealumanga/Nedster.git
-Set-Location Nedster
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e .
-Copy-Item config\ironclad.toml.example config\ironclad.toml
-nedster-ironclad doctor
-nedster-ironclad tui
+cd Nedster
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-Docker Desktop provides the strongest currently supported Windows execution boundary. Without a container backend, read/write file tools remain project-confined, but command execution stays disabled unless you deliberately pass `--unsafe-process`.
-
-### macOS
-
-Use the Linux steps, substituting a Homebrew Python if needed. Apple Silicon is treated as unified memory and receives a conservative 72% scheduling budget.
-
-## Run modes
+### macOS and Linux
 
 ```bash
-# Full-screen console
-nedster-ironclad --project /path/to/repo tui
-
-# One mission, read-only by default
-nedster-ironclad --project . run "map the authentication flow and identify risks"
-
-# Allow writes up to the configured risk ceiling
-nedster-ironclad --project . --autonomous run "fix and test the parser"
-
-# Inspect hardware, runtimes, and the selected fleet
-nedster-ironclad doctor
-nedster-ironclad models
-
-# Verify that the event history still matches its HMAC hash chain
-nedster-ironclad verify-ledger
-
-# Print a tuned llama.cpp server command; nothing is launched
-nedster-ironclad llama-command --model /models/worker.gguf
-nedster-ironclad llama-command --model /models/worker.gguf --draft-model /models/router.gguf
+git clone https://github.com/unrealumanga/Nedster.git
+cd Nedster
+chmod +x install.sh && ./install.sh
 ```
 
-## Hardware tiers
+The installer:
 
-These are scheduling envelopes, not promises that every architecture will fit. Context length, MoE expert layout, KV type, GPU offload, and concurrent slots all change real memory use.
+1. installs the global `nedster` terminal launcher;
+2. detects the machine and proposes a model profile;
+3. keeps an existing Ollama installation or installs Ollama from its official source;
+4. downloads the selected worker, router, and embedding models;
+5. creates `nedster-worker` and `nedster-router` aliases with tuned context settings;
+6. runs a local generation check and writes `~/.nedster/config.toml`.
 
-| Tier | Resident router | Paged worker envelope | Default concurrency | Inference profile |
-|---|---:|---:|---:|---|
-| Edge / 8 GB | 1.5–4B | 7–9B | 1 | Q4 weights, Q4 KV, 32K context |
-| Forge / 16 GB | 3–8B | 12–20B | 2 read-only | Q5 weights, Q5 KV, 64K context |
-| Titan / 32 GB | 7–14B | 27–40B | 3 read-only | Q6/8-bit weights, Q8 KV, 128K context |
+It does not remove unrelated Ollama models or silently change global Ollama settings. Use `nedster setup --dry-run` to preview every action without downloading or writing.
 
-With Ollama, Nedster scores the models already installed rather than silently downloading a fashionable checkpoint. Explicit model names in `config/ironclad.toml` always win.
+## Use it from anywhere
 
-## Optional GPT-5.6 Sol oracle
+Open a terminal in any repository or folder:
 
-The cloud path uses OpenAI's Responses API with structured output, configurable reasoning effort, current-turn reasoning context, and `store=false`. It is off by default.
+```text
+cd my-project
+nedster
+```
+
+Useful commands:
 
 ```bash
-export OPENAI_API_KEY="..."                 # PowerShell: $env:OPENAI_API_KEY="..."
-nedster-ironclad --oracle run "review this migration plan"
-nedster-ironclad --oracle --pro run "analyze the hardest invariant"
+nedster run "Find the failing tests, fix the cause, and verify the suite"
+nedster doctor
+nedster models recommend
+nedster models list
+nedster setup --profile fast
 ```
 
-Enabling the oracle changes the privacy boundary: the selected prompt and evidence are sent to OpenAI. `--pro` is a reasoning mode, not a separate model slug, and should be enabled only when your evaluations justify the extra latency and cost.
+Running bare `nedster` starts a chat-first TUI designed for 80-column terminals. It keeps project, mode, active model, and Ollama state at the top; work in the center; transient status and discoverable keys at the bottom. Use `/help`, `/models`, `/doctor`, `/permissions`, `/clear`, and `/quit`.
 
-## Security posture
+## Automatic model matching
 
-Ironclad follows one rule: **workers propose; the runtime authorizes**.
+The defaults leave headroom for context, desktop graphics, tools, and concurrent work instead of filling every byte of VRAM.
 
-- Safe default: only read operations are automatically authorized.
-- `--autonomous`: permits the configured ceiling, which defaults to non-destructive writes.
-- Destructive or external actions remain outside the automatic ceiling.
-- Tool commands use argv arrays, `shell=False`, and an executable allowlist.
-- Workers do not receive signing secrets, capability keys, or direct tool handles.
-- The RPC feature of llama.cpp is not used as a trust boundary; upstream documents it as insecure.
+| Hardware tier | Balanced worker | Responsive router | Typical use |
+| --- | --- | --- | --- |
+| Edge / CPU / ~8 GB | `qwen3.5:9b-q4_K_M` | `qwen3.5:4b-q4_K_M` | General tasks with modest context |
+| Forge / ~16 GB | `qwen3.5:27b-q4_K_M` | `qwen3.5:4b-q4_K_M` | Stronger reasoning with model paging |
+| Titan / ~32 GB | `qwen3.6:27b` | `qwen3.5:4b-q4_K_M` | Tool use, coding, reasoning, and large context |
 
-Capabilities are not a hardware enclave. A compromised host can inspect process memory. Firecracker lifecycle management, native Landlock rules, and remote attestation are roadmap items—not current claims. Read [SECURITY.md](SECURITY.md) and [the architecture notes](docs/ARCHITECTURE.md) before processing hostile repositories.
+Choose `fast` for low latency or `maximum` when quality matters more than model-loading delay. Recommendations are configuration, not lock-in: edit `~/.nedster/config.toml` or rerun setup at any time.
+
+## The harness advantage
+
+A useful local agent is more than a chat model:
+
+```text
+request → inspect → retrieve → structured plan → constrained tools → verify
+                                      ↘ evidence ledger ↗
+```
+
+Nedster assigns work by role, sends only relevant project context, requires schema-shaped plans/actions, resolves every file beneath the selected project, and serializes mutating steps. Read-only work can run concurrently. This reduces wasted context and allows a smaller local model to behave more reliably than an unconstrained larger model.
+
+The optional `rag` dependency group provides ChromaDB, sentence-transformers, and BM25 building blocks:
+
+```bash
+python -m pip install -e ".[rag]"
+```
+
+## What works now
+
+- Hardware probing and Ollama model discovery
+- Guided and fully non-interactive setup (`--yes`, `--no-input`, `--dry-run`)
+- Structured router/worker/critic loop with Ollama
+- Project-scoped read, search, write, patch, diff, and approved command tools
+- Capability-bound tool requests, policy checks, sandbox selection, and tamper-evident local events
+- Responsive terminal UI and one-shot CLI
+- Optional, explicitly configured OpenAI reasoning adapter
+- Legacy MCP stdio server foundations while the unified MCP client/server manager is completed
+
+The alpha does **not** yet match every feature in Cursor, Claude Code, Codex, or other mature cloud agents. IDE-grade inline completion, universal MCP lifecycle management, multimodal model routing, checkpoints/undo, and polished app bridges are on the roadmap. Contributions in these areas are especially welcome.
+
+## Configuration and privacy
+
+Generated state lives under `~/.nedster/`:
+
+```text
+~/.nedster/
+├── config.toml
+├── models/modelfiles/
+└── runtime/
+```
+
+Local-only is the default privacy boundary. Nedster does not need an account, does not enable cloud inference automatically, and binds Ollama to its configured local endpoint. Files can still contain malicious instructions, so tool output and retrieved content are treated as untrusted. See [SECURITY.md](SECURITY.md) for the practical security model.
 
 ## Development
 
 ```bash
+git clone https://github.com/unrealumanga/Nedster.git
+cd Nedster
 python -m pip install -e ".[dev]"
 python -m pytest
-python -m ruff check ironclad tests
-python -m compileall -q ironclad
+python -m ruff check nedster_agent ironclad core tests
+python -m nedster_agent setup --dry-run --no-input
 ```
 
-CI runs on Linux, Windows, and macOS with Python 3.11 and 3.13. The classic interface is still available through `python nedster.py repl` for users of the existing plugin/RAG stack.
+Architecture details live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), with upcoming work in [docs/ROADMAP_2026.md](docs/ROADMAP_2026.md).
 
-Existing installations can migrate legacy state and Ollama tags without deleting the original data:
+## Who this is for
 
-```bash
-DRY_RUN=1 ./scripts/migrate_from_aria.sh
-REMOVE_LEGACY_TAGS=1 ./scripts/migrate_from_aria.sh
-```
+Nedster is for developers and makers looking for a **local AI agent**, **Ollama coding agent**, **private coding assistant**, **self-hosted AI assistant**, **local LLM tool-use runtime**, **RAG agent**, or **MCP-ready terminal agent** that can grow beyond coding into desktop and creative automation.
 
-The migration is idempotent, preserves a timestamped backup, and moves supported state to `~/.nedster` without leaving an obsolete compatibility symlink.
-
-## What comes next
-
-The next meaningful leap is not another larger monolith. It is **stateful local inference infrastructure**: shared prefix/KV snapshots, topology-aware worker placement across GPU/CPU/NVMe, eval-driven routing, native Linux Landlock enforcement, reproducible micro-VM images, and privacy-budgeted oracle escalation. See [the August 2026 roadmap](docs/ROADMAP_2026.md).
-
-Primary technical references: [OpenAI GPT-5.6 guidance](https://developers.openai.com/api/docs/guides/model-guidance?model=gpt-5.6), [Ollama structured outputs](https://docs.ollama.com/capabilities/structured-outputs), [Ollama tool calling](https://docs.ollama.com/capabilities/tool-calling), [llama.cpp server](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md), [llama.cpp speculative decoding](https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md), [Linux Landlock](https://docs.kernel.org/userspace-api/landlock.html), [gVisor](https://gvisor.dev/), and [Firecracker](https://firecracker-microvm.github.io/).
-
-## License
-
-MIT © 2026 unrealumanga
+MIT licensed. Issues and contributions are welcome.

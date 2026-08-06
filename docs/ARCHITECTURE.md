@@ -1,4 +1,16 @@
-# Ironclad architecture
+# Nedster architecture
+
+Nedster is a local-first general agent. Coding is the first deeply supported domain; MCP,
+desktop, media, and creative-application adapters extend the same runtime instead of defining
+the product. The public entry point is the global `nedster` command.
+
+## Setup and model control plane
+
+`nedster setup` probes available accelerator memory and system RAM, selects a Fast, Balanced,
+or Maximum plan, installs or adopts Ollama, and creates stable `nedster-router` and
+`nedster-worker` aliases. Generated Modelfiles inherit each upstream model's native template so
+tool calling remains intact. Nedster manages its aliases and `~/.nedster` state only; it does not
+delete unrelated models or rewrite global Ollama configuration.
 
 ## Design invariants
 
@@ -15,7 +27,7 @@ The router receives the objective and tool descriptions, then emits a JSON-schem
 
 The scheduler scores the locally installed Ollama inventory against the detected hardware tier. Explicit configuration is deterministic; `auto` mode prefers smaller models for routing and criticism and larger suitable models for coding and reasoning. The router is held resident, while workers receive short keep-alive leases.
 
-GPT-5.6 Sol can serve as an optional quality-first reasoner. The adapter uses the Responses API and structured outputs. It never activates solely because an API key happens to exist.
+An OpenAI model can serve as an optional quality-first reasoner. The adapter uses the Responses API and structured outputs. It never activates solely because an API key happens to exist.
 
 ## Data plane
 
@@ -67,7 +79,7 @@ For users operating llama.cpp directly, `llama-command` generates a plan with:
 
 The command is printed, not executed. That preserves operator review and accommodates the fast-moving llama.cpp CLI.
 
-## Explicit non-goals in 3.0 alpha
+## Explicit non-goals in 3.1 alpha
 
 - No claim of silicon-enclave or hardware-rooted capability security.
 - No direct worker-to-worker dialogue.

@@ -21,6 +21,7 @@ class ModelConfig:
     coder: str = "auto"
     reasoner: str = "auto"
     critic: str = "auto"
+    embedding: str = "embeddinggemma:300m-qat-q4_0"
     router_keep_alive: str = "-1"
     worker_keep_alive: str = "90s"
     local_thinking: bool | str = True
@@ -77,14 +78,15 @@ class PolicyConfig:
 @dataclass(slots=True)
 class RuntimeConfig:
     project_root: Path = field(default_factory=Path.cwd)
-    state_dir: Path = field(default_factory=lambda: Path.home() / ".nedster" / "ironclad")
+    state_dir: Path = field(default_factory=lambda: Path.home() / ".nedster" / "runtime")
     max_worker_turns: int = 8
     max_parallel_workers: int = 2
+    profile: str = "balanced"
     ledger_key_env: str = "NEDSTER_LEDGER_KEY"
 
 
 @dataclass(slots=True)
-class IroncladConfig:
+class NedsterConfig:
     models: ModelConfig = field(default_factory=ModelConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
@@ -100,9 +102,15 @@ def _apply(obj: Any, values: dict[str, Any]) -> None:
             setattr(obj, key, value)
 
 
-def load_config(path: str | Path | None = None, project_root: str | Path | None = None) -> IroncladConfig:
-    config = IroncladConfig()
-    candidate = Path(path).expanduser() if path else Path("config/ironclad.toml")
+def load_config(path: str | Path | None = None, project_root: str | Path | None = None) -> NedsterConfig:
+    config = NedsterConfig()
+    if path:
+        candidate = Path(path).expanduser()
+    else:
+        user_config = Path.home() / ".nedster" / "config.toml"
+        project_config = Path("config/nedster.toml")
+        legacy_config = Path("config/ironclad.toml")
+        candidate = next((item for item in (user_config, project_config, legacy_config) if item.exists()), user_config)
     if candidate.exists():
         data = tomllib.loads(candidate.read_text(encoding="utf-8"))
         _apply(config.models, dict(data.get("models") or {}))
@@ -123,3 +131,7 @@ def load_config(path: str | Path | None = None, project_root: str | Path | None 
     )
     config.policy.autonomous = _bool_env("NEDSTER_AUTONOMOUS", config.policy.autonomous)
     return config
+
+
+# Compatibility for v3.0 integrations. New code should import NedsterConfig.
+IroncladConfig = NedsterConfig
