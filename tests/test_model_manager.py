@@ -42,6 +42,8 @@ def test_modelfile_preserves_native_template_and_sets_context():
     assert "PARAMETER num_ctx 65536" in value
     assert "TEMPLATE" not in value
     assert "SYSTEM" not in value
+    assert "temperature" not in value
+    assert "top_p" not in value
 
 
 def test_generated_config_uses_stable_aliases():
@@ -49,6 +51,9 @@ def test_generated_config_uses_stable_aliases():
     assert 'router = "nedster-router"' in value
     assert 'coder = "nedster-worker"' in value
     assert 'ollama_url = "http://localhost:11434"' in value
+    assert "[policy]" in value
+    assert "autonomous = true" in value
+    assert 'max_auto_risk = "execute"' in value
 
 
 def test_state_directory_can_be_overridden(tmp_path: Path):
@@ -62,11 +67,16 @@ def test_capability_verification_checks_all_local_agent_primitives():
         Mock(is_success=True, json=lambda: {"version": "test"}),
         Mock(raise_for_status=lambda: None, json=lambda: {"response": "ready"}),
         Mock(raise_for_status=lambda: None, json=lambda: {"response": '{"ready": true}'}),
-        Mock(raise_for_status=lambda: None, json=lambda: {"message": {"tool_calls": [{"function": {"name": "ping"}}]}}),
+        Mock(
+            raise_for_status=lambda: None,
+            json=lambda: {"message": {"tool_calls": [{"function": {"name": "ping"}}]}},
+        ),
         Mock(raise_for_status=lambda: None, json=lambda: {"embeddings": [[0.1, 0.2]]}),
     ]
-    with patch("nedster_agent.model_manager.httpx.get", return_value=responses[0]), patch(
-        "nedster_agent.model_manager.httpx.post", side_effect=responses[1:]
+    with (
+        patch("nedster_agent.model_manager.httpx.get", return_value=responses[0]),
+        patch("nedster_agent.model_manager.httpx.post", side_effect=responses[1:]) as post,
     ):
         result = manager.verify_capabilities()
     assert all(result.values())
+    assert all(call.kwargs["json"].get("think") is False for call in post.call_args_list[:3])

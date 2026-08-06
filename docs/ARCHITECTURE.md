@@ -23,7 +23,7 @@ delete unrelated models or rewrite global Ollama configuration.
 
 ## Control plane
 
-The router receives the objective and tool descriptions, then emits a JSON-schema task plan. Each step declares a role, dependencies, allowed tools, and success criteria. A malformed plan falls back to a single bounded step rather than trying to recover intent with permissive regexes.
+Read-only research requests use deterministic, evidence-oriented plans when the required capability is clear. Explicit build, fix, and update requests skip a redundant router call and enter one bounded, stateful inspect→edit→test step. Other objectives go through the router, which emits a JSON-schema task plan whose steps declare roles, dependencies, tools, and success criteria. A malformed plan falls back to a single bounded step.
 
 The scheduler scores the locally installed Ollama inventory against the detected hardware tier. Explicit configuration is deterministic; `auto` mode prefers smaller models for routing and criticism and larger suitable models for coding and reasoning. The router is held resident, while workers receive short keep-alive leases.
 
@@ -60,6 +60,8 @@ The ledger is local SQLite in WAL mode. Each event stores its canonical payload,
 
 Workers do not message one another directly. Their only shared state is router-approved manifests plus evidence emitted through the runtime. This limits feedback loops and makes the task graph inspectable.
 
+Software completion requires validation after the latest mutation. Test-runner output must contain meaningful executed tests, and runnable products also need an expected-output smoke check through the real entry point. Failed compiler, test, and smoke results become no-good evidence that forces a changed implementation or verification branch; passing tests cannot be weakened to hide a behavioral failure.
+
 ## Concurrency rules
 
 Independent steps may execute together only when their entire declared tool set is read-only (`read_file`, `list_files`, `search_text`, `git_diff`). Steps that can write or execute commands run one at a time. The current rule is deliberately conservative: a future version may add file-range leases and optimistic conflict detection.
@@ -83,7 +85,7 @@ The command is printed, not executed. That preserves operator review and accommo
 
 - No claim of silicon-enclave or hardware-rooted capability security.
 - No direct worker-to-worker dialogue.
-- No automatic internet access.
+- No unrestricted or authenticated browsing. Current public facts may use read-only HTTPS search/fetch tools; private hosts, arbitrary ports, credentials, and publication remain blocked.
 - No transparent cross-machine llama.cpp RPC, because upstream warns that RPC is insecure.
 - No claim that KV caches switch between unrelated model architectures.
 - No automatic destructive actions or external publication.

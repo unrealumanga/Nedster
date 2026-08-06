@@ -34,19 +34,100 @@ class ModelPlan:
 
 MODEL_PLANS: dict[str, dict[str, ModelPlan]] = {
     "edge-8g": {
-        "fast": ModelPlan("fast", "Fast", "qwen3.5:4b-q4_K_M", "qwen3.5:4b-q4_K_M", "embeddinggemma:300m-qat-q4_0", 16_384, 3.7, "One compact model keeps memory pressure low."),
-        "balanced": ModelPlan("balanced", "Balanced", "qwen3.5:9b-q4_K_M", "qwen3.5:4b-q4_K_M", "embeddinggemma:300m-qat-q4_0", 16_384, 10.3, "A stronger worker with a responsive router."),
-        "maximum": ModelPlan("maximum", "Maximum", "qwen3.5:9b-q4_K_M", "qwen3.5:4b-q4_K_M", "embeddinggemma:300m-qat-q4_0", 32_768, 10.3, "Uses more context and may spill into system RAM."),
+        "fast": ModelPlan(
+            "fast",
+            "Fast",
+            "qwen3.5:4b-q4_K_M",
+            "qwen3.5:4b-q4_K_M",
+            "embeddinggemma:300m-qat-q4_0",
+            16_384,
+            3.7,
+            "One compact model keeps memory pressure low.",
+        ),
+        "balanced": ModelPlan(
+            "balanced",
+            "Balanced",
+            "qwen3.5:9b-q4_K_M",
+            "qwen3.5:4b-q4_K_M",
+            "embeddinggemma:300m-qat-q4_0",
+            16_384,
+            10.3,
+            "A stronger worker with a responsive router.",
+        ),
+        "maximum": ModelPlan(
+            "maximum",
+            "Maximum",
+            "qwen3.5:9b-q4_K_M",
+            "qwen3.5:4b-q4_K_M",
+            "embeddinggemma:300m-qat-q4_0",
+            32_768,
+            10.3,
+            "Uses more context and may spill into system RAM.",
+        ),
     },
     "forge-16g": {
-        "fast": ModelPlan("fast", "Fast", "qwen3.5:9b-q4_K_M", "qwen3.5:4b-q4_K_M", "embeddinggemma:300m-qat-q4_0", 32_768, 10.3, "Both models fit typical 16 GB accelerators."),
-        "balanced": ModelPlan("balanced", "Balanced", "qwen3.5:27b-q4_K_M", "qwen3.5:4b-q4_K_M", "embeddinggemma:300m-qat-q4_0", 32_768, 20.7, "Pages the worker when needed while the router stays quick."),
-        "maximum": ModelPlan("maximum", "Maximum", "qwen3-coder:30b", "qwen3.5:4b-q4_K_M", "embeddinggemma:300m-qat-q4_0", 65_536, 22.7, "Coding-specialized worker; partial CPU offload may occur."),
+        "fast": ModelPlan(
+            "fast",
+            "Fast",
+            "qwen3.5:9b-q4_K_M",
+            "qwen3.5:4b-q4_K_M",
+            "embeddinggemma:300m-qat-q4_0",
+            32_768,
+            10.3,
+            "Both models fit typical 16 GB accelerators.",
+        ),
+        "balanced": ModelPlan(
+            "balanced",
+            "Balanced",
+            "qwen3.5:27b-q4_K_M",
+            "qwen3.5:4b-q4_K_M",
+            "embeddinggemma:300m-qat-q4_0",
+            32_768,
+            20.7,
+            "Pages the worker when needed while the router stays quick.",
+        ),
+        "maximum": ModelPlan(
+            "maximum",
+            "Maximum",
+            "qwen3-coder:30b",
+            "qwen3.5:4b-q4_K_M",
+            "embeddinggemma:300m-qat-q4_0",
+            65_536,
+            22.7,
+            "Coding-specialized worker; partial CPU offload may occur.",
+        ),
     },
     "titan-32g": {
-        "fast": ModelPlan("fast", "Fast", "qwen3.5:9b-q4_K_M", "qwen3.5:4b-q4_K_M", "embeddinggemma:300m-qat-q4_0", 32_768, 10.3, "Low latency and generous VRAM headroom."),
-        "balanced": ModelPlan("balanced", "Balanced", "qwen3.6:27b", "qwen3.5:4b-q4_K_M", "embeddinggemma:300m-qat-q4_0", 65_536, 20.7, "Recommended: strong tool use with room for router and context."),
-        "maximum": ModelPlan("maximum", "Maximum", "qwen3.6:35b", "qwen3.5:4b-q4_K_M", "embeddinggemma:300m-qat-q4_0", 65_536, 27.7, "Highest local quality; models are paged instead of kept together."),
+        "fast": ModelPlan(
+            "fast",
+            "Fast",
+            "qwen3.5:9b-q4_K_M",
+            "qwen3.5:4b-q4_K_M",
+            "embeddinggemma:300m-qat-q4_0",
+            32_768,
+            10.3,
+            "Low latency and generous VRAM headroom.",
+        ),
+        "balanced": ModelPlan(
+            "balanced",
+            "Balanced",
+            "qwen3.6:27b",
+            "qwen3.5:4b-q4_K_M",
+            "embeddinggemma:300m-qat-q4_0",
+            65_536,
+            20.7,
+            "Recommended: strong tool use with room for router and context.",
+        ),
+        "maximum": ModelPlan(
+            "maximum",
+            "Maximum",
+            "qwen3.6:35b",
+            "qwen3.5:4b-q4_K_M",
+            "embeddinggemma:300m-qat-q4_0",
+            65_536,
+            27.7,
+            "Highest local quality; models are paged instead of kept together.",
+        ),
     },
 }
 
@@ -62,19 +143,16 @@ def state_dir() -> Path:
 
 
 def render_modelfile(base: str, context_tokens: int, *, role: str) -> str:
-    temperature = "0.15" if role == "worker" else "0.05"
-    return (
-        f"FROM {base}\n"
-        f"PARAMETER num_ctx {context_tokens}\n"
-        f"PARAMETER temperature {temperature}\n"
-        "PARAMETER top_p 0.9\n"
-    )
+    # Keep the publisher's sampler calibration. Role-specific prompts and
+    # constrained schemas provide control without forcing Qwen off-distribution.
+    _ = role
+    return f"FROM {base}\nPARAMETER num_ctx {context_tokens}\n"
 
 
 def render_config(plan: ModelPlan, ollama_url: str) -> str:
     return f'''# Managed by `nedster setup`. Edit any value and rerun `nedster doctor`.
 [models]
-ollama_url = "{ollama_url.rstrip('/')}"
+ollama_url = "{ollama_url.rstrip("/")}"
 router = "nedster-router"
 coder = "nedster-worker"
 reasoner = "nedster-worker"
@@ -84,11 +162,21 @@ router_keep_alive = "5m"
 worker_keep_alive = "90s"
 local_thinking = true
 
+[policy]
+autonomous = true
+max_auto_risk = "execute"
+
 [runtime]
 state_dir = "~/.nedster/runtime"
 max_worker_turns = 8
+max_worker_restarts = 1
+max_step_attempts = 2
 max_parallel_workers = 2
 profile = "{plan.profile}"
+chat_max_tokens = 96
+answer_max_tokens = 768
+conversation_history_chars = 6000
+max_grounding_sources = 5
 '''
 
 
@@ -130,7 +218,9 @@ class OllamaManager:
         if system == "Windows":
             installer = Path(tempfile.gettempdir()) / "Nedster-OllamaSetup.exe"
             self.progress("Downloading the official Ollama Windows installer…")
-            with httpx.stream("GET", "https://ollama.com/download/OllamaSetup.exe", follow_redirects=True, timeout=120) as response:
+            with httpx.stream(
+                "GET", "https://ollama.com/download/OllamaSetup.exe", follow_redirects=True, timeout=120
+            ) as response:
                 response.raise_for_status()
                 with installer.open("wb") as output:
                     for chunk in response.iter_bytes():
@@ -162,7 +252,9 @@ class OllamaManager:
             self.progress("Would start the local Ollama service.")
             return
         if not executable:
-            raise RuntimeError("Ollama was installed but its executable is not on PATH. Restart the terminal and rerun setup.")
+            raise RuntimeError(
+                "Ollama was installed but its executable is not on PATH. Restart the terminal and rerun setup."
+            )
         self.progress("Starting Ollama in the background…")
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform.system() == "Windows" else 0
         subprocess.Popen(
@@ -201,7 +293,13 @@ class OllamaManager:
     def verify_generation(self, model: str = "nedster-router") -> str:
         response = httpx.post(
             f"{self.url}/api/generate",
-            json={"model": model, "prompt": "Reply with only: ready", "stream": False, "options": {"num_predict": 8}},
+            json={
+                "model": model,
+                "prompt": "Reply with only: ready",
+                "think": False,
+                "stream": False,
+                "options": {"num_predict": 8},
+            },
             timeout=120,
         )
         response.raise_for_status()
@@ -226,6 +324,7 @@ class OllamaManager:
                 "model": router,
                 "prompt": "Return JSON with ready set to true.",
                 "format": schema,
+                "think": False,
                 "stream": False,
                 "options": {"num_predict": 32},
             },
@@ -249,6 +348,7 @@ class OllamaManager:
                         },
                     }
                 ],
+                "think": False,
                 "stream": False,
             },
             timeout=180,
@@ -298,8 +398,12 @@ def install_plan(
     router_path = modelfiles / "router.Modelfile"
     if not dry_run:
         modelfiles.mkdir(parents=True, exist_ok=True)
-        worker_path.write_text(render_modelfile(plan.worker, plan.context_tokens, role="worker"), encoding="utf-8")
-        router_path.write_text(render_modelfile(plan.router, min(plan.context_tokens, 32_768), role="router"), encoding="utf-8")
+        worker_path.write_text(
+            render_modelfile(plan.worker, plan.context_tokens, role="worker"), encoding="utf-8"
+        )
+        router_path.write_text(
+            render_modelfile(plan.router, min(plan.context_tokens, 32_768), role="router"), encoding="utf-8"
+        )
         config_path.write_text(render_config(plan, ollama_url), encoding="utf-8")
     manager.create_alias("nedster-worker", worker_path, dry_run=dry_run)
     manager.create_alias("nedster-router", router_path, dry_run=dry_run)

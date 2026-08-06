@@ -48,6 +48,16 @@ class SandboxExecutor:
         for directory in ("/usr", "/bin", "/lib", "/lib64", "/etc"):
             if Path(directory).exists():
                 args.extend(["--ro-bind", directory, directory])
+        user_home = Path.home()
+        cargo_bin = user_home / ".cargo" / "bin"
+        rustup_home = user_home / ".rustup"
+        if cargo_bin.is_dir() and rustup_home.is_dir():
+            parents = list(user_home.parents)
+            for parent in reversed([item for item in parents if item != Path("/")]):
+                args.extend(["--dir", str(parent)])
+            args.extend(["--dir", str(user_home)])
+            args.extend(["--ro-bind", str(cargo_bin), str(cargo_bin)])
+            args.extend(["--ro-bind", str(rustup_home), str(rustup_home)])
         relative = cwd.relative_to(self.project_root)
         sandbox_cwd = Path("/workspace") / relative
         args.extend(
@@ -119,6 +129,15 @@ class SandboxExecutor:
             "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
             "PYTHONIOENCODING": "utf-8",
         }
+        rustup_home = Path.home() / ".rustup"
+        if rustup_home.is_dir():
+            environment.update(
+                {
+                    "HOME": "/tmp",
+                    "CARGO_HOME": "/tmp/cargo-home",
+                    "RUSTUP_HOME": str(rustup_home),
+                }
+            )
         try:
             result = subprocess.run(
                 built,

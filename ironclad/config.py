@@ -45,8 +45,8 @@ class SandboxConfig:
 
 @dataclass(slots=True)
 class PolicyConfig:
-    autonomous: bool = False
-    max_auto_risk: str = "write"
+    autonomous: bool = True
+    max_auto_risk: str = "execute"
     allowed_commands: list[str] = field(
         default_factory=lambda: [
             "python",
@@ -80,9 +80,15 @@ class RuntimeConfig:
     project_root: Path = field(default_factory=Path.cwd)
     state_dir: Path = field(default_factory=lambda: Path.home() / ".nedster" / "runtime")
     max_worker_turns: int = 8
+    max_worker_restarts: int = 1
+    max_step_attempts: int = 2
     max_parallel_workers: int = 2
     profile: str = "balanced"
     ledger_key_env: str = "NEDSTER_LEDGER_KEY"
+    chat_max_tokens: int = 96
+    answer_max_tokens: int = 768
+    conversation_history_chars: int = 6_000
+    max_grounding_sources: int = 5
 
 
 @dataclass(slots=True)
@@ -110,7 +116,9 @@ def load_config(path: str | Path | None = None, project_root: str | Path | None 
         user_config = Path.home() / ".nedster" / "config.toml"
         project_config = Path("config/nedster.toml")
         legacy_config = Path("config/ironclad.toml")
-        candidate = next((item for item in (user_config, project_config, legacy_config) if item.exists()), user_config)
+        candidate = next(
+            (item for item in (user_config, project_config, legacy_config) if item.exists()), user_config
+        )
     if candidate.exists():
         data = tomllib.loads(candidate.read_text(encoding="utf-8"))
         _apply(config.models, dict(data.get("models") or {}))
@@ -118,17 +126,17 @@ def load_config(path: str | Path | None = None, project_root: str | Path | None 
         _apply(config.policy, dict(data.get("policy") or {}))
         _apply(config.runtime, dict(data.get("runtime") or {}))
 
-    config.runtime.project_root = Path(
-        project_root or os.getenv("NEDSTER_PROJECT") or config.runtime.project_root
-    ).expanduser().resolve()
-    config.runtime.state_dir = Path(
-        os.getenv("NEDSTER_STATE_DIR") or config.runtime.state_dir
-    ).expanduser().resolve()
+    config.runtime.project_root = (
+        Path(project_root or os.getenv("NEDSTER_PROJECT") or config.runtime.project_root)
+        .expanduser()
+        .resolve()
+    )
+    config.runtime.state_dir = (
+        Path(os.getenv("NEDSTER_STATE_DIR") or config.runtime.state_dir).expanduser().resolve()
+    )
     config.models.ollama_url = os.getenv("OLLAMA_HOST", config.models.ollama_url).rstrip("/")
     config.models.cloud_model = os.getenv("NEDSTER_CLOUD_MODEL", config.models.cloud_model)
-    config.models.cloud_oracle_enabled = _bool_env(
-        "NEDSTER_CLOUD_ORACLE", config.models.cloud_oracle_enabled
-    )
+    config.models.cloud_oracle_enabled = _bool_env("NEDSTER_CLOUD_ORACLE", config.models.cloud_oracle_enabled)
     config.policy.autonomous = _bool_env("NEDSTER_AUTONOMOUS", config.policy.autonomous)
     return config
 

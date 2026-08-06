@@ -54,6 +54,8 @@ class OllamaBackend:
         schema: dict[str, Any] | None = None,
         thinking: bool | str = False,
         keep_alive: str = "90s",
+        num_predict: int | None = None,
+        temperature: float | None = None,
     ) -> str:
         payload: dict[str, Any] = {
             "model": model,
@@ -64,8 +66,14 @@ class OllamaBackend:
             "stream": False,
             "think": thinking,
             "keep_alive": keep_alive,
-            "options": {"temperature": 0.1},
         }
+        options: dict[str, Any] = {}
+        if num_predict is not None:
+            options["num_predict"] = num_predict
+        if temperature is not None:
+            options["temperature"] = temperature
+        if options:
+            payload["options"] = options
         if schema:
             payload["format"] = schema
         try:
@@ -77,8 +85,43 @@ class OllamaBackend:
         except httpx.HTTPError as exc:
             raise BackendError(f"Ollama request failed: {exc}") from exc
 
-    async def complete_json(self, **kwargs: Any) -> dict[str, Any]:
-        return _json_from_text(await self.complete(**kwargs))
+    async def complete_json(
+        self,
+        *,
+        model: str,
+        system: str,
+        prompt: str,
+        schema: dict[str, Any],
+        thinking: bool | str = False,
+        keep_alive: str = "90s",
+        num_predict: int | None = None,
+        temperature: float | None = None,
+    ) -> dict[str, Any]:
+        # Ollama's generate endpoint reliably applies JSON Schema to Qwen 3.5.
+        # The chat endpoint may return prose even when the same schema is sent.
+        payload: dict[str, Any] = {
+            "model": model,
+            "system": system,
+            "prompt": prompt,
+            "format": schema,
+            "stream": False,
+            "think": thinking,
+            "keep_alive": keep_alive,
+        }
+        options: dict[str, Any] = {}
+        if num_predict is not None:
+            options["num_predict"] = num_predict
+        if temperature is not None:
+            options["temperature"] = temperature
+        if options:
+            payload["options"] = options
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(f"{self.base_url}/api/generate", json=payload)
+                response.raise_for_status()
+                return _json_from_text(str(response.json().get("response") or ""))
+        except httpx.HTTPError as exc:
+            raise BackendError(f"Ollama request failed: {exc}") from exc
 
     async def stream(
         self,
@@ -149,6 +192,7 @@ class OpenAIResponsesBackend:
         reasoning_mode: str = "standard",
         reasoning_context: str = "current_turn",
         verbosity: str = "medium",
+        num_predict: int | None = None,
         **_: Any,
     ) -> str:
         if not self.api_key:
@@ -175,6 +219,8 @@ class OpenAIResponsesBackend:
             "text": text_config,
             "store": False,
         }
+        if num_predict is not None:
+            payload["max_output_tokens"] = num_predict
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:

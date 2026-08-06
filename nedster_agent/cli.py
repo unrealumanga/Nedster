@@ -115,8 +115,19 @@ def _setup(args: argparse.Namespace, console: Console) -> int:
     recommended = recommend_plan(snapshot, preference)
 
     if not args.json:
-        console.print(Panel.fit("[bold]Nedster setup[/bold]\nLocal models, selected for this computer", border_style="cyan", box=box.ASCII if args.ascii else box.ROUNDED))
-        console.print(_ascii(f"Step 1/4  Hardware  {snapshot.accelerator} · {snapshot.vram_total_gb:.1f} GB VRAM · {snapshot.ram_total_gb:.1f} GB RAM", args.ascii))
+        console.print(
+            Panel.fit(
+                "[bold]Nedster setup[/bold]\nLocal models, selected for this computer",
+                border_style="cyan",
+                box=box.ASCII if args.ascii else box.ROUNDED,
+            )
+        )
+        console.print(
+            _ascii(
+                f"Step 1/4  Hardware  {snapshot.accelerator} · {snapshot.vram_total_gb:.1f} GB VRAM · {snapshot.ram_total_gb:.1f} GB RAM",
+                args.ascii,
+            )
+        )
         console.print(f"Step 2/4  Recommendation  {tier} / {recommended.label.lower()}")
     table = Table(show_header=False, box=None)
     table.add_row("Worker", recommended.worker)
@@ -158,7 +169,9 @@ def _setup(args: argparse.Namespace, console: Console) -> int:
     else:
         console.print("Step 4/4  Ready")
         launcher = _launcher_path()
-        console.print(f"Global command: {'ready at ' + launcher if launcher else 'not visible on PATH; restart the terminal'}")
+        console.print(
+            f"Global command: {'ready at ' + launcher if launcher else 'not visible on PATH; restart the terminal'}"
+        )
         console.print("Run [bold]nedster[/bold] from any project folder to begin.")
     return 0
 
@@ -195,7 +208,9 @@ def _doctor(args: argparse.Namespace, console: Console) -> int:
     else:
         snapshot = report["hardware"]
         console.print(f"Nedster {__version__} · {report['profile']['name']}")
-        console.print(f"Hardware  {snapshot['accelerator']} · {snapshot['vram_total_gb']} GB VRAM · {snapshot['ram_total_gb']} GB RAM")
+        console.print(
+            f"Hardware  {snapshot['accelerator']} · {snapshot['vram_total_gb']} GB VRAM · {snapshot['ram_total_gb']} GB RAM"
+        )
         console.print(f"Launcher  {report['nedster']['launcher'] or 'not on PATH'}")
         console.print(f"Ollama    {'ready' if report['ollama']['api'] else 'not running'}")
         console.print(f"Config    {'ready' if report['nedster']['configured'] else 'run: nedster setup'}")
@@ -239,7 +254,7 @@ async def _run_objective(args: argparse.Namespace, console: Console) -> int:
     runtime = NedsterRuntime(config)
     try:
         await runtime.initialize()
-        result = await runtime.run(args.objective)
+        result = await runtime.respond(args.objective)
         console.print_json(json.dumps(result, default=str))
         return 0 if result.get("passed") else 2
     finally:

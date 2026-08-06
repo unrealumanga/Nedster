@@ -4,16 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nedster-agent"
-version = "3.1.0a1"
-description = "Local-first AI coding and automation agent with automatic Ollama setup, hardware-aware models, RAG, MCP, and a friendly TUI"
+version = "3.1.0a2"
+description = "Persistent local AI coding agent for Ollama with project RAG, sandboxed tools, web research, and a concise terminal UI"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "unrealumanga" }]
 keywords = [
   "ai-agent", "local-ai", "local-llm", "coding-agent", "coding-assistant",
-  "ollama", "ollama-agent", "qwen", "rag", "mcp", "terminal-ui",
-  "autonomous-agent", "privacy", "self-hosted-ai", "agentic-coding",
+  "ollama", "ollama-agent", "qwen", "rag", "retrieval-augmented-generation",
+  "mcp", "terminal-ui", "cli", "developer-tools", "software-development",
+  "autonomous-agent", "privacy", "self-hosted-ai", "agentic-coding", "tool-use",
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",

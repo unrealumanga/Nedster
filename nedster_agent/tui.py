@@ -17,22 +17,26 @@ from ironclad.orchestrator import NedsterRuntime
 class NedsterApp(App[None]):
     TITLE = "Nedster"
     SUB_TITLE = "local AI agent"
+    ENABLE_COMMAND_PALETTE = False
 
     CSS = """
     Screen { background: ansi_default; color: ansi_default; layout: vertical; }
     #identity { height: 3; padding: 1 2; background: ansi_default; color: ansi_bright_blue; text-style: bold; border-bottom: solid ansi_blue; }
-    #work { height: 1fr; padding: 1 2; background: ansi_default; color: ansi_default; scrollbar-color: ansi_blue; }
-    #prompt { height: 3; margin: 0 1; padding: 0 1; background: ansi_default; color: ansi_default; border: tall ansi_blue; }
-    #prompt:focus { border: tall ansi_bright_blue; text-style: reverse; }
+    #work, #details { height: 1fr; padding: 1 2; background: ansi_default; color: ansi_default; scrollbar-color: ansi_blue; }
+    #details { display: none; }
+    #prompt { height: 1; margin: 0 1; padding: 0 1; background: ansi_default; color: ansi_default; border: none; border-left: thick ansi_blue; }
+    #prompt:focus { background: ansi_default; color: ansi_default; border: none; border-left: thick ansi_bright_blue; text-style: none; }
+    #prompt > .input--cursor { background: ansi_default; color: ansi_default; text-style: underline; }
+    #prompt > .input--placeholder, #prompt > .input--suggestion { color: ansi_default; text-style: none; }
     #message { height: 1; padding: 0 2; background: ansi_default; color: ansi_default; }
     Footer { background: ansi_default; color: ansi_default; }
     #too-small { display: none; height: 1fr; content-align: center middle; text-align: center; }
-    .no-color #identity, .no-color #work, .no-color #message, .no-color Footer { color: ansi_default; background: ansi_default; }
-    .no-color #prompt { color: ansi_default; background: ansi_default; border: tall ansi_default; }
-    .no-color #prompt:focus { text-style: reverse; }
+    .no-color #identity, .no-color #work, .no-color #details, .no-color #message, .no-color Footer { color: ansi_default; background: ansi_default; }
+    .no-color #prompt { color: ansi_default; background: ansi_default; border: none; border-left: thick ansi_default; }
+    .no-color #prompt:focus { border: none; border-left: thick ansi_default; text-style: none; }
     .ascii #identity { border-bottom: none; }
-    .ascii #prompt { border: none; }
-    .ascii #prompt:focus { text-style: reverse; }
+    .ascii #prompt { border: none; border-left: thick ansi_blue; }
+    .ascii #prompt:focus { border: none; border-left: thick ansi_bright_blue; text-style: none; }
     """
 
     BINDINGS = [
@@ -49,14 +53,19 @@ class NedsterApp(App[None]):
         self.runtime: NedsterRuntime | None = None
         self.busy = False
         self.last_event = "starting"
+        self.details_visible = False
+        self.event_buffer: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield Static("terminal too small - need at least 80x24", id="too-small")
         yield Static("Nedster  |  project  |  ASK  |  model: starting  |  Ollama: checking", id="identity")
         yield RichLog(id="work", markup=True, wrap=True, auto_scroll=True)
-        yield Input(placeholder="Ask Nedster to inspect, explain, build, or fix…  (/help)", id="prompt")
+        yield RichLog(id="details", markup=True, wrap=False, auto_scroll=True)
+        yield Input(
+            placeholder="> Ask a question or describe a task  (/help)", id="prompt", select_on_focus=False
+        )
         yield Static("Starting local runtime…", id="message")
-        yield Footer()
+        yield Footer(show_command_palette=False)
 
     async def on_mount(self) -> None:
         if self.no_color_mode:
@@ -64,10 +73,10 @@ class NedsterApp(App[None]):
         if self.ascii_only:
             self.screen.add_class("ascii")
         self._apply_size(self.size.width, self.size.height)
+        self.query_one("#prompt", Input).cursor_blink = False
         root = self.config.runtime.project_root
         self.query_one("#work", RichLog).write(
-            f"[bold]Nedster[/] is working in [bold]{escape(str(root))}[/]\n"
-            "Describe an outcome. Nedster will inspect first and show progress here."
+            f"[bold]Project[/]  {escape(str(root))}\nAsk a question or describe an outcome."
         )
         self.run_worker(self._initialize(), group="startup", exclusive=True)
         self.query_one("#prompt", Input).focus()
@@ -95,9 +104,32 @@ class NedsterApp(App[None]):
     def _event(self, event: dict[str, Any]) -> None:
         self.last_event = str(event.get("kind", "working"))
         detail = event.get("message") or event.get("reason") or event.get("tool") or ""
-        symbol = "x" if self.last_event.endswith(("failed", "denied")) else ">"
-        self.query_one("#work", RichLog).write(f"[dim]{symbol} {escape(self.last_event)}[/] {escape(str(detail))}")
-        self._status(self.last_event)
+        failed = self.last_event.endswith(("failed", "denied"))
+        symbol = "[FAIL]" if failed else ">"
+        event_line = f"[dim]{symbol} {escape(self.last_event)}[/] {escape(str(detail))}"
+        self.event_buffer.append(event_line)
+        if len(self.event_buffer) > 500:
+            del self.event_buffer[:100]
+        if self.details_visible:
+            self.query_one("#details", RichLog).write(event_line)
+        statuses = {
+            "runtime.ready": "Ready",
+            "response.started": "Thinking… · Esc cancels",
+            "response.finished": "Ready",
+            "objective.received": "Thinking… · Esc cancels",
+            "planner.fallback": "Using a simple plan… · Esc cancels",
+            "plan.created": "Plan ready · working… · Esc cancels",
+            "step.started": "Working… · Esc cancels",
+            "worker.turn": "Thinking… · Esc cancels",
+            "tool.authorized": f"Using {event.get('tool', 'tool')}… · Esc cancels",
+            "tool.completed": f"Used {event.get('actor', 'tool')} · working… · Esc cancels",
+            "step.finished": "Verifying… · Esc cancels",
+            "run.finished": "Ready",
+        }
+        if failed:
+            self._status("A tool step failed · continuing… · Esc cancels")
+        else:
+            self._status(statuses.get(self.last_event, "Working… · Esc cancels"))
 
     def _status(self, message: str) -> None:
         self.query_one("#message", Static).update(self._text(message))
@@ -110,7 +142,10 @@ class NedsterApp(App[None]):
     def _apply_size(self, width: int, height: int) -> None:
         too_small = width < 80 or height < 24
         self.query_one("#too-small", Static).display = too_small
-        for selector in ("#identity", "#work", "#prompt", "#message", "Footer"):
+        self.query_one("#identity").display = not too_small
+        self.query_one("#work").display = not too_small and not self.details_visible
+        self.query_one("#details").display = not too_small and self.details_visible
+        for selector in ("#prompt", "#message", "Footer"):
             self.query_one(selector).display = not too_small
 
     def on_resize(self, event: Resize) -> None:
@@ -146,9 +181,9 @@ class NedsterApp(App[None]):
         log.write(f"\n[bold #f0f6fc]You[/]  {escape(objective)}")
         self._status("Working… · Esc cancels")
         try:
-            result = await self.runtime.run(objective)
-            state = "complete" if result.get("passed") else "needs review"
-            log.write(f"[bold]Nedster[/]  Task {state}.")
+            result = await self.runtime.respond(objective)
+            answer = str(result.get("answer") or "I could not produce an answer.").strip()
+            log.write(f"[bold]Nedster[/]  {escape(answer)}")
         except asyncio.CancelledError:
             log.write("[bold][CANCELLED][/] Task cancelled.")
             raise
@@ -167,10 +202,15 @@ class NedsterApp(App[None]):
         elif command == "/clear":
             log.clear()
         elif command == "/help":
-            log.write("[bold]Commands[/]  /models  /doctor  /permissions  /clear  /quit\n[bold]Keys[/]  ? help  F2 details  Esc cancel/exit")
+            log.write(
+                "[bold]Commands[/]  /models  /doctor  /permissions  /clear  /quit\n[bold]Keys[/]  ? help  F2 details  Esc cancel/exit"
+            )
         elif command == "/models":
             rows = self.runtime.fleet.as_rows() if self.runtime and self.runtime.fleet else []
-            log.write("\n".join(f"{role}: {model} ({backend})" for role, model, backend in rows) or "No model fleet is active. Run `nedster setup`.")
+            log.write(
+                "\n".join(f"{role}: {model} ({backend})" for role, model, backend in rows)
+                or "No model fleet is active. Run `nedster setup`."
+            )
         elif command == "/doctor":
             log.write("Run `nedster doctor` outside the TUI for a complete machine-readable check.")
         elif command == "/permissions":
@@ -183,7 +223,15 @@ class NedsterApp(App[None]):
         self._command("/help")
 
     def action_details(self) -> None:
-        self._command("/models")
+        self.details_visible = not self.details_visible
+        self.query_one("#work", RichLog).display = not self.details_visible
+        details = self.query_one("#details", RichLog)
+        details.display = self.details_visible
+        if self.details_visible:
+            details.clear()
+            for line in self.event_buffer:
+                details.write(line)
+        self._status("Details · F2 returns to conversation" if self.details_visible else "Ready")
 
     def action_clear(self) -> None:
         self.query_one("#work", RichLog).clear()
