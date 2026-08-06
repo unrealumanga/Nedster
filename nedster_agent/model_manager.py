@@ -5,6 +5,7 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -142,10 +143,10 @@ class OllamaManager:
             response.raise_for_status()
             script.write_bytes(response.content)
             self.progress("Running the official Ollama Linux installer…")
-            subprocess.run(["sh", str(script)], check=True)
+            subprocess.run(["sh", str(script)], check=True, stdout=sys.stderr)
         elif system == "Darwin":
             if shutil.which("brew"):
-                subprocess.run(["brew", "install", "--cask", "ollama-app"], check=True)
+                subprocess.run(["brew", "install", "--cask", "ollama-app"], check=True, stdout=sys.stderr)
             else:
                 subprocess.run(["open", "https://ollama.com/download/mac"], check=True)
                 raise RuntimeError("Complete the Ollama app installation, then rerun `nedster setup`.")
@@ -186,7 +187,7 @@ class OllamaManager:
         if not executable:
             raise RuntimeError("The Ollama executable is unavailable.")
         self.progress(f"Downloading {model}…")
-        subprocess.run([executable, "pull", model], check=True)
+        subprocess.run([executable, "pull", model], check=True, stdout=sys.stderr)
 
     def create_alias(self, alias: str, modelfile: Path, *, dry_run: bool = False) -> None:
         if dry_run:
@@ -195,7 +196,7 @@ class OllamaManager:
         executable = self.executable
         if not executable:
             raise RuntimeError("The Ollama executable is unavailable.")
-        subprocess.run([executable, "create", alias, "-f", str(modelfile)], check=True)
+        subprocess.run([executable, "create", alias, "-f", str(modelfile)], check=True, stdout=sys.stderr)
 
     def verify_generation(self, model: str = "nedster-router") -> str:
         response = httpx.post(

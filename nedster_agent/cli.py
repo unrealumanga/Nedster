@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import shutil
+import os
 import subprocess
 import sys
 from dataclasses import asdict
+from pathlib import Path
 
 import httpx
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -31,6 +33,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project", default=".", help="Project folder (default: current folder)")
     parser.add_argument("--config", default=None, help="Nedster TOML configuration path")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    parser.add_argument("--plain", action="store_true", help="Emit stable, one-record-per-line text")
+    parser.add_argument("--no-tui", action="store_true", help="Never open the full-screen interface")
+    parser.add_argument("--color", action="store_true", help="Force color when the destination supports it")
     parser.add_argument("--no-color", action="store_true", help="Disable color output")
     parser.add_argument("--ascii", action="store_true", help="Use ASCII-safe symbols")
     parser.add_argument("--version", action="version", version=f"Nedster {__version__}")
@@ -40,6 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("--project", default=argparse.SUPPRESS)
         command_parser.add_argument("--config", default=argparse.SUPPRESS)
         command_parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+        command_parser.add_argument("--plain", action="store_true", default=argparse.SUPPRESS)
+        command_parser.add_argument("--no-tui", action="store_true", default=argparse.SUPPRESS)
+        command_parser.add_argument("--color", action="store_true", default=argparse.SUPPRESS)
         command_parser.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
         command_parser.add_argument("--ascii", action="store_true", default=argparse.SUPPRESS)
 
@@ -67,11 +75,36 @@ def build_parser() -> argparse.ArgumentParser:
     accept_global_options(tui)
     ledger = subcommands.add_parser("verify-ledger", help="Verify the local event chain")
     accept_global_options(ledger)
+    permissions = subcommands.add_parser("permissions", help="Show the active tool permission policy")
+    accept_global_options(permissions)
     return parser
 
 
 def _console(args: argparse.Namespace) -> Console:
-    return Console(no_color=args.no_color, force_terminal=None if not args.no_color else False)
+    if args.color and args.no_color:
+        raise SystemExit("Choose either --color or --no-color, not both.")
+    no_color: bool | None = False if args.color else (True if args.no_color else None)
+    return Console(
+        no_color=no_color,
+        force_terminal=False if args.no_color else None,
+    )
+
+
+def _ascii(value: str, enabled: bool) -> str:
+    if not enabled:
+        return value
+    return value.replace("…", "...").replace("·", "|").replace("—", "-")
+
+
+def _launcher_path() -> str | None:
+    names = ("nedster.exe", "nedster") if sys.platform == "win32" else ("nedster",)
+    for raw_directory in os.getenv("PATH", "").split(os.pathsep):
+        directory = Path(raw_directory.strip('"'))
+        for name in names:
+            candidate = directory / name
+            if candidate.is_file():
+                return str(candidate.resolve())
+    return None
 
 
 def _setup(args: argparse.Namespace, console: Console) -> int:
@@ -82,8 +115,8 @@ def _setup(args: argparse.Namespace, console: Console) -> int:
     recommended = recommend_plan(snapshot, preference)
 
     if not args.json:
-        console.print(Panel.fit("[bold]Nedster setup[/bold]\nLocal models, selected for this computer", border_style="cyan"))
-        console.print(f"Step 1/4  Hardware  {snapshot.accelerator} · {snapshot.vram_total_gb:.1f} GB VRAM · {snapshot.ram_total_gb:.1f} GB RAM")
+        console.print(Panel.fit("[bold]Nedster setup[/bold]\nLocal models, selected for this computer", border_style="cyan", box=box.ASCII if args.ascii else box.ROUNDED))
+        console.print(_ascii(f"Step 1/4  Hardware  {snapshot.accelerator} · {snapshot.vram_total_gb:.1f} GB VRAM · {snapshot.ram_total_gb:.1f} GB RAM", args.ascii))
         console.print(f"Step 2/4  Recommendation  {tier} / {recommended.label.lower()}")
     table = Table(show_header=False, box=None)
     table.add_row("Worker", recommended.worker)
@@ -107,23 +140,24 @@ def _setup(args: argparse.Namespace, console: Console) -> int:
 
     if not args.json:
         console.print("Step 3/4  Ollama and models")
-    progress_console = console if not args.json else Console(stderr=True, no_color=args.no_color)
+    progress_no_color: bool | None = False if args.color else (True if args.no_color else None)
+    progress_console = Console(stderr=True, no_color=progress_no_color)
     try:
         result = install_plan(
             recommended,
             ollama_url=args.ollama_url,
             install_ollama=not args.skip_ollama_install,
             dry_run=args.dry_run,
-            progress=lambda message: progress_console.print(f"  {message}"),
+            progress=lambda message: progress_console.print(f"  {_ascii(message, args.ascii)}"),
         )
     except (RuntimeError, OSError, subprocess.CalledProcessError, httpx.HTTPError) as exc:
-        console.print(f"[red]Setup stopped:[/red] {exc}")
+        progress_console.print(f"[red][FAIL] Setup stopped:[/red] {exc}")
         return 1
     if args.json:
         console.print_json(json.dumps(result))
     else:
         console.print("Step 4/4  Ready")
-        launcher = shutil.which("nedster")
+        launcher = _launcher_path()
         console.print(f"Global command: {'ready at ' + launcher if launcher else 'not visible on PATH; restart the terminal'}")
         console.print("Run [bold]nedster[/bold] from any project folder to begin.")
     return 0
@@ -134,7 +168,7 @@ def _doctor(args: argparse.Namespace, console: Console) -> int:
     manager = OllamaManager()
     report["nedster"] = {
         "version": __version__,
-        "launcher": shutil.which("nedster"),
+        "launcher": _launcher_path(),
         "config": str(state_dir() / "config.toml"),
         "configured": (state_dir() / "config.toml").exists(),
     }
@@ -145,6 +179,19 @@ def _doctor(args: argparse.Namespace, console: Console) -> int:
     }
     if args.json:
         console.print_json(json.dumps(report))
+    elif args.plain:
+        snapshot = report["hardware"]
+        for key, value in (
+            ("version", report["nedster"]["version"]),
+            ("profile", report["profile"]["name"]),
+            ("accelerator", snapshot["accelerator"]),
+            ("vram_gb", snapshot["vram_total_gb"]),
+            ("ram_gb", snapshot["ram_total_gb"]),
+            ("launcher", report["nedster"]["launcher"] or "missing"),
+            ("ollama", "ready" if report["ollama"]["api"] else "unavailable"),
+            ("configured", str(report["nedster"]["configured"]).lower()),
+        ):
+            print(f"{key}\t{value}")
     else:
         snapshot = report["hardware"]
         console.print(f"Nedster {__version__} · {report['profile']['name']}")
@@ -159,7 +206,13 @@ def _models(args: argparse.Namespace, console: Console) -> int:
     manager = OllamaManager()
     plan = recommend_plan(preference=args.profile)
     if args.action == "recommend":
-        console.print_json(json.dumps(asdict(plan))) if args.json else console.print(Panel(json.dumps(asdict(plan), indent=2), title="Recommended model plan"))
+        if args.json:
+            console.print_json(json.dumps(asdict(plan)))
+        elif args.plain:
+            for key, value in asdict(plan).items():
+                print(f"{key}\t{value}")
+        else:
+            console.print(Panel(json.dumps(asdict(plan), indent=2), title="Recommended model plan"))
         return 0
     if args.action == "install":
         install_plan(plan, dry_run=args.dry_run, progress=console.print)
@@ -170,6 +223,9 @@ def _models(args: argparse.Namespace, console: Console) -> int:
     models = manager.list_models()
     if args.json:
         console.print_json(json.dumps({"models": models}))
+    elif args.plain:
+        for model in models:
+            print(model)
     else:
         table = Table("Installed Ollama models")
         for model in models:
@@ -207,17 +263,44 @@ def main(argv: list[str] | None = None) -> int:
             valid, count, digest = ledger.verify()
         console.print({"valid": valid, "events": count, "head": digest})
         return 0 if valid else 1
+    if command == "permissions":
+        policy = load_config(args.config, args.project).policy
+        value = {
+            "autonomous": policy.autonomous,
+            "max_auto_risk": policy.max_auto_risk,
+            "allowed_commands": policy.allowed_commands,
+        }
+        if args.json:
+            console.print_json(json.dumps(value))
+        elif args.plain:
+            print(f"autonomous\t{str(policy.autonomous).lower()}")
+            print(f"max_auto_risk\t{policy.max_auto_risk}")
+            for executable in policy.allowed_commands:
+                print(f"allowed_command\t{executable}")
+        else:
+            console.print(f"Autonomous: {policy.autonomous}")
+            console.print(f"Automatic risk ceiling: {policy.max_auto_risk}")
+            console.print("Allowed commands: " + ", ".join(policy.allowed_commands))
+        return 0
     if command == "run":
         return asyncio.run(_run_objective(args, console))
 
+    interactive_tui = not args.no_tui and sys.stdout.isatty()
     config_path = state_dir() / "config.toml"
-    if command is None and not config_path.exists() and sys.stdin.isatty():
+    if command is None and interactive_tui and not config_path.exists() and sys.stdin.isatty():
         setup_args = build_parser().parse_args(["--project", args.project, "setup"])
         if _setup(setup_args, console):
             return 1
+    if not interactive_tui:
+        build_parser().print_help()
+        return 0
     from .tui import run_tui
 
-    run_tui(load_config(args.config, args.project))
+    run_tui(
+        load_config(args.config, args.project),
+        ascii_only=args.ascii,
+        no_color=args.no_color or (not args.color and bool(os.getenv("NO_COLOR"))),
+    )
     return 0
 
 

@@ -60,12 +60,18 @@ Useful commands:
 ```bash
 nedster run "Find the failing tests, fix the cause, and verify the suite"
 nedster doctor
+nedster doctor --plain
+nedster permissions --plain
 nedster models recommend
 nedster models list
 nedster setup --profile fast
 ```
 
 Running bare `nedster` starts a chat-first TUI designed for 80-column terminals. It keeps project, mode, active model, and Ollama state at the top; work in the center; transient status and discoverable keys at the bottom. Use `/help`, `/models`, `/doctor`, `/permissions`, `/clear`, and `/quit`.
+
+When output is redirected or piped, Nedster does not open the full-screen TUI. Use `--plain` for stable one-record-per-line text, `--json` for structured output, `--no-tui` to force the linear path, `--no-color`/`--color` for an explicit color preference, and `--ascii` for restricted terminals.
+
+The TUI is designed for a monospace font of **15 px or larger** at a normal desk distance; 18–20 px is recommended. Below 14 px, secondary text may be difficult to read. Full-screen terminal accessibility with screen readers is currently untested; the `run`, `doctor`, `models`, `setup`, `--plain`, and `--json` paths are the supported linear interfaces for assistive technology and automation.
 
 ## Automatic model matching
 
