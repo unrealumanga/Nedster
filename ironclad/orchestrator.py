@@ -105,7 +105,9 @@ LOCAL_INSPECTION = re.compile(
     re.IGNORECASE,
 )
 EXPLICIT_FILE = re.compile(r"(?<![\w.-])([\w.-]+\.[A-Za-z0-9]{1,8})(?![\w.-])")
-LOCAL_PATH = re.compile(r"(?<!\w)(~/(?:[^\s,;!?]+)|/(?:[^\s,;!?]+))")
+LOCAL_PATH = re.compile(
+    r"(?<!\w)((?:[A-Za-z]:[\\/]|~[\\/]|/)(?:[^\s,;!?]+))"
+)
 FOLLOWUP_CRITERIA = re.compile(
     r"^(?:and\s+|also\s+)?(?:best\s+is|by\s+|based\s+on|continue|go\s+on|keep\s+going|"
     r"how\s+many|what\s+about|how\s+about|look\s+at|rank\s+by|the\s+one|those|them|"
@@ -341,11 +343,17 @@ class NedsterRuntime:
 
     def _access_answer(self) -> str:
         root = self.config.runtime.project_root
+        displayed_root = root.as_posix()
+        suggested_root = (
+            root.parent.as_posix()
+            if root.parent.name.casefold() == "workspace"
+            else "/path/to/folder"
+        )
         return (
             f"I can read and search the active project or an explicitly named local folder. Edits and "
-            f"approved commands stay inside the active project: `{root}`. To make another folder the "
+            f"approved commands stay inside the active project: `{displayed_root}`. To make another folder the "
             "full project, start me with "
-            f"`nedster --project {root.parent if root.parent.name.casefold() == 'workspace' else '/path/to/folder'}`. "
+            f"`nedster --project {suggested_root}`. "
             "Use `/permissions` to inspect the current write and command policy."
         )
 

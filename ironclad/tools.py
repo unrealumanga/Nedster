@@ -232,9 +232,15 @@ class ToolRegistry:
         ]
 
     def _path(self, raw: str) -> Path:
-        candidate = (self.project_root / raw).resolve()
+        # Resolve the root on every boundary check. Windows may expose the same
+        # temporary directory through both an 8.3 alias and its long path; a
+        # lexical comparison between those spellings incorrectly looks like an
+        # escape even though both paths identify the same directory.
+        root = self.project_root.resolve()
+        self.project_root = root
+        candidate = (root / raw).resolve()
         try:
-            candidate.relative_to(self.project_root)
+            candidate.relative_to(root)
         except ValueError as exc:
             raise PermissionError(f"path escapes project root: {raw}") from exc
         return candidate
@@ -310,6 +316,7 @@ class ToolRegistry:
         return [value if "/" in value else f"**/{value}" for value in variants]
 
     def _matching_files(self, pattern: str) -> list[Path]:
+        self.project_root = self.project_root.resolve()
         paths: set[Path] = set()
         for variant in self._glob_variants(pattern):
             for path in self.project_root.glob(variant):
