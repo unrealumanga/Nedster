@@ -51,6 +51,10 @@ def test_local_work_takes_the_agent_path(value):
         "help me debug this code",
         "finish the Rust calculator",
         "complete the implementation",
+        "compile the application",
+        "export the report",
+        "render the final image",
+        "please do it",
     ],
 )
 def test_conversational_action_requests_take_the_agent_path(value):
@@ -348,6 +352,7 @@ async def test_chat_response_uses_one_text_call_and_skips_agent_pipeline():
 
     assert result["answer"] == "Hello! How can I help?"
     assert result["mode"] == "chat"
+    assert result["grounded"] is False
     runtime._text_call.assert_awaited_once()
     runtime.run.assert_not_awaited()
 
@@ -365,7 +370,43 @@ async def test_stable_knowledge_answer_stays_on_the_low_cost_direct_path():
     result = await runtime.respond("Why does retrieval reduce hallucination?")
 
     assert result["mode"] == "ask"
+    assert result["grounded"] is False
     runtime._execute_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unverified_work_claim_in_direct_answer_is_escalated_to_tools():
+    runtime = object.__new__(NedsterRuntime)
+    runtime.config = NedsterConfig()
+    runtime.conversation = []
+    runtime.on_event = None
+    runtime.ledger = Mock(append=Mock(return_value=1))
+    runtime._text_call = AsyncMock(return_value="I reviewed your project and fixed the issue.")
+    runtime._execute_agent = AsyncMock(
+        return_value={"answer": "Verified with tools.", "passed": True, "mode": "agent"}
+    )
+
+    result = await runtime.respond("What is the likely cause of this obscure issue?")
+
+    assert result["answer"] == "Verified with tools."
+    runtime._execute_agent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unverified_work_claim_is_removed_from_chat_response():
+    runtime = object.__new__(NedsterRuntime)
+    runtime.config = NedsterConfig()
+    runtime.conversation = []
+    runtime.on_event = None
+    runtime.ledger = Mock(append=Mock(return_value=1))
+    runtime._text_call = AsyncMock(
+        return_value="Nice to meet you.\n- Updated your project while we were chatting."
+    )
+
+    result = await runtime.respond("hello")
+
+    assert result["answer"] == "Nice to meet you."
+    assert result["grounded"] is False
 
 
 @pytest.mark.asyncio
@@ -510,6 +551,7 @@ async def test_current_market_price_uses_a_cross_checked_tool_without_an_llm():
     result = await runtime.respond("whats the current BTCUSDT market price")
 
     assert result["passed"] is True
+    assert result["grounded"] is True
     assert "Binance 64,463.73 USDT" in result["answer"]
     assert "Coinbase 64,463.9 USDT" in result["answer"]
     runtime.run.assert_not_awaited()

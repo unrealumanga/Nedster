@@ -69,7 +69,7 @@ nedster models list
 nedster setup --profile fast
 ```
 
-Running bare `nedster` starts a quiet, chat-first TUI designed for 80-column terminals. Normal conversation shows the answer instead of streaming internal event names; press `F2` when you want execution details. The input stays visually stable while focused. Use `/help`, `/models`, `/doctor`, `/permissions`, `/clear`, and `/quit`.
+Running bare `nedster` starts a quiet, chat-first TUI designed for 80-column terminals. The conversation shows a live plan, reasoning stages, compact tool activity, verification results, and the final Markdown answer without exposing raw internal messages. Press `F2` for the full diagnostic event stream. The composer stays visually stable while focused. Use `/help`, `/models`, `/doctor`, `/permissions`, `/clear`, and `/quit`.
 
 When output is redirected or piped, Nedster does not open the full-screen TUI. Use `--plain` for stable one-record-per-line text, `--json` for structured output, `--no-tui` to force the linear path, `--no-color`/`--color` for an explicit color preference, and `--ascii` for restricted terminals.
 

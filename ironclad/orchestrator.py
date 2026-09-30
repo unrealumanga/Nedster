@@ -9,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from .claim_gate import screen_unverified
 from .config import NedsterConfig
 from .grounding import GroundingHarness, GroundingSource
 from .hardware import choose_profile, probe_hardware
@@ -73,7 +74,9 @@ AGENT_ACTION = re.compile(
     r"^(?:(?:please|kindly)\s+|(?:can|could|would|will)\s+you\s+|"
     r"(?:let(?:'s|s)|let\s+us)\s+|(?:i\s+(?:want|need)\s+(?:you\s+)?to)\s+|"
     r"help\s+me\s+)?"
-    r"(?:build|change|complete|create|debug|edit|finish|fix|implement|install|patch|refactor|remove|rename|run|test|update|write)\b",
+    r"(?:build|calculate|change|compile|complete|convert|create|debug|deploy|download|draft|edit|"
+    r"export|fetch|finish|fix|generate|implement|import|install|migrate|organize|package|patch|"
+    r"refactor|remove|rename|render|run|test|update|write)\b",
     re.IGNORECASE,
 )
 MUTATION_TOOLS = frozenset({"replace_text", "write_file"})
@@ -160,17 +163,26 @@ def classify_interaction(value: str) -> str:
         or (LOCAL_TARGET.search(value) and LOCAL_INSPECTION.search(value))
         or FRESHNESS_QUERY.search(value)
         or WEB_QUERY.search(value)
+        or re.search(r"\b(?:please\s+)?do\s+(?:this|that|it)\b", value, re.IGNORECASE)
     ):
         return "agent"
     return "ask"
 
 
-def _result(objective: str, answer: str, *, mode: str = "ask", passed: bool = True) -> dict[str, Any]:
+def _result(
+    objective: str,
+    answer: str,
+    *,
+    mode: str = "ask",
+    passed: bool = True,
+    grounded: bool = True,
+) -> dict[str, Any]:
     return {
         "objective": objective,
         "answer": answer,
         "passed": passed,
         "mode": mode,
+        "grounded": grounded,
         "completed_steps": 0,
         "total_steps": 0,
         "results": [],
@@ -438,6 +450,7 @@ class NedsterRuntime:
             "answer": answer,
             "passed": passed,
             "mode": "agent",
+            "grounded": True,
             "completed_steps": 1,
             "total_steps": 1,
             "results": [
@@ -528,11 +541,17 @@ class NedsterRuntime:
         if mode == "ask" and self._needs_tool_escalation(answer):
             self._emit("response.escalated", "nedster", reason=answer[:240] or "empty answer")
             return await self._execute_agent(objective, objective)
+        screened = screen_unverified(answer)
+        if screened.claims_unverified_work:
+            if mode == "ask":
+                self._emit("response.escalated", "nedster", reason="unverified work claim")
+                return await self._execute_agent(objective, objective)
+            answer = screened.without_work_claims
         if not answer:
             raise BackendError("the local model returned an empty answer")
         self._remember(objective, answer)
         self.last_mode = mode
-        result = _result(objective, answer, mode=mode)
+        result = _result(objective, answer, mode=mode, grounded=False)
         self._emit("response.finished", "nedster", mode=mode)
         return result
 
@@ -1639,6 +1658,7 @@ class NedsterRuntime:
             "answer": answer,
             "mode": "agent",
             "passed": passed,
+            "grounded": True,
             "completed_steps": len(completed),
             "total_steps": len(plan.steps),
             "results": results,
