@@ -168,7 +168,7 @@ local_thinking = true
 
 [policy]
 autonomous = true
-max_auto_risk = "execute"
+max_auto_risk = "write"
 
 [sandbox]
 allow_host_execution = false
@@ -424,8 +424,34 @@ def _dump_toml(data: dict[str, object]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def merge_config(existing: dict[str, object], plan: ModelPlan, ollama_url: str) -> dict[str, object]:
-    """Managed keys take the new plan; every other user-edited key is preserved."""
+@dataclass(frozen=True, slots=True)
+class ExecutionChoice:
+    """What the user explicitly agreed to; None fields leave the existing value untouched."""
+
+    max_auto_risk: str
+    allow_host_execution: bool | None = None
+
+
+def describe_permissions(max_auto_risk: object, allow_host: object) -> str:
+    """One-line statement of exactly what Nedster may do without asking."""
+    if max_auto_risk == "execute":
+        where = "directly on this machine (NO isolation)" if allow_host else "only inside an isolated sandbox"
+        return f"Nedster may read files, write files and run commands automatically, {where}."
+    if max_auto_risk == "write":
+        return "Nedster may read and write files automatically; it will ask before running commands."
+    return "Nedster may only read files automatically; it will ask before writing or running commands."
+
+
+def merge_config(
+    existing: dict[str, object],
+    plan: ModelPlan,
+    ollama_url: str,
+    execution: ExecutionChoice | None = None,
+) -> dict[str, object]:
+    """Managed keys take the new plan; every other user-edited key is preserved.
+
+    An explicit `execution` choice (the user's answer) overrides policy/sandbox consent keys.
+    """
     generated = tomllib.loads(render_config(plan, ollama_url))
     merged: dict[str, object] = {k: (dict(v) if isinstance(v, dict) else v) for k, v in existing.items()}
     for section, table in generated.items():
@@ -435,6 +461,10 @@ def merge_config(existing: dict[str, object], plan: ModelPlan, ollama_url: str) 
         for key, value in table.items():
             if key in MANAGED_KEYS.get(section, set()) or key not in target:
                 target[key] = value
+    if execution is not None:
+        merged["policy"]["max_auto_risk"] = execution.max_auto_risk  # type: ignore[index]
+        if execution.allow_host_execution is not None:
+            merged["sandbox"]["allow_host_execution"] = execution.allow_host_execution  # type: ignore[index]
     return merged
 
 
@@ -479,6 +509,7 @@ def install_plan(
     progress: ProgressCallback | None = None,
     manager: OllamaManager | None = None,
     config_dir: Path | None = None,
+    execution: ExecutionChoice | None = None,
 ) -> dict[str, object]:
     """Stage, verify, back up, then atomically activate. Any failure leaves the old config in place."""
     emit = progress or (lambda _message: None)
@@ -527,7 +558,7 @@ def install_plan(
             for alias, staged in STAGED_ALIASES.items():
                 manager.copy_model(staged, alias)
             existing = tomllib.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
-            backup = activate_config(root, _dump_toml(merge_config(existing, plan, ollama_url)))
+            backup = activate_config(root, _dump_toml(merge_config(existing, plan, ollama_url, execution)))
     except SetupError:
         raise
     except (RuntimeError, OSError, subprocess.CalledProcessError, httpx.HTTPError, ValueError) as exc:

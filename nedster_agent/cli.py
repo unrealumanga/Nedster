@@ -54,6 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--yes", action="store_true", help="Accept the recommended configuration")
     setup.add_argument("--no-input", action="store_true", help="Never prompt; use flags and defaults")
     setup.add_argument("--dry-run", action="store_true", help="Show actions without downloading or writing")
+    setup.add_argument("--allow-execution", action="store_true",
+                       help="Let Nedster run tests and commands automatically, inside an isolated sandbox only")
+    setup.add_argument("--allow-host-execution", action="store_true",
+                       help="Let Nedster run commands directly on this machine, with NO isolation (implies execute)")
 
     doctor = subcommands.add_parser("doctor", help="Check inference, read-only and execution readiness")
     accept_global_options(doctor)
@@ -163,6 +167,57 @@ def _config_show(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _read_line(prompt: str) -> str:
+    return input(prompt)
+
+
+def _ask_yes_no(question: str, default: bool) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    try:
+        answer = _read_line(f"{question} {suffix} ").strip().lower()
+    except EOFError:
+        return default
+    return default if not answer else answer in ("y", "yes")
+
+
+def _isolated(probe: dict[str, Any]) -> bool:
+    return bool(probe["ready"]) and probe["isolation"] == "full"
+
+
+def _decide_execution(args: argparse.Namespace, probe: dict[str, Any], interactive: bool, say: Any) -> Any:
+    """Turn flags / answers into an ExecutionChoice (None = keep what the config already says)."""
+    from .model_manager import ExecutionChoice
+
+    if args.allow_host_execution:
+        say("WARNING: commands will run directly on this machine with NO isolation. "
+            "Undo with: sandbox.allow_host_execution = false in config.toml")
+        return ExecutionChoice("execute", True)
+    isolated = _isolated(probe)
+    if args.allow_execution or (args.yes and not interactive):
+        if isolated:
+            return ExecutionChoice("execute")
+        if args.allow_execution:
+            say(f"Execution NOT enabled: no isolated sandbox is ready ({probe['detail']}). "
+                "Start Docker/install a sandbox, or use --allow-host-execution to accept no isolation.")
+        return None
+    if not interactive:
+        return None
+    if probe["ready"]:
+        question = (f"Let Nedster run tests and commands automatically inside {probe['backend']} "
+                    f"({probe['isolation']} isolation)?")
+        if _ask_yes_no(question, default=isolated):
+            return ExecutionChoice("execute")
+    else:
+        say(f"No execution backend is ready: {probe['detail']}")
+    if not isolated:
+        say("Without a sandbox, commands would run with your full user permissions and could change or "
+            "delete anything you can. Change it later: sandbox.allow_host_execution in config.toml.")
+        if _ask_yes_no("No sandbox is available. Allow commands to run directly on this machine (no isolation)?",
+                       default=False):
+            return ExecutionChoice("execute", True)
+    return ExecutionChoice("write", False)
+
+
 def _setup(args: argparse.Namespace) -> int:
     import httpx  # noqa: F401  (surface import problems early, and for error mapping)
     from rich import box
@@ -172,7 +227,7 @@ def _setup(args: argparse.Namespace) -> int:
 
     from ironclad.hardware import choose_profile, probe_hardware
 
-    from .model_manager import SetupError, install_plan, recommend_plan
+    from .model_manager import SetupError, describe_permissions, install_plan, probe_execution, recommend_plan
 
     console = _console(args)
     config, _ = _resolve(args, {"models.ollama_url": args.ollama_url})
@@ -204,6 +259,9 @@ def _setup(args: argparse.Namespace) -> int:
             console.print("Setup cancelled; nothing was changed.")
             return EXIT_OK
 
+    probe = probe_execution(config)
+    execution = _decide_execution(args, probe, interactive, lambda message: _err(_ascii(message, args.ascii)))
+
     if human:
         console.print("Step 3/4  Ollama and models")
     progress_console = _stderr_console(args)
@@ -215,6 +273,7 @@ def _setup(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             with_embeddings=args.with_embeddings,
             progress=lambda message: progress_console.print(f"  {_ascii(message, args.ascii)}", markup=False),
+            execution=execution,
         )
     except SetupError as exc:
         _err(f"[FAIL] Setup stopped: {exc}")
@@ -222,16 +281,25 @@ def _setup(args: argparse.Namespace) -> int:
             _err(f"Remedy: {exc.remedy}")
         _err("Your previous configuration was left untouched.")
         return EXIT_RUNTIME
+    risk = execution.max_auto_risk if execution else config.policy.max_auto_risk
+    if execution and execution.allow_host_execution is not None:
+        host = execution.allow_host_execution
+    else:
+        host = config.sandbox.allow_host_execution
+    permissions = describe_permissions(risk, host)
+    result["permissions"] = {"max_auto_risk": risk, "allow_host_execution": bool(host), "summary": permissions}
     if args.json:
         _emit_json(result)
     elif args.plain:
         for key in ("config", "backup", "aliases"):
             print(f"{key}\t{result[key]}")
+        print(f"permissions\t{permissions}")
     else:
         console.print("Step 4/4  Ready")
         if result.get("backup"):
             console.print(f"Previous config saved to {result['backup']}")
         launcher = _launcher_path()
+        console.print(permissions, markup=False, highlight=False)
         console.print(f"Global command: {'ready at ' + launcher if launcher else 'not visible on PATH; restart the terminal'}")
         console.print("Run [bold]nedster[/bold] from any project folder to begin.")
     return EXIT_OK

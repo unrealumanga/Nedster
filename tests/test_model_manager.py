@@ -53,7 +53,8 @@ def test_generated_config_uses_stable_aliases():
     assert 'ollama_url = "http://localhost:11434"' in value
     assert "[policy]" in value
     assert "autonomous = true" in value
-    assert 'max_auto_risk = "execute"' in value
+    assert 'max_auto_risk = "write"' in value  # execution is never enabled without consent
+    assert "allow_host_execution = false" in value
 
 
 def test_state_directory_can_be_overridden(tmp_path: Path):
@@ -182,3 +183,44 @@ def test_readiness_host_mode_is_labelled_and_unopted_host_is_not_ready():
     assert host["ready"] and host["detail"] == "host process — no isolation (opted in)"
     denied = readiness(_config("host", False), FakeManager())["execution"]
     assert not denied["ready"] and denied["remedy"]
+
+
+# --- explicit execution consent (SETUP-CONSENT) -----------------------------------------------
+
+from nedster_agent.model_manager import ExecutionChoice, describe_permissions  # noqa: E402
+
+
+def _merge(existing, execution):
+    return merge_config(existing, recommend_plan(snapshot(32)), "http://h:1", execution)
+
+
+def test_merge_without_choice_defaults_to_write_and_keeps_previous_answers():
+    fresh = _merge({}, None)
+    assert fresh["policy"]["max_auto_risk"] == "write" and fresh["sandbox"]["allow_host_execution"] is False
+    prior = {"policy": {"max_auto_risk": "execute"}, "sandbox": {"allow_host_execution": True}}
+    kept = _merge(prior, None)
+    assert kept["policy"]["max_auto_risk"] == "execute" and kept["sandbox"]["allow_host_execution"] is True
+
+
+def test_merge_with_choice_overrides_consent_keys():
+    prior = {"policy": {"max_auto_risk": "write"}, "sandbox": {"allow_host_execution": True}}
+    isolated = _merge(prior, ExecutionChoice("execute"))
+    assert isolated["policy"]["max_auto_risk"] == "execute" and isolated["sandbox"]["allow_host_execution"] is True
+    host = _merge({}, ExecutionChoice("execute", True))
+    assert host["sandbox"]["allow_host_execution"] is True
+    declined = _merge({"policy": {"max_auto_risk": "execute"}}, ExecutionChoice("write", False))
+    assert declined["policy"]["max_auto_risk"] == "write" and declined["sandbox"]["allow_host_execution"] is False
+
+
+def test_install_plan_writes_the_consent_choice(tmp_path: Path):
+    install_plan(recommend_plan(snapshot(32)), manager=FakeManager(), config_dir=tmp_path,
+                 execution=ExecutionChoice("execute", True))
+    data = tomllib.loads((tmp_path / "config.toml").read_text())
+    assert data["policy"]["max_auto_risk"] == "execute" and data["sandbox"]["allow_host_execution"] is True
+
+
+def test_describe_permissions_states_exact_capability():
+    assert "only read" in describe_permissions("read", False)
+    assert "read and write" in describe_permissions("write", False)
+    assert "isolated sandbox" in describe_permissions("execute", False)
+    assert "NO isolation" in describe_permissions("execute", True)

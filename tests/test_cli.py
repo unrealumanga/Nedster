@@ -138,3 +138,131 @@ def test_cli_module_import_is_lazy():
         capture_output=True, text=True, check=True, cwd=str(Path(__file__).resolve().parents[1]),
     )
     assert out.stdout.strip() == ""
+
+
+# --- setup execution consent (SETUP-CONSENT) --------------------------------------------------
+
+import tomllib  # noqa: E402
+
+ISOLATED = {"ready": True, "backend": "docker", "isolation": "full", "detail": "docker (full isolation)"}
+PROCESS_ONLY = {"ready": True, "backend": "winjob", "isolation": "process-only", "detail": "winjob"}
+NO_BACKEND = {"ready": False, "backend": "auto", "isolation": "unknown", "detail": "no backend"}
+
+
+class _SetupManager:
+    url = "http://fake"
+
+    def __init__(self, *_a, **_k): ...
+    def install(self, **_): ...
+    def ensure_service(self, **_): ...
+    def list_models(self): return []
+    def pull(self, *_a, **_k): ...
+    def create_alias(self, *_a, **_k): ...
+    def copy_model(self, *_a): ...
+    def remove_model(self, *_a): ...
+
+    def verify_capabilities(self, router="", embedding=None):
+        result = {"generation": True, "structured_output": True, "tool_calling": True}
+        if embedding:
+            result["embeddings"] = True
+        return result
+
+
+def _run_setup(clean_env, monkeypatch, capsys, probe, flags=(), answers=(), tty=False, prior=None):
+    cfg = clean_env / "cfg"
+    (cfg / "config.toml").unlink(missing_ok=True)  # each call starts from the given prior state
+    if prior is not None:
+        cfg.mkdir(parents=True, exist_ok=True)
+        (cfg / "config.toml").write_text(prior, encoding="utf-8")
+    asked: list[str] = []
+    replies = iter(answers)
+
+    def fake_input(prompt):
+        asked.append(prompt)
+        return next(replies)
+
+    monkeypatch.setattr("nedster_agent.cli._read_line", fake_input)
+    monkeypatch.setattr("nedster_agent.model_manager.probe_execution", lambda _c: probe)
+    monkeypatch.setattr("nedster_agent.model_manager.OllamaManager", _SetupManager)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: tty)
+    argv = ["setup", "--project", str(clean_env), *flags]
+    if tty:
+        monkeypatch.setattr("rich.prompt.Prompt.ask", lambda *_a, **_k: "balanced")
+        monkeypatch.setattr("rich.prompt.Confirm.ask", lambda *_a, **_k: True)
+    else:
+        argv.append("--plain")
+    code = main(argv)
+    out = capsys.readouterr()
+    path = cfg / "config.toml"
+    data = tomllib.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    return code, data, asked, out
+
+
+def test_yes_enables_execute_only_with_isolated_backend(clean_env, monkeypatch, capsys):
+    code, data, asked, out = _run_setup(clean_env, monkeypatch, capsys, ISOLATED, ["--yes"])
+    assert code == 0 and data["policy"]["max_auto_risk"] == "execute"
+    assert data["sandbox"]["allow_host_execution"] is False and not asked
+    assert "isolated sandbox" in out.out
+
+
+def test_yes_without_isolated_backend_stays_write(clean_env, monkeypatch, capsys):
+    for probe in (NO_BACKEND, PROCESS_ONLY):
+        code, data, _, out = _run_setup(clean_env, monkeypatch, capsys, probe, ["--yes"])
+        assert code == 0 and data["policy"]["max_auto_risk"] == "write"
+        assert data["sandbox"]["allow_host_execution"] is False
+        assert "read and write" in out.out
+
+
+def test_allow_execution_needs_isolated_backend(clean_env, monkeypatch, capsys):
+    _, data, _, _ = _run_setup(clean_env, monkeypatch, capsys, ISOLATED, ["--allow-execution"])
+    assert data["policy"]["max_auto_risk"] == "execute"
+    _, data, _, out = _run_setup(clean_env, monkeypatch, capsys, NO_BACKEND, ["--allow-execution"])
+    assert data["policy"]["max_auto_risk"] == "write" and "NOT enabled" in out.err
+
+
+def test_allow_host_execution_implies_execute_and_warns(clean_env, monkeypatch, capsys):
+    _, data, _, out = _run_setup(clean_env, monkeypatch, capsys, NO_BACKEND, ["--allow-host-execution"])
+    assert data["policy"]["max_auto_risk"] == "execute" and data["sandbox"]["allow_host_execution"] is True
+    assert "WARNING" in out.err and "NO isolation" in out.out
+
+
+def test_no_flags_non_interactive_keeps_previous_answers(clean_env, monkeypatch, capsys):
+    prior = '[policy]\nmax_auto_risk = "execute"\n[sandbox]\nallow_host_execution = true\n'
+    _, data, asked, _ = _run_setup(clean_env, monkeypatch, capsys, ISOLATED, [], prior=prior)
+    assert data["policy"]["max_auto_risk"] == "execute" and data["sandbox"]["allow_host_execution"] is True
+    assert not asked
+
+
+def test_interactive_isolated_default_yes(clean_env, monkeypatch, capsys):
+    _, data, asked, _ = _run_setup(clean_env, monkeypatch, capsys, ISOLATED, answers=[""], tty=True)
+    assert len(asked) == 1 and "inside docker (full isolation)" in asked[0] and "[Y/n]" in asked[0]
+    assert data["policy"]["max_auto_risk"] == "execute" and data["sandbox"]["allow_host_execution"] is False
+
+
+def test_interactive_isolated_decline_asks_no_host_question(clean_env, monkeypatch, capsys):
+    _, data, asked, _ = _run_setup(clean_env, monkeypatch, capsys, ISOLATED, answers=["n"], tty=True)
+    assert len(asked) == 1
+    assert data["policy"]["max_auto_risk"] == "write" and data["sandbox"]["allow_host_execution"] is False
+
+
+def test_interactive_no_backend_host_default_no(clean_env, monkeypatch, capsys):
+    _, data, asked, _ = _run_setup(clean_env, monkeypatch, capsys, NO_BACKEND, answers=[""], tty=True)
+    assert len(asked) == 1 and "[y/N]" in asked[0] and "no isolation" in asked[0]
+    assert data["policy"]["max_auto_risk"] == "write" and data["sandbox"]["allow_host_execution"] is False
+
+
+def test_interactive_no_backend_host_yes(clean_env, monkeypatch, capsys):
+    _, data, _, _ = _run_setup(clean_env, monkeypatch, capsys, NO_BACKEND, answers=["y"], tty=True)
+    assert data["policy"]["max_auto_risk"] == "execute" and data["sandbox"]["allow_host_execution"] is True
+
+
+def test_interactive_process_only_default_no_then_host_question(clean_env, monkeypatch, capsys):
+    _, data, asked, _ = _run_setup(clean_env, monkeypatch, capsys, PROCESS_ONLY, answers=["", "y"], tty=True)
+    assert "[y/N]" in asked[0] and len(asked) == 2
+    assert data["policy"]["max_auto_risk"] == "execute" and data["sandbox"]["allow_host_execution"] is True
+
+
+def test_interactive_decline_overrides_previous_execute(clean_env, monkeypatch, capsys):
+    prior = '[policy]\nmax_auto_risk = "execute"\n'
+    _, data, _, _ = _run_setup(clean_env, monkeypatch, capsys, NO_BACKEND, answers=["n"], tty=True, prior=prior)
+    assert data["policy"]["max_auto_risk"] == "write"
