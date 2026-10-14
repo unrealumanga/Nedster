@@ -1,0 +1,464 @@
+"""Read-before-edit file tools: read_file / write_file / edit_file / list_files.
+
+Write and edit refuse to touch a file whose sha256 the model has not seen: existing
+files need an ``expected_sha`` matching the current bytes ("read it first"). Path
+arguments resolve (symlinks followed) inside the project root, or inside an extra
+read root for reads only; anything else is INVALID and nothing is executed.
+"""
+
+from __future__ import annotations
+
+import bisect
+import contextlib
+import difflib
+import fnmatch
+import hashlib
+import os
+import shutil
+import stat
+import subprocess
+import tempfile
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import Any, NamedTuple
+
+from ..contracts import ToolCall, ToolResult, ToolSpec, ToolStatus
+from ..types import RiskLevel
+from .schema import validate
+
+READ_FILE, WRITE_FILE, EDIT_FILE, LIST_FILES = "read_file", "write_file", "edit_file", "list_files"
+TOOLS = (READ_FILE, WRITE_FILE, EDIT_FILE, LIST_FILES)
+DEFAULT_PROTECTED = (".git", ".nedster")
+MAX_LIST_ENTRIES = 2000
+MAX_DIFF_LINES = 200
+MAX_REPORTED_MATCH_LINES = 3
+NEWLINE_CRLF = "\r\n"
+WALK_SKIP_DIRS = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        "dist",
+        "build",
+        "target",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+    }
+)
+GIT_LS_FILES = ("ls-files", "--cached", "--others", "--exclude-standard")
+
+
+class ToolError(Exception):
+    """Argument/scope problem. Mapped to ToolStatus.INVALID; nothing was executed."""
+
+
+class Located(NamedTuple):
+    path: Path  # resolved absolute path (symlinks followed)
+    rel: str  # POSIX path relative to ``root``
+    root: Path  # the allowed root that contains ``path``
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def hash_matches(expected: str, digest: str) -> bool:
+    value = expected.strip().lower()
+    if value.startswith("sha256:"):
+        value = value[len("sha256:") :]
+    return value == digest or value == digest[:16]
+
+
+def locate(
+    root: Path,
+    raw: str,
+    *,
+    extra_roots: Sequence[Path] = (),
+    protected: Sequence[str] = (),
+    for_write: bool = False,
+) -> Located:
+    if not raw or "\x00" in raw:
+        raise ToolError(f"invalid path {raw!r}")
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve()
+    except OSError as exc:
+        raise ToolError(f"cannot resolve path {raw!r}: {exc}") from exc
+    bases = (root, *extra_roots) if not for_write else (root,)
+    for base in bases:
+        try:
+            rel = resolved.relative_to(base)
+        except ValueError:
+            continue
+        if for_write and any(part in protected for part in rel.parts):
+            raise ToolError(f"path is inside a protected directory: {rel.as_posix()}")
+        return Located(resolved, rel.as_posix(), base)
+    raise ToolError(f"path escapes the project root: {raw}")
+
+
+def detect_newline(data: bytes) -> str | None:
+    if NEWLINE_CRLF.encode() in data:
+        return NEWLINE_CRLF
+    return "\n" if b"\n" in data else None
+
+
+def apply_newline(text: str, newline: str | None) -> str:
+    if newline is None:
+        return text
+    return text.replace("\r\n", "\n").replace("\n", newline)
+
+
+def inventory(base: Path) -> tuple[list[str], bool]:
+    """Sorted POSIX file paths under ``base``, relative to ``base``. Returns (paths, used_git)."""
+    git = shutil.which("git")
+    if git:
+        env = dict(os.environ)
+        env["GIT_OPTIONAL_LOCKS"] = "0"
+        try:
+            proc = subprocess.run(
+                [git, *GIT_LS_FILES],
+                cwd=base,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+                shell=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            proc = None
+        if proc is not None and proc.returncode == 0:
+            entries = sorted({line.strip() for line in proc.stdout.splitlines() if line.strip()})
+            return entries, True
+    return _walk_inventory(base), False
+
+
+def _walk_inventory(base: Path) -> list[str]:
+    entries: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = sorted(name for name in dirnames if name not in WALK_SKIP_DIRS)
+        for name in filenames:
+            try:
+                entries.add((Path(dirpath) / name).relative_to(base).as_posix())
+            except ValueError:
+                continue
+    return sorted(entries)
+
+
+def glob_match(pattern: str, rel: str) -> bool:
+    name = rel.rsplit("/", 1)[-1]
+    if "/" in pattern:
+        return fnmatch.fnmatchcase(rel, pattern)
+    return fnmatch.fnmatchcase(name, pattern) or fnmatch.fnmatchcase(rel, pattern)
+
+
+def line_numbers(text: str, needle: str) -> list[int]:
+    starts = [0]
+    for index, char in enumerate(text):
+        if char == "\n":
+            starts.append(index + 1)
+    numbers: list[int] = []
+    offset = text.find(needle)
+    while offset != -1:
+        numbers.append(bisect.bisect_right(starts, offset))
+        offset = text.find(needle, offset + 1)
+    return numbers
+
+
+def unified_diff(before: str, after: str, rel: str) -> str:
+    lines = list(
+        difflib.unified_diff(before.splitlines(), after.splitlines(), fromfile=f"a/{rel}", tofile=f"b/{rel}", lineterm="")
+    )
+    if len(lines) > MAX_DIFF_LINES:
+        lines = lines[:MAX_DIFF_LINES] + [f"[diff truncated at {MAX_DIFF_LINES} lines]"]
+    return "\n".join(lines) or "(no textual difference)"
+
+
+def atomic_replace(target: Path, payload: bytes, mode: int | None) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+        if mode is not None:
+            os.chmod(temporary, mode)
+        os.replace(temporary, target)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+
+
+_PATH_PROP = {"type": "string", "description": "Project-relative or absolute path inside the project."}
+READ_SCHEMA = {
+    "type": "object",
+    "properties": {"path": _PATH_PROP, "start_line": {"type": "integer", "minimum": 1},
+                   "end_line": {"type": "integer", "minimum": 1}},  # fmt: skip
+    "required": ["path"],
+    "additionalProperties": False,
+}
+WRITE_SCHEMA = {
+    "type": "object",
+    "properties": {"path": _PATH_PROP, "content": {"type": "string"}, "expected_sha": {"type": "string"}},
+    "required": ["path", "content"],
+    "additionalProperties": False,
+}
+EDIT_SCHEMA = {
+    "type": "object",
+    "properties": {"path": _PATH_PROP, "old": {"type": "string"}, "new": {"type": "string"},
+                   "expected_sha": {"type": "string"}, "count": {"type": "integer", "minimum": 1}},  # fmt: skip
+    "required": ["path", "old", "new", "expected_sha"],
+    "additionalProperties": False,
+}
+LIST_SCHEMA = {
+    "type": "object",
+    "properties": {"path": {"type": "string"}, "glob": {"type": "string"}},
+    "additionalProperties": False,
+}
+
+
+class FileTools:
+    """Sync ToolRuntime for project files. Roots are resolved once at construction and immutable."""
+
+    def __init__(
+        self,
+        project_root: str | Path,
+        *,
+        extra_read_roots: Sequence[str | Path] = (),
+        protected: Sequence[str] = DEFAULT_PROTECTED,
+        max_read_bytes: int = 200_000,
+    ):
+        self.project_root = Path(project_root).resolve()
+        self.extra_read_roots = tuple(Path(item).resolve() for item in extra_read_roots)
+        self.protected = tuple(protected)
+        self.max_read_bytes = int(max_read_bytes)
+        self.read_hashes: dict[str, str] = {}
+        self._schemas: dict[str, Mapping[str, Any]] = {
+            READ_FILE: READ_SCHEMA,
+            WRITE_FILE: WRITE_SCHEMA,
+            EDIT_FILE: EDIT_SCHEMA,
+            LIST_FILES: LIST_SCHEMA,
+        }
+        self._handlers = {
+            READ_FILE: self._read_file,
+            WRITE_FILE: self._write_file,
+            EDIT_FILE: self._edit_file,
+            LIST_FILES: self._list_files,
+        }
+
+    # -- ToolRuntime -------------------------------------------------------------------
+
+    def specs(self) -> list[ToolSpec]:
+        read = ToolSpec(
+            READ_FILE,
+            "Read a UTF-8 file as numbered lines. Needs no prior state; returns the whole-file sha256.",
+            READ_SCHEMA,
+            int(RiskLevel.READ),
+        )
+        write = ToolSpec(
+            WRITE_FILE,
+            "Create or replace a file. Existing files require expected_sha from a prior read_file (read first). "
+            "New files are created exclusively.",
+            WRITE_SCHEMA,
+            int(RiskLevel.WRITE),
+            mutates=True,
+        )
+        edit = ToolSpec(
+            EDIT_FILE,
+            "Replace an exact substring count times. Requires expected_sha from a prior read_file (read first). "
+            "Returns a unified diff.",
+            EDIT_SCHEMA,
+            int(RiskLevel.WRITE),
+            mutates=True,
+        )
+        listing = ToolSpec(
+            LIST_FILES,
+            "List project files under a directory, optionally filtered by a glob. Git-aware.",
+            LIST_SCHEMA,
+            int(RiskLevel.READ),
+        )
+        return [read, write, edit, listing]
+
+    def run(self, call: ToolCall) -> ToolResult:
+        handler = self._handlers.get(call.name)
+        if handler is None:
+            return ToolResult(call.id, call.name, ToolStatus.INVALID, f"unknown tool {call.name!r}")
+        errors = validate(self._schemas[call.name], dict(call.arguments or {}))
+        if errors:
+            return ToolResult(call.id, call.name, ToolStatus.INVALID, "\n".join(errors))
+        try:
+            return handler(call)
+        except ToolError as exc:
+            return ToolResult(call.id, call.name, ToolStatus.INVALID, str(exc))
+        except OSError as exc:
+            return ToolResult(call.id, call.name, ToolStatus.FAILED, f"{type(exc).__name__}: {exc}")
+        except Exception as exc:  # a tool bug must not escape as an exception
+            return ToolResult(call.id, call.name, ToolStatus.FAILED, f"tool error: {exc}")
+
+    # -- helpers -----------------------------------------------------------------------
+
+    def _locate(self, raw: str, *, for_write: bool) -> Located:
+        return locate(
+            self.project_root,
+            raw,
+            extra_roots=self.extra_read_roots,
+            protected=self.protected,
+            for_write=for_write,
+        )
+
+    @staticmethod
+    def _decode(data: bytes, rel: str) -> str:
+        if b"\x00" in data:
+            raise ToolError(f"binary file, refusing: {rel}")
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ToolError(f"binary file (not valid UTF-8): {rel}") from exc
+
+    # -- tools -------------------------------------------------------------------------
+
+    def _read_file(self, call: ToolCall) -> ToolResult:
+        args = call.arguments
+        located = self._locate(str(args["path"]), for_write=False)
+        data = located.path.read_bytes()
+        digest = sha256_hex(data)
+        text = self._decode(data, located.rel)
+        lines = text.splitlines()
+        total = len(lines)
+        start = int(args.get("start_line", 1))
+        end = int(args.get("end_line", total or 1))
+        if end < start:
+            raise ToolError(f"end_line {end} is before start_line {start}")
+        self.read_hashes[located.rel] = digest
+        selected = lines[start - 1 : end]
+        width = max(len(str(total)), 1)
+        header = (
+            f"{located.rel}: lines {start}-{start - 1 + len(selected)} of {total}, sha256:{digest[:16]}"
+            if selected
+            else f"{located.rel}: 0 of {total} lines, sha256:{digest[:16]}"
+        )
+        body = [f"{number:>{width}}| {lines[number - 1]}" for number in range(start, start + len(selected))]
+        output = header + ("\n" + "\n".join(body) if body else "")
+        truncated_at: int | None = None
+        while len(output.encode("utf-8")) > self.max_read_bytes and body:
+            body.pop()
+            truncated_at = start + len(body)
+            output = header + ("\n" + "\n".join(body) if body else "")
+        if truncated_at is not None:
+            output += f"\n[truncated: use start_line={truncated_at}]"
+        data_field = {"path": located.rel, "total_lines": total, "sha256": digest}
+        return ToolResult(call.id, call.name, ToolStatus.OK, output, data_field)
+
+    def _write_file(self, call: ToolCall) -> ToolResult:
+        args = call.arguments
+        located = self._locate(str(args["path"]), for_write=True)
+        content = str(args["content"])
+        expected = args.get("expected_sha")
+        target = located.path
+        created = False
+        if target.exists():
+            if target.is_dir():
+                raise ToolError(f"is a directory: {located.rel}")
+            current = target.read_bytes()
+            digest = sha256_hex(current)
+            if not expected or not hash_matches(str(expected), digest):
+                raise ToolError("file changed since read / read it first")
+            payload = apply_newline(content, detect_newline(current)).encode("utf-8")
+            atomic_replace(target, payload, stat.S_IMODE(target.stat().st_mode))
+        else:
+            if expected:
+                raise ToolError("file changed since read / read it first")
+            payload = content.encode("utf-8")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(target, "xb") as handle:
+                    handle.write(payload)
+            except FileExistsError as exc:
+                raise ToolError("file changed since read / read it first") from exc
+            created = True
+        new_digest = sha256_hex(payload)
+        self.read_hashes[located.rel] = new_digest
+        verb = "created" if created else "updated"
+        return ToolResult(
+            call.id,
+            call.name,
+            ToolStatus.OK,
+            f"{verb} {located.rel} ({len(payload)} bytes)",
+            {"sha256": new_digest, "created": created},
+            (located.rel,),
+        )
+
+    def _edit_file(self, call: ToolCall) -> ToolResult:
+        args = call.arguments
+        located = self._locate(str(args["path"]), for_write=True)
+        old = str(args["old"])
+        new = str(args["new"])
+        count = int(args.get("count", 1))
+        if not old:
+            raise ToolError("old must not be empty")
+        current = located.path.read_bytes()
+        digest = sha256_hex(current)
+        if not hash_matches(str(args["expected_sha"]), digest):
+            raise ToolError("file changed since read / read it first")
+        text = self._decode(current, located.rel)
+        actual = text.count(old)
+        if actual != count:
+            hits = line_numbers(text, old)[:MAX_REPORTED_MATCH_LINES]
+            where = f" at line(s) {', '.join(str(number) for number in hits)}" if hits else ""
+            raise ToolError(f"'old' occurs {actual} time(s), expected {count}{where}")
+        edited = apply_newline(text.replace(old, new), detect_newline(current))
+        payload = edited.encode("utf-8")
+        if payload == current:
+            return ToolResult(
+                call.id,
+                call.name,
+                ToolStatus.OK,
+                "no change: replacement produced identical content",
+                {"sha256": digest},
+            )
+        atomic_replace(located.path, payload, stat.S_IMODE(located.path.stat().st_mode))
+        new_digest = sha256_hex(payload)
+        self.read_hashes[located.rel] = new_digest
+        return ToolResult(
+            call.id,
+            call.name,
+            ToolStatus.OK,
+            unified_diff(text, edited, located.rel),
+            {"sha256": new_digest},
+            (located.rel,),
+        )
+
+    def _list_files(self, call: ToolCall) -> ToolResult:
+        args = call.arguments
+        raw_path = str(args.get("path") or ".")
+        located = self._locate(raw_path, for_write=False)
+        if not located.path.exists():
+            raise ToolError(f"no such directory: {located.rel}")
+        if not located.path.is_dir():
+            raise ToolError(f"not a directory: {located.rel}")
+        entries, used_git = inventory(located.root)
+        if located.rel != ".":
+            prefix = located.rel + "/"
+            entries = [entry for entry in entries if entry.startswith(prefix)]
+        pattern = args.get("glob")
+        if pattern:
+            entries = [entry for entry in entries if glob_match(str(pattern), entry)]
+        total = len(entries)
+        shown = entries[:MAX_LIST_ENTRIES]
+        output = "\n".join(shown)
+        if total > len(shown):
+            output += f"\n[truncated: showing first {len(shown)} of {total} entries]"
+        data_field = {
+            "count": len(shown),
+            "total": total,
+            "truncated": total > len(shown),
+            "backend": "git" if used_git else "walk",
+        }
+        return ToolResult(call.id, call.name, ToolStatus.OK, output, data_field)
+
+
+__all__ = ["TOOLS", "FileTools", "ToolError", "locate", "inventory", "sha256_hex", "hash_matches"]
