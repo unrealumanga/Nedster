@@ -119,6 +119,8 @@ def _trusted(record: ToolRecord) -> bool:
     """A validation whose program is a known test runner (so its own side effects are not a 'change')."""
     if not is_validation(record):
         return False
+    if record.result.data.get("changed_during_validation"):
+        return False
     return record.call.name not in FLAGGABLE_TOOLS or bool(record.result.data.get("runner"))
 
 

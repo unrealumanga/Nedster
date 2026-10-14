@@ -10,6 +10,7 @@ from .contracts import AcceptanceResult, EngineEvent
 
 DEFAULT_WORKER = "nedster-worker"
 FALLBACK_CONTEXT_TOKENS = 32_768
+FINGERPRINT_MAX_FILES = 20_000
 
 
 def worker_model(config: Any, override: str | None = None) -> str:
@@ -64,6 +65,8 @@ def git_inventory(git: Any) -> Callable[[Path], list[str]]:
 
 def build_tools(project_root: Path, config: Any, journal: Any = None) -> tuple[Any, Any]:
     """Return (CompositeToolRuntime, Executor) for ``project_root``; ``journal`` (a CheckpointStore) records undo data."""
+    import os
+
     from .tool_runtime.composite import CompositeToolRuntime
     from .tool_runtime.exec import Executor
     from .tool_runtime.files import FileTools
@@ -73,12 +76,25 @@ def build_tools(project_root: Path, config: Any, journal: Any = None) -> tuple[A
     executor = Executor(project_root, config)
     git = SafeGit(project_root, executor)
     inventory = git_inventory(git)
+
+    def fingerprint() -> dict[str, tuple[int, int]]:
+        """(size, mtime_ns) of the current inventory, so a command that rewrites sources is detected."""
+        result: dict[str, tuple[int, int]] = {}
+        for rel in inventory(project_root)[:FINGERPRINT_MAX_FILES]:
+            try:
+                st = os.stat(project_root / rel)
+            except OSError:
+                continue
+            result[rel] = (st.st_size, st.st_mtime_ns)
+        return result
+
     runtime = CompositeToolRuntime(
         sync_tools=[FileTools(project_root, inventory=inventory, journal=journal), SearchTools(project_root, inventory=inventory)],
         job_tools=[executor, git],
         policy=config.policy,
         resolve_argv=executor.resolve_argv,
         journal=journal,
+        fingerprint=fingerprint,
     )
     return runtime, executor
 

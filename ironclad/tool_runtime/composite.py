@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 from typing import Any, Protocol
 
@@ -67,13 +67,24 @@ class _Threaded:
             await asyncio.wait({self._task})
 
 
+Snapshot = dict[str, tuple[int, int]]  # relative path -> (size, mtime_ns)
+CHANGED_DURING_RUN = "changed_during_validation"
+MAX_CHANGED = 50
+
+
+def _modified(before: Snapshot, after: Snapshot) -> list[str]:
+    """Files that existed before and were changed or deleted; new files (test artifacts) are ignored."""
+    return sorted(path for path, stat in before.items() if after.get(path) != stat)
+
+
 class _Tracked:
     """Wraps an execution job so the workspace revision is bumped once it has really finished."""
 
-    def __init__(self, runtime: CompositeToolRuntime, job: JobHandle):
+    def __init__(self, runtime: CompositeToolRuntime, job: JobHandle, before: Snapshot | None = None):
         self._runtime = runtime
         self._job = job
         self._result: ToolResult | None = None
+        self._before = before  # taken before the job started
 
     async def wait(self) -> ToolResult:
         if self._result is None:
@@ -82,6 +93,12 @@ class _Tracked:
                 self._result = result
                 if result.status not in (ToolStatus.INVALID, ToolStatus.DENIED):
                     self._runtime._bump(result.mutated_paths)
+                fingerprint = self._runtime._fingerprint
+                if self._before is not None and fingerprint is not None:
+                    changed = _modified(self._before, fingerprint())
+                    if changed:  # existing files rewritten/deleted while it ran: not trustworthy evidence
+                        data = {**result.data, CHANGED_DURING_RUN: changed[:MAX_CHANGED]}
+                        self._result = replace(result, data=data)
         return self._result
 
     async def cancel(self) -> None:
@@ -97,6 +114,7 @@ class CompositeToolRuntime:
         policy: Any = None,
         resolve_argv: Any = None,
         journal: Any = None,
+        fingerprint: Callable[[], Snapshot] | None = None,
     ):
         self._journal = journal
         self._sync_groups = tuple(sync_tools := tuple(sync_tools))
@@ -114,6 +132,7 @@ class CompositeToolRuntime:
                     self._specs[spec.name] = spec
                     self._owners[spec.name] = (kind, tools)
         self._revision = WorkspaceRevision()
+        self._fingerprint = fingerprint
 
     # ------------------------------------------------------------------ ToolRuntime
 
@@ -149,9 +168,12 @@ class CompositeToolRuntime:
             return _Threaded(self, tools, call)
         if self._journal is not None and (call.name in EXECUTION_TOOLS or self._specs[call.name].mutates):
             self._journal.note_command()  # side effects of commands are outside undo coverage
+        # Snapshot BEFORE the job starts. Every execution call is covered: the engine strips the model's
+        # "validation" flag before the call reaches the runtime, so validations cannot be singled out here.
+        before = self._fingerprint() if call.name in EXECUTION_TOOLS and self._fingerprint is not None else None
         job = tools.start(call)
         if call.name in EXECUTION_TOOLS:
-            return _Tracked(self, job)
+            return _Tracked(self, job, before)
         return job
 
     # ------------------------------------------------------------------ internals

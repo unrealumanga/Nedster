@@ -190,3 +190,75 @@ def test_spoofed_run_tests_is_invalid_with_real_runtime(real) -> None:
     result = run(rt, "run_tests", argv=[sys.executable, "-c", "print('== 412 passed in 0.01s ==')"])
     assert result.status is ToolStatus.INVALID
     assert "known test runners" in result.output
+
+
+def _make_runtime_with_fingerprint(files_mock: Files) -> tuple[CompositeToolRuntime, dict[str, tuple[int, int]]]:
+    """Create a runtime with a real fingerprint function that uses a temp dir."""
+    import os.path as ospath
+    import tempfile
+
+    tmp_dir = tempfile.mkdtemp()
+    (Path(tmp_dir) / "a.py").write_text("hello")
+    (Path(tmp_dir) / "b.py").write_text("world")
+
+    def fingerprint():
+        result: dict[str, tuple[int, int]] = {}
+        for p in ["a.py", "b.py"]:
+            try:
+                st = ospath.stat(Path(tmp_dir) / p)
+                result[p] = (st.st_size, st.st_mtime_ns)
+            except OSError:
+                continue
+        return result
+
+    files_mock2 = Files()
+    policy = execute_policy()
+    rt = CompositeToolRuntime(
+        sync_tools=[files_mock2], job_tools=[Files()], policy=policy, resolve_argv=resolve, fingerprint=fingerprint
+    )
+    return rt, fingerprint
+
+
+class _Workspace:
+    """A fake project whose files a job can rewrite while it runs."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, tuple[int, int]] = {"a.py": (10, 1), "b.py": (20, 1)}
+
+    def snapshot(self) -> dict[str, tuple[int, int]]:
+        return dict(self.files)
+
+
+def _tracked_runtime(effect: object) -> tuple[CompositeToolRuntime, _Workspace]:
+    ws = _Workspace()
+
+    class SideEffectExec(Exec):
+        def start(self, call: ToolCall) -> Job:
+            effect(ws)  # type: ignore[operator]
+            return super().start(call)
+
+    rt = CompositeToolRuntime(job_tools=[SideEffectExec()], policy=execute_policy(), resolve_argv=resolve,
+                              fingerprint=ws.snapshot)  # fmt: skip
+    return rt, ws
+
+
+def test_run_that_rewrites_an_existing_file_is_flagged() -> None:
+    rt, _ = _tracked_runtime(lambda ws: ws.files.update({"a.py": (11, 2)}))
+    result = asyncio.run(rt.start(ToolCall("t", "run_tests", {})).wait())
+    assert result.data["changed_during_validation"] == ["a.py"]
+
+
+def test_deleted_file_is_flagged_but_new_artifacts_are_not() -> None:
+    rt, _ = _tracked_runtime(lambda ws: (ws.files.pop("b.py"), ws.files.update({".coverage": (5, 3)})))
+    result = asyncio.run(rt.start(ToolCall("t", "run_tests", {})).wait())
+    assert result.data["changed_during_validation"] == ["b.py"]
+    rt, _ = _tracked_runtime(lambda ws: ws.files.update({"new_log.txt": (1, 1)}))
+    assert "changed_during_validation" not in asyncio.run(rt.start(ToolCall("t", "run_tests", {})).wait()).data
+
+
+def test_snapshot_is_taken_before_the_job_starts_and_plain_commands_work() -> None:
+    rt, _ = _tracked_runtime(lambda ws: ws.files.update({"a.py": (99, 9)}))  # changes at start
+    result = asyncio.run(rt.start(ToolCall("c", "run_command", {"argv": ["python", "-V"]})).wait())
+    assert result.status is ToolStatus.OK and result.data["changed_during_validation"] == ["a.py"]
+    plain = CompositeToolRuntime(job_tools=[Exec()], policy=execute_policy(), resolve_argv=resolve)
+    assert asyncio.run(plain.start(ToolCall("c", "run_command", {"argv": ["python", "-V"]})).wait()).status is ToolStatus.OK

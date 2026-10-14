@@ -327,3 +327,18 @@ def test_evidence_paths_match_regardless_of_dot_slash_and_separators() -> None:
     records = [rec("read_file", path="pkg/a.py"), rec("run_tests", tests_run=5),
                rec("declare_no_change", mutating=False, reason="r", evidence_paths=[".\\pkg\\a.py"])]  # fmt: skip
     assert evaluate(records, intent=CHANGE).outcome is Outcome.NO_CHANGE_NEEDED
+
+
+def test_run_tests_with_changed_during_validation_is_not_completed() -> None:
+    """A run_tests that reports changed_during_validation should not count as trusted validation."""
+    records = [rec("edit_file", paths=("a.py",)), rec("run_tests", tests_run=5, changed_during_validation=["a.py"])]
+    result = evaluate(records)
+    assert result.outcome is not Outcome.COMPLETED
+
+
+def test_run_tests_with_changed_during_validation_gives_inconclusive_verdict() -> None:
+    """changed_during_validation makes _trusted return False, so verdict is based on no trusted validation."""
+    records = [rec("edit_file", paths=("a.py",)), rec("run_tests", tests_run=5, changed_during_validation=["a.py"])]
+    assert evaluate(records, intent=CHANGE).outcome is Outcome.UNVALIDATED  # flagged run counts as a change
+    assert validation_verdict(records[1]) == "inconclusive"
+
