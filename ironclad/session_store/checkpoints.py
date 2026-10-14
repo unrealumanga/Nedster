@@ -10,9 +10,12 @@ Tables live in the sessions DB file (own connection, WAL, ``BEGIN IMMEDIATE``).
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import secrets
+import socket
 import sqlite3
 import stat
 import threading
@@ -21,6 +24,8 @@ from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import psutil
 
 from ..tool_runtime.files import DEFAULT_PROTECTED, ToolError, atomic_replace, locate
 
@@ -74,6 +79,41 @@ _SCHEMA = (
     )
     """,
 )
+
+
+_OWNER_COLUMNS = (
+    ("owner_host", "TEXT"),
+    ("owner_pid", "INTEGER"),
+    ("owner_start", "REAL"),
+    ("owner_nonce", "TEXT"),
+)
+START_TOLERANCE = 1.0  # seconds; psutil create_time is stable for one process, differs after a pid reuse
+
+
+def process_start(pid: int) -> float | None:
+    try:
+        return psutil.Process(pid).create_time()
+    except (psutil.Error, OSError):
+        return None
+
+
+def process_alive(pid: int, start: float | None) -> bool:
+    """Is the process that began a turn still running? Unknown -> alive (never close a turn on a guess)."""
+    try:
+        proc = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return False
+    except (psutil.Error, OSError):
+        return True
+    try:
+        if proc.status() == psutil.STATUS_ZOMBIE:
+            return False
+        created = proc.create_time()
+    except psutil.NoSuchProcess:
+        return False
+    except (psutil.Error, OSError):
+        return True
+    return start is None or abs(created - start) <= START_TOLERANCE
 
 
 def path_key(rel: str) -> str:
@@ -145,8 +185,16 @@ _PARTIAL = (
 class CheckpointStore:
     """File-mutation journal + undo. One instance per session store; thread-safe."""
 
-    def __init__(self, db_path: str | Path, *, protected: Sequence[str] = DEFAULT_PROTECTED) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        protected: Sequence[str] = DEFAULT_PROTECTED,
+        liveness: Callable[[int, float | None], bool] = process_alive,
+    ) -> None:
         self.path = Path(db_path)
+        self._liveness = liveness  # (pid, start time) -> owner process still running; injectable for tests
+        self.owner = (socket.gethostname(), os.getpid(), process_start(os.getpid()), secrets.token_hex(8))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.protected = tuple(protected)
         self._lock = threading.RLock()
@@ -156,9 +204,17 @@ class CheckpointStore:
         self._connection.execute("PRAGMA busy_timeout=5000")
         for statement in _SCHEMA:
             self._connection.execute(statement)
+        self._migrate()
         self._turn: tuple[int, str, Path] | None = None  # (turn_id, session_id, root) of the open turn
         self._pending: tuple[str, Path] | None = None  # turn declared but not yet journaled (lazy row)
         self.on_undone: list[Callable[[list[str]], None]] = []
+
+    def _migrate(self) -> None:
+        have = {row[1] for row in self._connection.execute("PRAGMA table_info(ckpt_turns)")}
+        for name, kind in _OWNER_COLUMNS:
+            if name not in have:
+                with contextlib.suppress(sqlite3.OperationalError):  # another process may migrate first
+                    self._connection.execute(f"ALTER TABLE ckpt_turns ADD COLUMN {name} {kind}")
 
     # -- plumbing ----------------------------------------------------------------------
 
@@ -198,8 +254,9 @@ class CheckpointStore:
             session_id, root = self._pending
             with self._tx() as db:
                 cursor = db.execute(
-                    "INSERT INTO ckpt_turns(session_id, root, started_ns) VALUES (?, ?, ?)",
-                    (session_id, str(root), time.time_ns()),
+                    "INSERT INTO ckpt_turns(session_id, root, started_ns, owner_host, owner_pid, owner_start,"
+                    " owner_nonce) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (session_id, str(root), time.time_ns(), *self.owner),
                 )
             self._turn = (int(cursor.lastrowid), session_id, root)
         return self._turn[0], self._turn[2]
@@ -262,13 +319,18 @@ class CheckpointStore:
     # -- recovery ----------------------------------------------------------------------
 
     def recover(self) -> list[str]:
-        """Run on start: close turns left open by a crash (post-image = what is on disk now), then
-        complete or roll back interrupted undos. Returns human-readable notes."""
+        """Run on start: close turns ABANDONED by a crash (post-image = what is on disk now), then
+        complete or roll back interrupted undos. A turn is abandoned only when its owner (same host) is
+        gone; live and foreign-host owners are left open. Returns human-readable notes."""
         notes: list[str] = []
         with self._lock, self._mutation_lock:
-            for turn_id, root in self._connection.execute(
-                "SELECT turn_id, root FROM ckpt_turns WHERE state='open'"
-            ).fetchall():
+            rows = self._connection.execute(
+                "SELECT turn_id, root, owner_host, owner_pid, owner_start, owner_nonce FROM ckpt_turns"
+                " WHERE state='open'"
+            ).fetchall()
+            for turn_id, root, host, pid, start, nonce in rows:
+                if self._owner_alive(host, pid, start, nonce):
+                    continue
                 self._close_turn(int(turn_id), Path(root))
                 notes.append(f"closed interrupted turn {turn_id}")
             for undo_id, turn_id in self._connection.execute(
@@ -277,9 +339,22 @@ class CheckpointStore:
                 notes.append(self._recover_undo(int(undo_id), int(turn_id)))
         return notes
 
+    def _owner_alive(self, host: str | None, pid: int | None, start: float | None, nonce: str | None) -> bool:
+        if nonce == self.owner[3]:
+            return True  # this very store's open turn
+        if host is None or pid is None:
+            return False  # journaled before owners were recorded: nobody can claim it
+        if host != self.owner[0]:
+            return True  # foreign host: liveness unknowable, never close its turn
+        return bool(self._liveness(int(pid), start))
+
     def _recover_undo(self, undo_id: int, turn_id: int) -> str:
         root = Path(self._connection.execute("SELECT root FROM ckpt_turns WHERE turn_id=?", (turn_id,)).fetchone()[0])
         files = self._turn_files(turn_id)
+        conflicts = [c for row in files.values() if (c := self._path_conflict(root, row))]
+        if conflicts:  # same path safety as undo_last: write nothing, keep the recovery pending
+            listing = "; ".join(f"{c.path} ({c.reason})" for c in conflicts)
+            return f"interrupted undo of turn {turn_id} left pending, nothing written: {listing}"
         states = {key: self._classify(root, row) for key, row in files.items()}
         roll_forward = all(state in ("pre", "post") for state in states.values())
         for key, row in files.items():
@@ -328,6 +403,8 @@ class CheckpointStore:
         with self._mutation_lock, self._lock:
             if self._turn is not None:
                 return UndoReport(False, message="Undo refused: a turn is still running.")
+            if self._connection.execute("SELECT 1 FROM ckpt_undo WHERE state='restoring' LIMIT 1").fetchone():
+                return UndoReport(False, message="Undo refused: an interrupted undo is still pending recovery.")
             turn_id = self.latest_undoable(session_id)
             if turn_id is None:
                 return UndoReport(False, message="Nothing to undo: no journaled file changes in this session.")
@@ -348,6 +425,20 @@ class CheckpointStore:
             report.commands_not_covered = ran
             return report
 
+    def _path_conflict(self, root: Path, row: dict) -> UndoConflict | None:
+        """Path safety shared by undo and its recovery: inside the root, not protected, identity unchanged, no
+        link in the path (a link in a parent chain resolves elsewhere and fails the identity check)."""
+        rel = row["rel"]
+        try:
+            located = locate(root, rel, protected=self.protected, for_write=True)
+        except ToolError as exc:
+            return UndoConflict(rel, str(exc))
+        if path_key(located.rel) != path_key(rel):
+            return UndoConflict(rel, f"path now resolves to {located.rel} (link or case swap)")
+        if os.path.islink(root / rel):
+            return UndoConflict(rel, "path is now a symbolic link")
+        return None
+
     def _preflight(self, root: Path, files: dict[str, dict]) -> list[UndoConflict]:
         conflicts: list[UndoConflict] = []
         for row in files.values():
@@ -355,20 +446,11 @@ class CheckpointStore:
             if row["post_sha"] is None:
                 conflicts.append(UndoConflict(rel, "post-image was never recorded"))
                 continue
-            try:
-                located = locate(root, rel, protected=self.protected, for_write=True)
-            except ToolError as exc:
-                conflicts.append(UndoConflict(rel, str(exc)))
-                continue
-            if path_key(located.rel) != path_key(rel):
-                conflicts.append(UndoConflict(rel, f"path now resolves to {located.rel} (link or case swap)"))
-                continue
-            if os.path.islink(root / rel):
-                conflicts.append(UndoConflict(rel, "path is now a symbolic link"))
-                continue
-            current = digest_path(root / rel)
-            if current != row["post_sha"]:
-                conflicts.append(UndoConflict(rel, "changed since the turn ended"))
+            conflict = self._path_conflict(root, row)
+            if conflict is None and digest_path(root / rel) != row["post_sha"]:
+                conflict = UndoConflict(rel, "changed since the turn ended")
+            if conflict is not None:
+                conflicts.append(conflict)
         return conflicts
 
     def _restore(self, turn_id: int, root: Path, files: dict[str, dict]) -> UndoReport:

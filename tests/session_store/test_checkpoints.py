@@ -174,7 +174,7 @@ def test_crash_leaves_open_turn_which_recover_closes(store, root):
     tools = FileTools(root, journal=store)
     turn(store, root)
     write(tools, "a.txt", "A1")  # process dies before end_turn
-    fresh = CheckpointStore(store.path)
+    fresh = CheckpointStore(store.path, liveness=lambda pid, start: False)  # owner process is gone
     assert any("interrupted turn" in note for note in fresh.recover())
     assert fresh.undo_last("s1").ok and (root / "a.txt").read_text() == "A0"
     fresh.close()
