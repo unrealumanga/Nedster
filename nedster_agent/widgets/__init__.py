@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 from .glyphs import Glyphs
-from .session import EngineSession, EventCallback, LegacySession, NativeSession, SessionFactory, SessionNote
+from .session import EngineSession, EventCallback, NativeSession, SessionFactory, SessionNote
 
 __all__ = [
     "EngineSession",
     "EventCallback",
     "Glyphs",
-    "LegacySession",
     "NativeSession",
     "SessionFactory",
     "SessionNote",

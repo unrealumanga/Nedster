@@ -21,7 +21,6 @@ from textual.widgets import Footer, OptionList, RichLog, Static
 
 from ironclad.config import NedsterConfig
 from ironclad.contracts import EngineEvent
-from ironclad.orchestrator import NedsterRuntime
 from ironclad.session_store.sqlite_store import make_owner
 
 from .widgets.composer import Composer, History, project_files
@@ -29,7 +28,6 @@ from .widgets.glyphs import Glyphs
 from .widgets.session import (
     EngineSession,
     EventCallback,
-    LegacySession,
     NativeSession,
     SessionEvent,
     SessionNote,
@@ -297,9 +295,7 @@ class NedsterApp(App[None]):
     def _make_session(self) -> EngineSession:
         if self.session_factory is not None:
             return self.session_factory(self.config, self.handle_event)
-        if self.config.engine == "native":
-            return native_session(self.config, self.handle_event)
-        return LegacySession(self.config, self.handle_event, runtime_class=NedsterRuntime)
+        return native_session(self.config, self.handle_event)
 
     async def _initialize(self) -> None:
         g = self.glyphs
@@ -776,7 +772,7 @@ class NedsterApp(App[None]):
     def _cmd_sessions(self, _args: list[str]) -> None:
         lister = getattr(self.session, "list_sessions", None)
         if lister is None:
-            self._line('Saved sessions need the native engine (engine = "native").', "warn")
+            self._line("Saved sessions are not available with this session.", "warn")
             return
         sessions = list(lister())
         if not sessions:
@@ -794,7 +790,7 @@ class NedsterApp(App[None]):
     def _cmd_resume(self, args: list[str]) -> None:
         resume = getattr(self.session, "resume", None)
         if resume is None:
-            self._line('Resuming needs the native engine (engine = "native").', "warn")
+            self._line("Resuming a saved session is not available with this session.", "warn")
             return
         wanted = args[0] if args else None
         store = self._session_store()

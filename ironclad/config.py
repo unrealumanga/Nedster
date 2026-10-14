@@ -83,7 +83,7 @@ class NedsterConfig:
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
-    engine: str = "legacy"
+    engine: str = "native"
     warnings: list[str] = field(default_factory=list)
 
 
@@ -92,7 +92,7 @@ Config = NedsterConfig
 
 _BOOL_TRUE = {"1", "true", "yes", "on"}
 _BOOL_FALSE = {"0", "false", "no", "off", ""}
-_ENGINES = ("native", "legacy")
+_ENGINES = ("native", "legacy")  # "legacy" is accepted once more so old configs warn instead of failing
 _RISK_ORDER = ("read", "write", "execute", "destructive", "external")
 # A cloned repo's .nedster/config.toml is untrusted: it may only pick model names / tuning,
 # and may only tighten (never loosen) the security settings below.
@@ -194,8 +194,14 @@ def _set(config: Config, key: str, value: Any) -> bool:
     if name not in getattr(target, "__dataclass_fields__", {}):
         return False
     coerced = _coerce(getattr(target, name), value, key)
-    if key == "engine" and coerced not in _ENGINES:
-        raise ValueError(f"engine must be one of {', '.join(_ENGINES)}, got {coerced!r}")
+    if key == "engine":
+        if coerced not in _ENGINES:
+            raise ValueError(f"engine must be one of {', '.join(_ENGINES)}, got {coerced!r}")
+        if coerced == "legacy":  # the v3 engine was removed (tag v3-legacy); run native with a warning
+            coerced = "native"
+            message = 'engine = "legacy" was removed; the native engine runs instead (rollback: tag v3-legacy)'
+            if message not in config.warnings:
+                config.warnings.append(message)
     setattr(target, name, coerced)
     return True
 

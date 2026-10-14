@@ -1,7 +1,7 @@
 """Compatibility package for the Nedster local runtime.
 
 Public names are resolved lazily (PEP 562) so that importing a submodule,
-or running ``nedster --help``, does not load the orchestrator and httpx.
+or running ``nedster --help``, does not load the engine and httpx.
 """
 
 from importlib import import_module
@@ -10,8 +10,6 @@ _EXPORTS = {
     "IroncladConfig": ".config",
     "NedsterConfig": ".config",
     "load_config": ".config",
-    "MythosOrchestrator": ".orchestrator",
-    "NedsterRuntime": ".orchestrator",
 }
 
 __all__ = sorted(_EXPORTS)

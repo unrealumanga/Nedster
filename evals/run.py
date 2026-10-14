@@ -1,4 +1,4 @@
-"""Headless eval runner: python -m evals.run --model nedster-worker [--engine native|legacy] [--only a,b]."""
+"""Headless eval runner: python -m evals.run --model nedster-worker [--only a,b]."""
 
 from __future__ import annotations
 
@@ -22,7 +22,6 @@ TOYREPOS = Path(__file__).parent / "toyrepos"
 class RunStats:
     answer: str = ""
     outcome: str | None = None
-    passed: bool | None = None
     model_calls: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -32,7 +31,7 @@ class RunStats:
 
 
 def parse_events(stdout: str) -> RunStats:
-    """Fold a `nedster run --jsonl` stream (native EngineEvents or legacy start/result/end) into stats."""
+    """Fold a `nedster run --jsonl` stream of EngineEvents into stats."""
     stats = RunStats()
     for line in stdout.splitlines():
         try:
@@ -57,19 +56,14 @@ def parse_events(stdout: str) -> RunStats:
             stats.outcome = str(data.get("outcome", "")) or None
         elif kind == "error":
             stats.error = str(data.get("message", ""))
-        elif kind == "result":  # legacy
-            stats.answer = str(event.get("answer", ""))
-            stats.passed = bool(event.get("passed"))
     return stats
 
 
-def _invoke(task: Task, workdir: Path, model: str | None, engine: str | None, timeout: float) -> tuple[RunStats, str]:
+def _invoke(task: Task, workdir: Path, model: str | None, timeout: float) -> tuple[RunStats, str]:
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
     if model:
         for role in ("router", "coder", "reasoner", "critic"):
             env[f"NEDSTER_MODELS__{role.upper()}"] = model
-    if engine:
-        env["NEDSTER_ENGINE"] = engine
     argv = [sys.executable, "-m", "nedster_agent", "--project", str(workdir), "run", "--jsonl", task.prompt]
     try:
         proc = subprocess.run(argv, cwd=workdir, env=env, capture_output=True, text=True, timeout=timeout)
@@ -83,7 +77,7 @@ def _invoke(task: Task, workdir: Path, model: str | None, engine: str | None, ti
     return stats, "ok"
 
 
-def run_task(task: Task, model: str | None, engine: str | None, timeout: float) -> dict:
+def run_task(task: Task, model: str | None, timeout: float) -> dict:
     missing = [tool for tool in task.requires if shutil.which(tool) is None]
     if missing:
         return {"task": task.name, "status": "skipped", "reason": f"missing {', '.join(missing)}"}
@@ -92,11 +86,11 @@ def run_task(task: Task, model: str | None, engine: str | None, timeout: float) 
         shutil.copytree(task.repo, workdir)
         before = snapshot(workdir)
         started = time.monotonic()
-        stats, _ = _invoke(task, workdir, model, engine, timeout)
+        stats, _ = _invoke(task, workdir, model, timeout)
         wall = time.monotonic() - started
         after = snapshot(workdir)
         score = score_run(task, before, after, answer=stats.answer,
-                          claimed=claimed_success(stats.outcome, stats.passed),
+                          claimed=claimed_success(stats.outcome),
                           check=load_check(task), root=workdir, commands=stats.commands)
     return _record(task, score, stats, wall)
 
@@ -133,7 +127,6 @@ def format_table(records: list[dict]) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="evals.run", description=__doc__)
     parser.add_argument("--model", default=None, help="Model name applied to every role")
-    parser.add_argument("--engine", choices=("native", "legacy"), default=None)
     parser.add_argument("--only", default="", help="Comma-separated fixture name prefixes, e.g. a,b or a_add_subtract")
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=900.0, help="Seconds per run")
@@ -150,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
     records: list[dict] = []
     for _ in range(max(1, args.repeat)):
         for directory in dirs:
-            records.append(run_task(load_task(directory), args.model, args.engine, args.timeout))
+            records.append(run_task(load_task(directory), args.model, args.timeout))
     if args.out:
         args.out.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
     print(format_table(records))

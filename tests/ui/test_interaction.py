@@ -337,7 +337,7 @@ async def test_commands_clear_new_undo_doctor_status_diff(tmp_path):
 
         h.app._command("/sessions")
         await settle(pilot)
-        assert "native engine" in transcript(h.app)
+        assert "Saved sessions are not available" in transcript(h.app)
 
 
 async def test_state_changing_command_while_busy_keeps_text(tmp_path):

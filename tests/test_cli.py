@@ -41,12 +41,12 @@ def test_config_show_json_has_provenance(clean_env, capsys):
     assert main(["config", "show", "--json", "--project", str(clean_env)]) == 0
     doc = json.loads(capsys.readouterr().out)
     assert doc["provenance"]["runtime.state_dir"] == "env"
-    assert doc["config"]["engine"] == "legacy"
+    assert doc["config"]["engine"] == "native"
 
 
 def test_config_show_human_lists_sources(clean_env, capsys):
     assert main(["config", "show", "--project", str(clean_env)]) == 0
-    assert "engine = legacy  [default]" in capsys.readouterr().out
+    assert "engine = native  [default]" in capsys.readouterr().out
 
 
 def test_missing_explicit_config_exits_2(clean_env, capsys):
@@ -66,32 +66,50 @@ def test_run_without_prompt_and_tty_stdin_is_usage_error(clean_env, capsys):
     assert "No objective" in capsys.readouterr().err
 
 
-class _FakeRuntime:
-    def __init__(self, config):
-        self.config = config
+class _FakeNativeSession:
+    """Stands in for ironclad.native.NativeSession: emits one turn.finished event, returns an answer."""
 
-    async def initialize(self): ...
+    def __init__(self, config, *, emit=None, model=None, session_id=None, resume_latest=False, **_kwargs):
+        self._emit = emit
+        self.session_id = session_id or "0123456789abcdef"
 
-    async def respond(self, objective):
-        return {"answer": f"echo:{objective}", "passed": True, "mode": "ask", "completed_steps": 1, "total_steps": 1}
+    async def run(self, text, *, intent=None):
+        import time
 
-    def close(self): ...
+        from ironclad.contracts import AcceptanceResult, EngineEvent, Outcome
+
+        if self._emit is not None:
+            self._emit(EngineEvent(
+                "turn.finished", self.session_id, "run-1",
+                {"answer": f"echo:{text}", "outcome": "answered"}, time.time_ns(),
+            ))
+        return AcceptanceResult(outcome=Outcome.ANSWERED, answer=f"echo:{text}")
+
+    async def aclose(self): ...
 
 
 @pytest.mark.parametrize("flag", [None, "--json", "--jsonl"])
 def test_run_output_contracts_and_piped_prompt(clean_env, capsys, flag):
     argv = ["run", "--project", str(clean_env)] + ([flag] if flag else [])
-    with patch("ironclad.orchestrator.NedsterRuntime", _FakeRuntime), patch("sys.stdin", io.StringIO("hello\n")):
+    with patch("ironclad.native.NativeSession", _FakeNativeSession), patch("sys.stdin", io.StringIO("hello\n")):
         assert main(argv) == 0
     captured = capsys.readouterr()
     if flag is None:
         assert captured.out == "echo:hello\n"
-        assert "passed" in captured.err
+        assert "answered" in captured.err
     elif flag == "--json":
         assert json.loads(captured.out)["answer"] == "echo:hello"
+        assert json.loads(captured.out)["outcome"] == "answered"
     else:
         events = [json.loads(line) for line in captured.out.splitlines()]
-        assert [e["type"] for e in events] == ["start", "result", "end"]
+        assert [e["kind"] for e in events] == ["turn.finished"]
+        assert events[0]["data"]["answer"] == "echo:hello"
+
+
+def test_run_rejects_removed_legacy_engine_flag(clean_env, capsys):
+    with patch("sys.stdin", io.StringIO("hello\n")), pytest.raises(SystemExit) as exit_info:
+        main(["run", "--engine", "legacy", "--project", str(clean_env)])
+    assert exit_info.value.code == 2
 
 
 def test_doctor_exit_3_when_inference_not_ready(clean_env, capsys):
@@ -123,15 +141,14 @@ def test_models_list_uses_resolved_endpoint(clean_env, monkeypatch):
 
 
 def test_cli_module_import_is_lazy():
-    # nedster_agent/__init__ eagerly imports the orchestrator (not owned by this package), so stub the
-    # package to test cli's own imports.
+    # Stub the package so the test covers only cli's own imports (no eager package-level work).
     code = (
         "import sys, types\n"
         "pkg = types.ModuleType('nedster_agent'); pkg.__path__ = ['nedster_agent']; pkg.__version__ = 'x'\n"
         "sys.modules['nedster_agent'] = pkg\n"
         "import nedster_agent.cli as cli\n"
         "cli.build_parser()\n"
-        "print(','.join(m for m in ('textual', 'httpx', 'rich', 'ironclad.orchestrator') if m in sys.modules))\n"
+        "print(','.join(m for m in ('textual', 'httpx', 'rich', 'ironclad.native') if m in sys.modules))\n"
     )
     out = subprocess.run(
         [sys.executable, "-I", "-c", code],

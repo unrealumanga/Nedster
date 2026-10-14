@@ -20,7 +20,7 @@ def isolated(tmp_path: Path, monkeypatch):
 def test_defaults_and_new_fields(isolated):
     config, prov = resolve_config({}, isolated / "proj")
     assert config.sandbox.allow_host_execution is False
-    assert config.engine == "legacy"
+    assert config.engine == "native"
     assert prov["engine"] == "default"
     assert config.runtime.state_dir.name == "data"
 
@@ -95,6 +95,22 @@ def test_invalid_values_rejected(isolated, monkeypatch):
     monkeypatch.setenv("NEDSTER_SANDBOX__MAX_SECONDS", "abc")
     with pytest.raises(ValueError):
         resolve_config({}, isolated / "proj")
+
+
+def test_legacy_engine_warns_and_runs_native(isolated):
+    (isolated / "user" / "config.toml").write_text('engine = "legacy"\n')
+    config, prov = resolve_config({}, isolated / "proj")
+    assert config.engine == "native"
+    assert prov["engine"] == "user"
+    assert any("legacy" in warning for warning in config.warnings)
+
+
+def test_legacy_engine_env_warns_and_runs_native(isolated, monkeypatch):
+    monkeypatch.setenv("NEDSTER_ENGINE", "legacy")
+    config, prov = resolve_config({}, isolated / "proj")
+    assert config.engine == "native"
+    assert prov["engine"] == "env"
+    assert any("legacy" in warning for warning in config.warnings)
 
 
 def test_load_config_compat_and_project_root(isolated):

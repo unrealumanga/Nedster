@@ -5,7 +5,6 @@ from importlib import import_module
 _EXPORTS = {
     "NedsterConfig": "ironclad.config",
     "load_config": "ironclad.config",
-    "NedsterRuntime": "ironclad.orchestrator",
 }
 
 __all__ = sorted(_EXPORTS)

@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-# Heavy modules (httpx, rich, textual, asyncio, the orchestrator) are imported inside command
+# Heavy modules (httpx, rich, textual, asyncio, the engine) are imported inside command
 # functions so `nedster --help` and `nedster config show` stay fast.
 from . import __version__
 
@@ -75,7 +75,12 @@ def build_parser() -> argparse.ArgumentParser:
     accept_global_options(run)
     run.add_argument("objective", nargs="?", help="Objective (default: read from piped stdin)")
     run.add_argument("--jsonl", action="store_true", help="Emit an event stream, one JSON object per line")
-    run.add_argument("--engine", choices=("native", "legacy"), default=None, help="Agent engine (default: configuration)")
+    run.add_argument(
+        "--engine",
+        choices=("native",),
+        default=None,
+        help="DEPRECATED (kept for one release): the native engine is the only engine; this flag does nothing",
+    )
     run.add_argument("--model", default=None, help="Worker model for the native engine (default: configuration)")
     run.add_argument(
         "--expect",
@@ -442,30 +447,7 @@ def _read_objective(args: argparse.Namespace) -> str:
 
 async def _run_objective(args: argparse.Namespace, objective: str) -> int:
     config, _ = _resolve(args)
-    if (getattr(args, "engine", None) or config.engine) == "native":
-        return await _run_native(args, config, objective)
-    from ironclad.orchestrator import NedsterRuntime
-
-    runtime = NedsterRuntime(config)
-    jsonl = args.jsonl
-    if jsonl:
-        _emit_json({"type": "start", "objective": objective})
-    try:
-        await runtime.initialize()
-        result = await runtime.respond(objective)
-    finally:
-        runtime.close()
-    passed = bool(result.get("passed"))
-    if jsonl:
-        _emit_json({"type": "result", **result})
-        _emit_json({"type": "end", "passed": passed})
-    elif args.json:
-        _emit_json(result)
-    else:
-        print(result.get("answer", ""))
-        steps = f"{result.get('completed_steps', 0)}/{result.get('total_steps', 0)} steps"
-        _err(f"[{'passed' if passed else 'failed'} · {result.get('mode', 'ask')} · {steps}]")
-    return EXIT_OK if passed else EXIT_RUNTIME
+    return await _run_native(args, config, objective)
 
 
 class _SessionHeartbeat:

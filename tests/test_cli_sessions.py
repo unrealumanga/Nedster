@@ -259,7 +259,7 @@ def test_sessions_show_marks_a_session_another_window_is_using(clean_env, capsys
 
 
 def test_cli_sessions_parsing_stays_lazy():
-    # parsing `sessions` must not import the UI, the model client or the orchestrator
+    # parsing `sessions` must not import the UI, the model client or the engine
     code = (
         "import sys, types\n"
         "pkg = types.ModuleType('nedster_agent'); pkg.__path__ = ['nedster_agent']; pkg.__version__ = 'x'\n"
@@ -267,7 +267,7 @@ def test_cli_sessions_parsing_stays_lazy():
         "import nedster_agent.cli as cli\n"
         "args = cli.build_parser().parse_args(['sessions', 'list', '--json', '--plain'])\n"
         "assert args.command == 'sessions' and args.action == 'list' and args.json and args.plain\n"
-        "print(','.join(m for m in ('textual', 'httpx', 'rich', 'ironclad.orchestrator') if m in sys.modules))\n"
+        "print(','.join(m for m in ('textual', 'httpx', 'rich', 'ironclad.native') if m in sys.modules))\n"
     )
     out = subprocess.run(
         [sys.executable, "-I", "-c", code],
