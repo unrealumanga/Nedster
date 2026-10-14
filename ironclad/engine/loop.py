@@ -24,6 +24,7 @@ from ironclad.contracts import (
     EngineEvent,
     EventKind,
     JobHandle,
+    Outcome,
     SessionStore,
     TextDelta,
     ToolCall,
@@ -70,6 +71,8 @@ COMPACTED: EventKind = cast(EventKind, "context.compacted")  # proposed addition
 JOB_STOP_TIMEOUT_S = 10.0
 ENGINE_TOOLS = frozenset({SHOW_OUTPUT, DECLARE_NO_CHANGE})  # answered by the engine itself; never mutate
 TRANSCRIPT_TEXT_CHARS = 2_000
+AUTO_VERIFY_TOOL = "run_tests"
+AUTO_VERIFY_TEXT = "Running the project's tests to verify the change."
 
 Stop = tuple[StopReason, str]
 
@@ -96,6 +99,7 @@ class _Run:
     invalid: dict[str, int] = field(default_factory=dict)
     prose: str = ""
     intent: Intent = Intent.UNKNOWN  # what this user message asks for; decides whether "no change" can pass
+    auto_verified: int = 0  # engine-initiated run_tests calls in this run
 
 
 def _signature(call: ToolCall) -> str:
@@ -179,6 +183,7 @@ class Engine:
         think: bool | str = False,
         temperature: float | None = None,
         completion_reserve_tokens: int | None = None,
+        auto_verify: int = 2,
     ) -> None:
         self.transport = transport
         self.tools = tools
@@ -191,6 +196,7 @@ class Engine:
         self.think = think
         self.temperature = temperature
         self.completion_reserve_tokens = completion_reserve_tokens
+        self.auto_verify = max(0, auto_verify)  # max engine-run validations per run when the model skips them
         self.last_answer = ""
         self._sessions: dict[str, _Session] = {}
         self._running: set[JobHandle] = set()
@@ -338,10 +344,32 @@ class Engine:
                     return "cancelled", ""
                 if done_reason in TRUNCATED:
                     return "model_error", f"model stopped early ({done_reason})"
+                if await self._auto_verify(session, run, by_name):
+                    continue
                 return "final", ""
             stop = await self._run_calls(session, run, message.tool_calls, by_name)
             if stop is not None:
                 return stop
+
+    async def _auto_verify(self, session: _Session, run: _Run, by_name: Mapping[str, ToolSpec]) -> bool:
+        """The model finished after changing files without validating: run the tests ourselves.
+
+        Evidence comes from the real tool record (same policy, sandbox and runner parsing as a model call), so this
+        can only move UNVALIDATED to COMPLETED or INCOMPLETE. Returns True when the tests failed and the model gets
+        another turn to repair; the last allowed attempt never loops.
+        """
+        if run.auto_verified >= self.auto_verify or AUTO_VERIFY_TOOL not in by_name:
+            return False
+        if acceptance.evaluate(run.records, intent=run.intent).outcome is not Outcome.UNVALIDATED:
+            return False
+        run.auto_verified += 1
+        call = ToolCall(f"auto-verify-{run.run_id}-{run.auto_verified}", AUTO_VERIFY_TOOL, {})
+        self._append(session, ChatMessage(role="assistant", content=AUTO_VERIFY_TEXT, tool_calls=[call]))
+        await self._run_calls(session, run, [call], by_name)
+        record = next((r for r in reversed(run.records) if r.call.id == call.id), None)
+        if record is None or acceptance.validation_verdict(record) != "fail":
+            return False
+        return run.auto_verified < self.auto_verify
 
     async def _model_turn(self, session: _Session, run: _Run, specs: list[ToolSpec]) -> tuple[ChatMessage, str]:
         stream: Any = self.transport.chat(

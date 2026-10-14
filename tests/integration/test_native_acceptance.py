@@ -47,10 +47,11 @@ def config(project: Path) -> NedsterConfig:
 def run(project: Path, config: NedsterConfig) -> Iterator[object]:
     executors: list[object] = []
 
-    async def go(script: list[Turn]) -> AcceptanceResult:
+    async def go(script: list[Turn], auto_verify: int = 0) -> AcceptanceResult:
+        # auto_verify=0: these tests pin the acceptance rules for what the model itself ran.
         tools, executor = build_tools(project, config)
         executors.append(executor)
-        engine = Engine(ScriptedTransport(script), tools, model="m", project_root=project)
+        engine = Engine(ScriptedTransport(script), tools, model="m", project_root=project, auto_verify=auto_verify)
         return await engine.run("s", "change x to 2 and make sure tests pass")
 
     yield go
@@ -104,3 +105,19 @@ async def test_review9_real_failed_command_is_incomplete(run) -> None:
     result = await run(script)
     assert result.outcome is Outcome.INCOMPLETE and not result.passed, result.reasons
     assert any("requested change failed" in r for r in result.reasons)
+
+
+async def test_auto_verify_runs_the_real_suite_when_the_model_skips_it(run, project: Path) -> None:
+    (project / "tests" / "__init__.py").write_text("")
+    (project / "tests" / "test_a.py").write_text(
+        "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        self.assertTrue(True)\n"
+    )
+    result = await run([edit_turn(), Turn("Done.")], auto_verify=1)
+    assert result.outcome is Outcome.COMPLETED, result.reasons
+
+
+async def test_auto_verify_collecting_no_tests_is_not_a_failure(run, project: Path, monkeypatch) -> None:
+    # pytest-style tests but the runner chosen is unittest: zero tests collected is inconclusive, not "failing".
+    monkeypatch.setattr("ironclad.tool_runtime.exec.Executor._uses_pytest", lambda self: False)
+    result = await run([edit_turn(), Turn("Done.")], auto_verify=1)
+    assert result.outcome is Outcome.UNVALIDATED, result.reasons

@@ -115,7 +115,7 @@ async def test_b03_pass_then_mutation_without_rerun_is_unvalidated() -> None:
         Turn(calls=[call("edit_file", "3", path="b.py")]),
         Turn("Done."),
     ]
-    engine, *_ = make(script)
+    engine, *_ = make(script, auto_verify=0)
     result = await engine.run("s", "fix it")
     assert result.outcome is Outcome.UNVALIDATED
     assert result.changed_paths == ("a.py", "b.py")

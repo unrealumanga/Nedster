@@ -114,6 +114,8 @@ def validation_verdict(record: ToolRecord) -> Verdict | None:
     """``None`` when the record is not a validation that actually ran."""
     if not is_validation(record) or record.result.status in _NOT_RUN:
         return None
+    if record.result.data.get("no_tests") is True and _trusted(record):
+        return "inconclusive"  # the runner collected nothing (e.g. unittest on pytest-style tests)
     if record.result.status is not ToolStatus.OK:
         return "fail"
     if not _trusted(record):

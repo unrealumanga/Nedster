@@ -170,6 +170,21 @@ def find_program(name: str, search_path: str, root: Path) -> Path | None:
     return None
 
 
+def _site_has(python: Path, package: str) -> bool:
+    """Whether ``package`` is installed for the interpreter ``python``, judged from its site-packages on disk only."""
+    bases = {python.parent, python.parent.parent}
+    with contextlib.suppress(OSError):
+        real = Path(os.path.realpath(python))
+        bases |= {real.parent, real.parent.parent}
+    for base in bases:
+        candidates = [base / "Lib" / "site-packages"] if IS_WINDOWS else list(base.glob("lib/python3*/site-packages"))
+        if not IS_WINDOWS:
+            candidates += list(base.glob("lib/python3/dist-packages"))
+        if any((site / package).is_dir() for site in candidates):
+            return True
+    return False
+
+
 def venv_python(root: Path) -> Path | None:
     """The project's ``.venv`` interpreter, only when it is a structurally real venv interpreter.
 
@@ -357,6 +372,7 @@ _NODE = re.compile(r"^(?:ℹ|#) tests (\d+)\s*$", re.MULTILINE)  # spec reporter
 _PYTEST_LINE = re.compile(r"^[=\s]*(?:(?:\d+ \w+(?:, )?)+|no tests ran)\b.* in [\d.]+s\b.*$", re.MULTILINE)
 _PYTEST_COUNT = re.compile(r"(\d+) (passed|failed|errors?|xfailed|xpassed)\b")
 _UNITTEST = re.compile(r"^Ran (\d+) tests? in ", re.MULTILINE)
+_NO_TESTS = re.compile(r"^(?:=+ )?no tests ran\b|^no tests to run\b|^testing: warning: no tests to run", re.MULTILINE | re.IGNORECASE)
 _GO_RESULT = re.compile(r"^\s*--- (?:PASS|FAIL): ", re.MULTILINE)
 _GO_VERBOSE = re.compile(r"^=== RUN ", re.MULTILINE)
 
@@ -684,6 +700,8 @@ class Job:
             data["runner"] = spec.runner
         if spec.count_tests or spec.runner is not None:
             data["tests_run"] = parse_tests_run(text, spec.runner)
+            if spec.runner is not None and (data["tests_run"] == 0 or _NO_TESTS.search(text[-4_000:])):
+                data["no_tests"] = True  # nothing was collected: not evidence either way
         self._result = ToolResult(spec.call_id, spec.tool, status, text, data, elapsed_ms=duration_ms)
         self._done.set()
 
@@ -845,7 +863,7 @@ class Executor:
                 return [python, "-m", "pytest", "-q"]
             tests = root / "tests"
             if tests.is_dir() and not (tests / "__init__.py").is_file() and not any(root.glob("test_*.py")):
-                return [python, "-m", "unittest", "discover", "-s", "tests", "-t", "."]
+                return [python, "-m", "unittest", "discover", "-s", "tests"]
             return [python, "-m", "unittest", "discover"]
         raise ArgumentError(
             "could not detect a test suite (no Cargo.toml, go.mod, package.json or Python tests)"
@@ -867,12 +885,10 @@ class Executor:
                 continue
         if self._container():
             return False
-        venv = self.venv_python()
-        if venv is not None:
-            lib = root / ".venv" / ("Lib" if IS_WINDOWS else "lib")
-            patterns = ("site-packages/pytest",) if IS_WINDOWS else ("python3*/site-packages/pytest",)
-            return any(path.is_dir() for pattern in patterns for path in lib.glob(pattern))
-        return find_program("pytest", self._search_path, self.project_root) is not None
+        python = self.venv_python() or find_program("python" if IS_WINDOWS else "python3", self._search_path, root)
+        if python is not None and _site_has(Path(python), "pytest"):
+            return True
+        return self.venv_python() is None and find_program("pytest", self._search_path, root) is not None
 
     def _container(self) -> bool:
         backend = self.selection().backend

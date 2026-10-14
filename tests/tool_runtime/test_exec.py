@@ -486,6 +486,6 @@ def test_python_runner_is_chosen_from_static_evidence(tmp_path: Path, monkeypatc
         (tmp_path / "test_a.py").unlink()
         (tmp_path / "tests").mkdir()
         (tmp_path / "tests" / "test_b.py").write_text("", encoding="utf-8")
-        assert ex.detect_test_argv()[1:] == ["-m", "unittest", "discover", "-s", "tests", "-t", "."]
+        assert ex.detect_test_argv()[1:] == ["-m", "unittest", "discover", "-s", "tests"]
     finally:
         ex.close()
