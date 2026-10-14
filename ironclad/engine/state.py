@@ -54,6 +54,7 @@ class TaskState:
     validation: str = "not run"
     obligations: list[str] = field(default_factory=list)
     updated_ns: int = 0
+    intent: str = ""  # ironclad.engine.intent.Intent value fixed for the task ("" = not classified yet)
 
     def note_user(self, text: str) -> None:
         """First user message is the objective; later ones are kept verbatim as constraints."""
@@ -78,6 +79,8 @@ class TaskState:
     def render(self) -> str:
         lines = ["[task state — maintained by the engine from tool records]"]
         lines.append(f"Objective: {self.objective or '(none yet)'}")
+        if self.intent:
+            lines.append(f"Task type: {self.intent}")
         if self.constraints:
             lines.append("Later user instructions (most recent last):")
             lines.extend(f"- {c}" for c in self.constraints)
@@ -104,4 +107,5 @@ class TaskState:
             validation=str(data.get("validation", "not run")),
             obligations=[str(o) for o in data.get("obligations", [])],
             updated_ns=int(data.get("updated_ns", 0)),
+            intent=str(data.get("intent", "")),
         )

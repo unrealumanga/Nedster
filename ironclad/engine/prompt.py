@@ -24,6 +24,7 @@ How to work:
   "validation": true). A change is only accepted when validation passes AFTER your latest change.
 - If a tool result is [invalid] or [denied], read the diagnostic and correct the call; do not repeat the same call.
 - Old tool outputs may be shown as "[output #N elided ...]". Call show_output(N) if you need them again.
+- If the requested change is already in place, call declare_no_change only after passing tests prove it.
 - When the request is a question, answer it from what the tools showed you. Say what you did not verify.
 - Finish with a short plain answer and no tool calls. The engine appends the list of changed files and the
   validation result from its own records; do not claim tests passed unless a tool result showed it."""

@@ -9,7 +9,13 @@ Rules (``evaluate``):
   record says the resolved program is a known test runner (``data["runner"]``, set by the executor). A flagged
   command without it is inconclusive. Exit 0 alone never passes: a pass needs ``tests_run > 0`` and no failures.
 - No successful change: if a mutating call failed or was rejected the requested change did not happen ->
-  INCOMPLETE, otherwise ANSWERED.
+  INCOMPLETE. Otherwise it depends on the task intent (``ironclad.engine.intent``): CHANGE -> INCOMPLETE
+  ("requested change was not made") unless there is NO_CHANGE_NEEDED evidence; QUESTION / UNKNOWN -> ANSWERED.
+- NO_CHANGE_NEEDED needs all of: intent CHANGE; no change this run; an OK ``declare_no_change`` call; at least one
+  successful read; and a trusted validation verdict "pass" recorded after every read, with no mutation or failed
+  record after it. The declared reason is explanatory only and never evidence.
+- QUESTION + a change: the change rules below apply unchanged and the reasons note "changes were made for a
+  question".
 - Change made: only validation records that started at or after the latest change count; a trusted validation's
   own revision bump does not invalidate it. The latest decisive one wins: pass -> COMPLETED, fail -> INCOMPLETE;
   none -> UNVALIDATED. Baseline runs before the latest change are stale.
@@ -17,17 +23,23 @@ Rules (``evaluate``):
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Literal
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
+from typing import Any, Literal
 
-from ironclad.contracts import AcceptanceResult, Outcome, ToolStatus
+from ironclad.contracts import AcceptanceResult, Outcome, ToolResult, ToolSpec, ToolStatus
+from ironclad.engine.intent import Intent
 from ironclad.engine.state import ToolRecord
 
 __all__ = [
+    "DECLARE_NO_CHANGE",
+    "DECLARE_NO_CHANGE_SPEC",
     "FLAGGABLE_TOOLS",
+    "Intent",
     "StopReason",
     "ToolRecord",
     "changed_paths",
+    "declare_no_change_result",
     "evaluate",
     "is_validation",
     "obligations",
@@ -42,6 +54,42 @@ Verdict = Literal["pass", "fail", "inconclusive"]
 FLAGGABLE_TOOLS = frozenset({"run_command"})  # the model may flag these as validation; trusted only with a runner
 _NOT_RUN = {ToolStatus.INVALID, ToolStatus.DENIED, ToolStatus.CANCELLED}
 _REJECTED = {ToolStatus.INVALID, ToolStatus.DENIED}
+
+NOT_MADE = "requested change was not made"
+QUESTION_CHANGED = "changes were made for a question"
+DECLARE_NO_CHANGE = "declare_no_change"
+MAX_REASON_CHARS = 1000
+DECLARE_NO_CHANGE_SPEC = ToolSpec(
+    name=DECLARE_NO_CHANGE,
+    description=(
+        "Declare that the requested change is already in place, so nothing needs editing. Only call this after "
+        "reading the relevant code and running the tests (run_tests) with a passing result; without passing "
+        "tests after your reads the declaration is not accepted."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {"reason": {"type": "string", "minLength": 1, "maxLength": MAX_REASON_CHARS}},
+        "required": ["reason"],
+        "additionalProperties": False,
+    },
+    risk=0,  # RiskLevel.READ; no side effects
+    mutates=False,
+)
+
+
+def declare_no_change_result(args: Mapping[str, Any], call_id: str = "") -> ToolResult:
+    """Pure handler: records the claim; acceptance decides from tool evidence whether it holds."""
+    reason = args.get("reason") if isinstance(args, Mapping) else None
+    extra = set(args) - {"reason"} if isinstance(args, Mapping) else set()
+    if not isinstance(reason, str) or not reason.strip() or extra:
+        text = "declare_no_change needs exactly one argument: a non-empty string 'reason'."
+        return ToolResult(call_id, DECLARE_NO_CHANGE, ToolStatus.INVALID, text)
+    reason = reason.strip()[:MAX_REASON_CHARS]
+    text = (
+        "Recorded. The engine accepts 'no change needed' only if a passing test run happened after your reads "
+        "and nothing was changed."
+    )
+    return ToolResult(call_id, DECLARE_NO_CHANGE, ToolStatus.OK, text, data={"reason": reason})
 
 
 def is_validation(record: ToolRecord) -> bool:
@@ -136,7 +184,40 @@ def _names(records: Sequence[ToolRecord]) -> str:
     return ", ".join(sorted({f"{r.call.name} {r.result.status.value}" for r in records}))
 
 
-def evaluate(records: Sequence[ToolRecord], stop: StopReason = "final", detail: str = "") -> AcceptanceResult:
+def _no_change_evidence(records: Sequence[ToolRecord]) -> tuple[ToolRecord | None, str]:
+    """The passing validation that justifies NO_CHANGE_NEEDED, or ``None`` and why not."""
+    if not any(r.call.name == DECLARE_NO_CHANGE and r.result.status is ToolStatus.OK for r in records):
+        return None, ""
+    if any(_is_change(r) for r in records):
+        return None, "declare_no_change ignored: the workspace changed this run"
+    reads = [i for i, r in enumerate(records) if _is_read(r)]
+    if not any(records[i].result.status is ToolStatus.OK for i in reads):
+        return None, "declare_no_change ignored: nothing was read first"
+    passes = [i for i, r in enumerate(records) if validation_verdict(r) == "pass" and i > reads[-1]]
+    if not passes:
+        return None, "declare_no_change ignored: no passing test run after the reads"
+    index = passes[-1]
+    later = records[index + 1:]
+    if any(r.mutating or r.bumped or r.result.status is not ToolStatus.OK for r in later):
+        return None, "declare_no_change ignored: a mutation or failure followed the passing test run"
+    return records[index], ""
+
+
+def _is_read(record: ToolRecord) -> bool:
+    return record.call.name != DECLARE_NO_CHANGE and not is_validation(record)
+
+
+def _with_reason(result: AcceptanceResult, reason: str) -> AcceptanceResult:
+    return replace(result, reasons=(*result.reasons, reason))
+
+
+def evaluate(
+    records: Sequence[ToolRecord],
+    stop: StopReason = "final",
+    detail: str = "",
+    *,
+    intent: Intent = Intent.UNKNOWN,
+) -> AcceptanceResult:
     changed = changed_paths(records)
     if stop == "cancelled":
         return AcceptanceResult(Outcome.CANCELLED, ("cancelled by user",), changed)
@@ -148,7 +229,6 @@ def evaluate(records: Sequence[ToolRecord], stop: StopReason = "final", detail: 
         )
         return AcceptanceResult(Outcome.INCOMPLETE, (reason,), changed)
 
-    unreported = unreported_changes(records)
     if not any(_is_change(r) and r.result.status is ToolStatus.OK for r in records):
         failed = [r for r in records if r.mutating and not is_validation(r) and r.result.status is not ToolStatus.OK]
         if failed and all(r.result.status in _REJECTED for r in failed):
@@ -156,9 +236,25 @@ def evaluate(records: Sequence[ToolRecord], stop: StopReason = "final", detail: 
             return AcceptanceResult(Outcome.INCOMPLETE, (reason,), changed)
         if failed:
             return AcceptanceResult(Outcome.INCOMPLETE, (f"requested change failed ({_names(failed)})",), changed)
-        if not unreported:
+        if intent is Intent.CHANGE:
+            return _unchanged_for_change(records, changed)
+        if not unreported_changes(records):
             return AcceptanceResult(Outcome.ANSWERED, ("no workspace changes",))
 
+    result = _change_outcome(records, changed)
+    return _with_reason(result, QUESTION_CHANGED) if intent is Intent.QUESTION else result
+
+
+def _unchanged_for_change(records: Sequence[ToolRecord], changed: tuple[str, ...]) -> AcceptanceResult:
+    evidence, why_not = _no_change_evidence(records)
+    if evidence is not None:
+        reason = f"no change needed; tests passed after reading the code: {_describe(evidence)}"
+        return AcceptanceResult(Outcome.NO_CHANGE_NEEDED, (reason,), changed, evidence.revision_after)
+    return AcceptanceResult(Outcome.INCOMPLETE, tuple(r for r in (NOT_MADE, why_not) if r), changed)
+
+
+def _change_outcome(records: Sequence[ToolRecord], changed: tuple[str, ...]) -> AcceptanceResult:
+    unreported = unreported_changes(records)
     fresh = _fresh_validations(records)
     decisive = [(r, v) for r, v in fresh if v != "inconclusive"]
     if decisive:
@@ -211,6 +307,6 @@ def render_summary(records: Sequence[ToolRecord], result: AcceptanceResult) -> s
         lines.append("Last validation: none")
     if not any(r.result.status is ToolStatus.OK for r in records):
         lines.append("Evidence: none - no tool call succeeded, so this answer is not verified against the project")
-    if not result.passed:
+    if not result.passed or result.outcome is Outcome.NO_CHANGE_NEEDED or QUESTION_CHANGED in result.reasons:
         lines.extend(f"Reason: {reason}" for reason in result.reasons)
     return "\n".join(lines)
