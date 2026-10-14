@@ -115,6 +115,24 @@ def test_invalid_critic_answer_falls_back_to_only_verified_findings():
     assert runtime.grounding.verify(answer, sources).valid
 
 
+def test_empty_verified_partial_answer_does_not_invent_project_inspection():
+    runtime = object.__new__(NedsterRuntime)
+    runtime.grounding = GroundingHarness()
+    sources = [
+        GroundingSource(
+            "S1",
+            "https://api.example.test/quote",
+            '{"price": "42", "symbol": "TESTUSDT"}',
+            1.0,
+        )
+    ]
+
+    answer = runtime._verified_partial_answer({"findings": []}, sources)
+
+    assert "active project" not in answer
+    assert "retrieved evidence does not verify" in answer
+
+
 def test_small_action_plan_is_merged_into_one_end_to_end_tool_step():
     runtime = object.__new__(NedsterRuntime)
     plan = TaskPlan(
@@ -554,6 +572,86 @@ async def test_current_market_price_uses_a_cross_checked_tool_without_an_llm():
     assert result["grounded"] is True
     assert "Binance 64,463.73 USDT" in result["answer"]
     assert "Coinbase 64,463.9 USDT" in result["answer"]
+    runtime.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("objective", "expected_symbol"),
+    [
+        ("whats the btc price now ?", "BTCUSDT"),
+        ("what is eth price now ?", "ETHUSDT"),
+        ("current Ethereum price in USD", "ETHUSD"),
+    ],
+)
+async def test_current_market_price_accepts_common_asset_shorthand(objective, expected_symbol):
+    runtime = object.__new__(NedsterRuntime)
+    runtime.config = NedsterConfig()
+    runtime.conversation = []
+    runtime.on_event = None
+    runtime.ledger = Mock(append=Mock(return_value=1))
+    runtime.tools = Mock()
+    runtime.tools.prepare.return_value = SimpleNamespace(risk=0)
+    runtime.tools.authorize.return_value = ("token", "allowed")
+    runtime.tools.execute.return_value = {
+        "symbol": expected_symbol,
+        "quotes": [
+            {
+                "provider": "Exchange",
+                "price": "2693.32",
+                "quote_currency": "USD" if expected_symbol.endswith("USD") else "USDT",
+                "source_url": "https://api.example.test/quote",
+            }
+        ],
+        "spread_percent": "0",
+        "observed_at": "2026-09-30T10:43:01+00:00",
+    }
+    runtime.run = AsyncMock()
+
+    result = await runtime.respond(objective)
+
+    requested = runtime.tools.prepare.call_args.args[0]
+    assert requested.tool == "market_price"
+    assert requested.arguments == {"symbol": expected_symbol}
+    assert result["passed"] is True
+    assert result["grounded"] is True
+    runtime.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_current_news_is_rendered_directly_from_search_results_without_an_llm():
+    runtime = object.__new__(NedsterRuntime)
+    runtime.config = NedsterConfig()
+    runtime.conversation = []
+    runtime.on_event = None
+    runtime.ledger = Mock(append=Mock(return_value=1))
+    runtime.tools = Mock()
+    runtime.tools.prepare.return_value = SimpleNamespace(risk=0)
+    runtime.tools.authorize.return_value = ("token", "allowed")
+    runtime.tools.execute.return_value = {
+        "provider": "Bing News",
+        "retrieved_at": "2026-09-30T11:00:00+00:00",
+        "results": [
+            {
+                "title": f"Verified headline {index}",
+                "url": f"https://example.test/news/{index}",
+                "snippet": f"Published report {index}. Published: Wed, 30 Sep 2026 10:0{index}:00 GMT",
+            }
+            for index in range(1, 6)
+        ],
+    }
+    runtime.run = AsyncMock()
+
+    result = await runtime.respond("top 5 global news?")
+
+    requested = runtime.tools.prepare.call_args.args[0]
+    assert requested.tool == "web_search"
+    assert requested.arguments == {"query": "latest world news headlines today", "limit": 5}
+    assert result["passed"] is True
+    assert result["grounded"] is True
+    assert "Verified headline 1" in result["answer"]
+    assert "https://example.test/news/5" in result["answer"]
+    assert "INSUFFICIENT_CONTEXT" not in result["answer"]
     runtime.run.assert_not_awaited()
 
 

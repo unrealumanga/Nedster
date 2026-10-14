@@ -117,6 +117,39 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertEqual(result["results"][0]["url"], "https://example.com/btc")
         self.assertEqual(result["results"][0]["snippet"], "A current public quote.")
 
+    def test_web_search_falls_back_to_bing_rss_when_duckduckgo_is_blocked(self):
+        tools = object.__new__(ToolRegistry)
+        rss = """<?xml version="1.0" encoding="utf-8"?>
+        <rss version="2.0"><channel><item>
+          <title>Verified world headline</title>
+          <link>http://www.bing.com/news/apiclick.aspx?url=https%3A%2F%2Fexample.com%2Fworld</link>
+          <description>A current public report.</description>
+          <pubDate>Wed, 30 Sep 2026 10:00:00 GMT</pubDate>
+        </item></channel></rss>
+        """
+        with patch.object(
+            ToolRegistry,
+            "_get_public",
+            side_effect=[
+                (
+                    "https://html.duckduckgo.com/html/?q=world+news",
+                    "text/html",
+                    '<div class="anomaly-modal">bot challenge</div>',
+                ),
+                (
+                    "https://www.bing.com/news/search?format=rss&q=world+news",
+                    "application/xml",
+                    rss,
+                ),
+            ],
+        ):
+            result = tools._web_search({"query": "world news", "limit": 3})
+
+        self.assertEqual(result["provider"], "Bing News")
+        self.assertEqual(result["results"][0]["url"], "https://example.com/world")
+        self.assertIn("Published: Wed, 30 Sep 2026", result["results"][0]["snippet"])
+        self.assertEqual(result["provider_warnings"], ["DuckDuckGo: blocked by a bot challenge"])
+
     def test_market_price_cross_checks_two_public_providers(self):
         tools = object.__new__(ToolRegistry)
         with patch.object(

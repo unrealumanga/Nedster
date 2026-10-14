@@ -8,6 +8,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -775,17 +776,72 @@ class ToolRegistry:
             raise ValueError("query must not be empty")
         limit = min(max(int(arguments.get("limit", 5)), 1), 10)
         search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-        final_url, _, content = self._get_public(search_url)
-        parser = _SearchResultParser()
-        parser.feed(content)
-        results = [item for item in parser.results if item.get("title") and item.get("url")][:limit]
-        return {
-            "query": query,
-            "provider": "DuckDuckGo",
-            "url": final_url,
-            "results": results,
-            "retrieved_at": datetime.now(UTC).isoformat(),
-        }
+        failures: list[str] = []
+        try:
+            final_url, _, content = self._get_public(search_url)
+            parser = _SearchResultParser()
+            parser.feed(content)
+            results = [
+                item for item in parser.results if item.get("title") and item.get("url")
+            ][:limit]
+            if results:
+                return {
+                    "query": query,
+                    "provider": "DuckDuckGo",
+                    "url": final_url,
+                    "results": results,
+                    "retrieved_at": datetime.now(UTC).isoformat(),
+                }
+            reason = "blocked by a bot challenge" if "anomaly-modal" in content else "no results"
+            failures.append(f"DuckDuckGo: {reason}")
+        except Exception as exc:
+            failures.append(f"DuckDuckGo: {type(exc).__name__}: {exc}")
+
+        news_query = bool(re.search(r"\b(?:breaking|headline|news)\b", query, re.IGNORECASE))
+        search_kind = "news/search" if news_query else "search"
+        bing_url = (
+            f"https://www.bing.com/{search_kind}?format=rss&q={quote_plus(query)}"
+            "&mkt=en-US&setlang=en-US&cc=US"
+        )
+        try:
+            final_url, _, content = self._get_public(bing_url)
+            results = self._bing_rss_results(content, limit)
+            if results:
+                return {
+                    "query": query,
+                    "provider": "Bing News" if news_query else "Bing",
+                    "url": final_url,
+                    "results": results,
+                    "retrieved_at": datetime.now(UTC).isoformat(),
+                    "provider_warnings": failures,
+                }
+            failures.append(f"{'Bing News' if news_query else 'Bing'}: no results")
+        except Exception as exc:
+            failures.append(f"Bing: {type(exc).__name__}: {exc}")
+        raise RuntimeError("public search failed: " + "; ".join(failures))
+
+    @staticmethod
+    def _bing_rss_results(content: str, limit: int) -> list[dict[str, str]]:
+        root = ET.fromstring(content)
+        results: list[dict[str, str]] = []
+        for item in root.findall(".//item"):
+            title = " ".join((item.findtext("title") or "").split())
+            raw_url = (item.findtext("link") or "").strip()
+            parsed = urlparse(raw_url)
+            target = parse_qs(parsed.query).get("url", [""])[0]
+            url = unquote(target) if target else raw_url
+            if not title or not url.startswith("https://"):
+                continue
+            description = re.sub(r"<[^>]+>", " ", item.findtext("description") or "")
+            description = " ".join(description.split())
+            published = " ".join((item.findtext("pubDate") or "").split())
+            snippet = description
+            if published:
+                snippet = f"{description} Published: {published}".strip()
+            results.append({"title": title, "url": url, "snippet": snippet})
+            if len(results) >= limit:
+                break
+        return results
 
     def _web_fetch(self, arguments: dict[str, Any]) -> dict[str, Any]:
         max_chars = min(max(int(arguments.get("max_chars", 30_000)), 1_000), 100_000)

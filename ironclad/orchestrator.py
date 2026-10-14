@@ -136,7 +136,34 @@ WEB_QUERY = re.compile(
     r"\b(?:browse|fetch|internet|online|search the web|web search|website)\b|https://",
     re.IGNORECASE,
 )
+NEWS_QUERY = re.compile(r"\b(?:breaking\s+news|global\s+news|news|world\s+headlines?)\b", re.IGNORECASE)
+NEWS_COUNT = re.compile(r"\btop\s+(\d{1,2})\b", re.IGNORECASE)
 MARKET_PAIR = re.compile(r"\b([A-Z0-9]{2,12})[\s/_-]?(USDT|USDC|USD|EUR)\b", re.IGNORECASE)
+MARKET_ASSET_ALIASES = {
+    "ada": "ADA",
+    "avalanche": "AVAX",
+    "avax": "AVAX",
+    "bitcoin": "BTC",
+    "bnb": "BNB",
+    "btc": "BTC",
+    "cardano": "ADA",
+    "doge": "DOGE",
+    "dogecoin": "DOGE",
+    "eth": "ETH",
+    "ether": "ETH",
+    "ethereum": "ETH",
+    "link": "LINK",
+    "litecoin": "LTC",
+    "ltc": "LTC",
+    "sol": "SOL",
+    "solana": "SOL",
+    "xrp": "XRP",
+}
+MARKET_ASSET = re.compile(
+    r"\b(" + "|".join(sorted(map(re.escape, MARKET_ASSET_ALIASES), key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+MARKET_QUOTE = re.compile(r"\b(?:in|to|against|quoted\s+in)\s+(USDT|USDC|USD|EUR)\b", re.IGNORECASE)
 GIT_INSPECTION = re.compile(
     r"\b(?:git\s+diff|working\s+tree|uncommitted\s+changes?|changed\s+files?|current\s+diff)\b",
     re.IGNORECASE,
@@ -167,6 +194,22 @@ def classify_interaction(value: str) -> str:
     ):
         return "agent"
     return "ask"
+
+
+def _market_symbol(value: str) -> str | None:
+    asset = MARKET_ASSET.search(value)
+    pair = MARKET_PAIR.search(value)
+    if asset:
+        normalized_base = MARKET_ASSET_ALIASES[asset.group(1).casefold()]
+        if pair and MARKET_ASSET_ALIASES.get(pair.group(1).casefold()) == normalized_base:
+            return f"{normalized_base}{pair.group(2).upper()}"
+        quote = MARKET_QUOTE.search(value)
+        return f"{normalized_base}{quote.group(1).upper() if quote else 'USDT'}"
+    if pair and pair.group(1).casefold() not in {"in", "is", "of", "to"}:
+        base, quote = pair.groups()
+        normalized_base = MARKET_ASSET_ALIASES.get(base.casefold(), base.upper())
+        return f"{normalized_base}{quote.upper()}"
+    return None
 
 
 def _result(
@@ -470,6 +513,77 @@ class NedsterRuntime:
         self._emit("response.finished", "nedster", mode="agent")
         return result
 
+    async def _news_response(self, objective: str) -> dict[str, Any]:
+        count_match = NEWS_COUNT.search(objective)
+        count = min(max(int(count_match.group(1)) if count_match else 5, 1), 10)
+        query = "latest world news headlines today"
+        action = ToolAction(
+            tool="web_search",
+            arguments={"query": query, "limit": count},
+            reason="Retrieve current world-news headlines from public sources.",
+        )
+        self._emit("response.started", "user", mode="agent")
+        try:
+            request = self.tools.prepare(action)
+            token, reason = self.tools.authorize(request)
+            if not token:
+                raise PermissionError(reason)
+            self._emit("tool.authorized", "policy", tool=action.tool, risk="read")
+            output = await asyncio.to_thread(self.tools.execute, request, token)
+            self._emit("tool.completed", action.tool, result=output)
+        except Exception as exc:
+            self._emit("tool.failed", action.tool, error=f"{type(exc).__name__}: {exc}")
+            answer = "I could not retrieve current news from the configured public search providers."
+            self._remember(objective, answer)
+            self.last_mode = "agent"
+            result = _result(objective, answer, mode="agent", passed=False, grounded=True)
+            self._emit("response.finished", "nedster", mode="agent")
+            return result
+
+        headlines = list(output.get("results") or [])[:count]
+        if not headlines:
+            answer = "I could not retrieve any current news results from the configured providers."
+            passed = False
+        else:
+            retrieved = str(output.get("retrieved_at") or "unknown time").replace("T", " ")
+            lines = [f"Latest world-news results (retrieved {retrieved}):"]
+            for index, item in enumerate(headlines, 1):
+                title = " ".join(str(item.get("title") or "Untitled result").split())
+                url = str(item.get("url") or "")
+                snippet = " ".join(str(item.get("snippet") or "").split())
+                lines.append(f"{index}. {title}\n   {snippet}\n   {url}".rstrip())
+            answer = "\n\n".join(lines)
+            passed = len(headlines) == count
+        self._remember(objective, answer)
+        self.last_mode = "agent"
+        result = {
+            "objective": objective,
+            "answer": answer,
+            "passed": passed,
+            "mode": "agent",
+            "grounded": True,
+            "completed_steps": 1,
+            "total_steps": 1,
+            "results": [
+                {
+                    "step": {"id": "current-news", "title": "Retrieve current world news"},
+                    "verdict": {
+                        "passed": passed,
+                        "findings": [],
+                        "next_action": "" if passed else "Try another public news provider.",
+                        "answer": answer,
+                    },
+                    "answer": answer,
+                    "sources": [str(item.get("url") or "") for item in headlines],
+                    "evidence": [
+                        {"action": asdict(action), "result": {"ok": True, "output": output}}
+                    ],
+                }
+            ],
+        }
+        self._emit("response.finished", "nedster", mode="agent")
+        return result
+
     def _continued_objective(self, objective: str, mode: str) -> str:
         active = getattr(self, "active_objective", None)
         if active and mode != "agent" and FOLLOWUP_CRITERIA.search(objective.strip()):
@@ -516,11 +630,13 @@ class NedsterRuntime:
             self.last_mode = "ask"
             return _result(objective, answer)
 
-        market = MARKET_PAIR.search(objective)
-        if market and FRESHNESS_QUERY.search(objective):
-            market_result = await self._market_response(objective, "".join(market.groups()).upper())
+        market_symbol = _market_symbol(objective)
+        if market_symbol and FRESHNESS_QUERY.search(objective):
+            market_result = await self._market_response(objective, market_symbol)
             if market_result:
                 return market_result
+        if NEWS_QUERY.search(objective) and FRESHNESS_QUERY.search(objective):
+            return await self._news_response(objective)
 
         mode = classify_interaction(objective)
         continued = self._continued_objective(objective, mode)
@@ -911,8 +1027,8 @@ class NedsterRuntime:
                 break
         if not confirmed:
             return (
-                "INSUFFICIENT_CONTEXT — I inspected the active project, but the retrieved evidence "
-                "does not verify the requested conclusion."
+                "INSUFFICIENT_CONTEXT — The retrieved evidence does not verify the requested "
+                "conclusion."
             )
         bullets = "\n".join(f"- {finding}" for finding in confirmed)
         return (
