@@ -439,3 +439,31 @@ async def test_resume_repairs_interrupted_tool_calls_before_replaying(tmp_path):
         assert [message.role for message in repaired] == ["user", "assistant", "tool"]
         assert repaired[2].content == INTERRUPTED_TEXT
         assert repaired[2].tool_call_id == "c1"
+
+
+async def test_tui_session_turns_can_edit_files_and_undo(tmp_path):
+    """Regression (real TUI trace): submit() bypassed the core session, so every write failed with
+    'no open turn: file mutations are refused without a checkpoint turn'."""
+    import hashlib
+
+    from nedster_agent.tui import native_session
+    from tests.engine.fakes import ScriptedTransport, Turn, call
+
+    (tmp_path / "rng.py").write_bytes(b"x = 1\n")
+    sha = hashlib.sha256(b"x = 1\n").hexdigest()[:16]
+    config = NedsterConfig()
+    config.runtime.project_root = tmp_path
+    config.runtime.state_dir = tmp_path / "state"
+    config.runtime.context_tokens = 8192  # no Ollama lookup
+    session = native_session(config, lambda event: None)
+    try:
+        session.core.engine.transport = ScriptedTransport([
+            Turn(calls=[call("edit_file", "e1", path="rng.py", old="x = 1", new="x = 2", expected_sha=sha)]),
+            Turn("Changed x."),
+        ])
+        await session.submit("set x to 2 in rng.py")
+        assert (tmp_path / "rng.py").read_bytes() == b"x = 2\n"
+        report = session.undo_last()
+        assert (tmp_path / "rng.py").read_bytes() == b"x = 1\n", str(report)
+    finally:
+        await session.close()

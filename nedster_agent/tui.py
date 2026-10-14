@@ -78,6 +78,19 @@ class _WiredNativeSession(NativeSession):
 
     core: Any = None
 
+    async def submit(self, text: str) -> None:
+        # Through the core session, not the bare engine: it opens the checkpoint turn that file mutations need
+        # (and that /undo restores). /resume may have switched session_id, so the core follows it.
+        if self.core is None:
+            await super().submit(text)
+            return
+        self.core.session_id = self.session_id
+        await self.core.run(text)
+
+    def undo_last(self) -> Any:
+        self.core.session_id = self.session_id
+        return self.core.undo_last()
+
     async def close(self) -> None:
         if self.core is not None:
             await self.core.aclose()
