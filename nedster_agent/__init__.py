@@ -1,7 +1,21 @@
 """Nedster: a local-first AI coding and automation agent."""
 
-from ironclad.config import NedsterConfig, load_config
-from ironclad.orchestrator import NedsterRuntime
+from importlib import import_module
 
-__all__ = ["NedsterConfig", "NedsterRuntime", "load_config"]
-__version__ = "3.1.0a2"
+_EXPORTS = {
+    "NedsterConfig": "ironclad.config",
+    "load_config": "ironclad.config",
+    "NedsterRuntime": "ironclad.orchestrator",
+}
+
+__all__ = sorted(_EXPORTS)
+__version__ = "4.0.0a1"
+
+
+def __getattr__(name: str):
+    module = _EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module), name)
+    globals()[name] = value
+    return value
