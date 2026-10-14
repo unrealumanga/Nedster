@@ -286,7 +286,8 @@ class Engine:
             if spec.name in VALIDATABLE_TOOLS and VALIDATION_ARG not in props:
                 props[VALIDATION_ARG] = {
                     "type": "boolean",
-                    "description": "true when this command validates your change (tests, build, lint)",
+                    "description": "true only when this command runs the project's tests with a known runner "
+                    "(pytest, unittest, npm test, node --test, cargo test, go test); other commands never validate",
                 }
                 spec = replace(spec, parameters={**spec.parameters, "properties": props})
                 self._augmented.add(spec.name)
