@@ -6,8 +6,11 @@ are forwarded, by name (values come from the CLI's own filtered environment).
 
 ``--mount`` values are CSV-parsed by Docker, so host paths containing ``,``, ``"`` or a line
 break are refused instead of being allowed to inject mount options. ``.git`` and ``.nedster``
-are mounted read-only even when missing (see ``bwrap.protected_mounts``). On POSIX hosts the
-container runs as the invoking user; memory and CPUs are capped.
+are mounted read-only even when missing (see ``bwrap.protected_mounts``). On case-insensitive
+hosts (Windows/macOS) every case spelling of those two names is read-only too, so writing to
+e.g. ``/workspace/.GIT/config`` cannot slip past the ``/workspace/.git`` mount and reach the
+host's real ``.git``. On POSIX hosts the container runs as the invoking user; memory and
+CPUs are capped.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import contextlib
 import os
 import shutil
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 
@@ -27,6 +31,36 @@ FORWARDED = ("LANG", "TERM", "PYTHONIOENCODING")
 MOUNT_UNSAFE = frozenset(',"\r\n')
 DEFAULT_MEMORY = "4g"
 DEFAULT_CPUS = "2"
+# Host filesystems that fold case, so ``.GIT`` and ``.git`` are the same host directory.
+CASE_FOLDING_HOSTS = os.name == "nt" or sys.platform == "darwin"
+# Names whose case aliases must be protected on those hosts (matches bwrap.PROTECTED).
+PROTECTED_NAMES = (".git", ".nedster")
+
+
+def case_variants(name: str) -> tuple[str, ...]:
+    """Every case spelling of ``name``; non-letters (the leading dot) are left untouched."""
+    indexes = [index for index, char in enumerate(name) if char.isalpha()]
+    variants: list[str] = []
+    for mask in range(1 << len(indexes)):
+        chars = list(name)
+        for bit, index in enumerate(indexes):
+            chars[index] = chars[index].upper() if mask >> bit & 1 else chars[index].lower()
+        variants.append("".join(chars))
+    return tuple(variants)
+
+
+def _mount_alias_names(name: str, case_insensitive: bool) -> tuple[str, ...]:
+    """Mount names to cover for a protected path: all case variants on case-folding hosts."""
+    if case_insensitive and name.casefold() in PROTECTED_NAMES:
+        return case_variants(name)
+    return (name,)
+
+
+def mount_alias_relpaths(rel: str, case_insensitive: bool) -> tuple[str, ...]:
+    """Every in-container path spelling a protected ``rel`` needs so no case alias escapes read-only."""
+    parent, _, name = rel.rpartition("/")
+    names = _mount_alias_names(name, case_insensitive)
+    return tuple(f"{parent}/{item}" if parent else item for item in names)
 
 
 def mount_safe(path: str | Path) -> str:
@@ -55,6 +89,8 @@ class DockerBackend:
         self.memory, self.cpus = str(memory), str(cpus)
         self.binary = shutil.which("docker")
         self.empty = EmptyDir()
+        # Overridable so tests can exercise both branches on any host.
+        self.case_insensitive = CASE_FOLDING_HOSTS
 
     def _run(self, *args: str, timeout: float = 10) -> subprocess.CompletedProcess[bytes]:
         assert self.binary
@@ -104,8 +140,10 @@ class DockerBackend:
                 rel_protected = target.relative_to(self.root).as_posix()
             except ValueError:
                 continue  # a gitdir outside the project is not mounted at all
-            dst = mount_safe(f"{WORKSPACE}/{rel_protected}")
-            cmd.extend(["--mount", f"type=bind,src={mount_safe(source)},dst={dst},readonly"])
+            safe_source = mount_safe(source)
+            for alias in mount_alias_relpaths(rel_protected, self.case_insensitive):
+                dst = mount_safe(f"{WORKSPACE}/{alias}")
+                cmd.extend(["--mount", f"type=bind,src={safe_source},dst={dst},readonly"])
         cmd.extend(["--workdir", workdir, "--env", "TMPDIR=/tmp", "--env", "HOME=/tmp"])
         for key in env:
             if key in FORWARDED or key.startswith("LC_"):

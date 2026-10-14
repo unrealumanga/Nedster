@@ -32,7 +32,7 @@ def tools(root: Path) -> SearchTools:
 
 
 def force_python(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("ironclad.tool_runtime.search.shutil.which", lambda program: None)
+    monkeypatch.setattr("ironclad.tool_runtime.search.find_ripgrep", lambda root: None)
 
 
 def test_specs(tools: SearchTools):

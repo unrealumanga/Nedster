@@ -1,4 +1,9 @@
-"""search_text: ripgrep (``rg --json``) when on PATH, pure-Python fallback otherwise.
+"""search_text: ripgrep (``rg --json``) when a *trusted* one is available, pure-Python fallback otherwise.
+
+``rg`` is resolved exactly like every other trusted program (``exec.find_program`` over the
+allowlisted PATH): absolute, never from a relative PATH entry and never from inside the project
+(a planted ``./rg`` is ignored and the pure-Python search runs instead). The child gets the same
+allowlisted environment sandboxed commands use (``exec.build_env``), so secrets never pass.
 
 Literal by default; regex mode compiles the pattern up front so a bad expression is
 INVALID before anything runs. Output lines are ``relpath:line: text`` (``line-`` for
@@ -12,10 +17,13 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
+import weakref
 from pathlib import Path
 
 from ..contracts import ToolCall, ToolResult, ToolSpec, ToolStatus
 from ..types import RiskLevel
+from .exec import build_env, find_program, host_search_path
 from .files import Inventory, ToolError, locate, walk_inventory
 from .schema import validate
 
@@ -42,12 +50,34 @@ SEARCH_SCHEMA = {
 }
 
 
+def find_ripgrep(root: Path) -> Path | None:
+    """``rg`` resolved the same way ``Executor`` resolves trusted programs, or ``None``.
+
+    Reuses ``exec.find_program`` over ``exec.host_search_path`` (the user's PATH with relative
+    entries and every directory inside the project removed), so an ``rg`` planted in the project
+    or reached through a project PATH entry is never returned. ``None`` means "use the Python
+    fallback".
+    """
+    search_path = host_search_path(root, os.environ.get("PATH", ""))
+    return find_program("rg", search_path, root)
+
+
 class SearchTools:
     """Sync ToolRuntime exposing one read-only tool: ``search_text``."""
 
     def __init__(self, project_root: str | Path, *, inventory: Inventory | None = None):
         self.project_root = Path(project_root).resolve()
         self._inventory = inventory or walk_inventory
+        self._environment: dict[str, str] | None = None
+
+    def _child_env(self) -> dict[str, str]:
+        """Allowlisted environment for the rg child, built by the same ``exec.build_env`` used
+        for sandboxed commands (secrets dropped, PATH sanitized). Created once per instance."""
+        if self._environment is None:
+            temp = Path(tempfile.mkdtemp(prefix="nedster-search-"))
+            weakref.finalize(self, shutil.rmtree, str(temp), True)
+            self._environment = build_env(self.project_root, temp)
+        return dict(self._environment)
 
     def specs(self) -> list[ToolSpec]:
         return [
@@ -99,9 +129,9 @@ class SearchTools:
 
     def _search(self, call: ToolCall) -> ToolResult:
         pattern, regex, path, rel, base, max_results, context = self._prepare(call)
-        rg = shutil.which("rg")
-        if rg:
-            result = self._search_ripgrep(call, rg, pattern, rel, base, regex, max_results, context)
+        rg = find_ripgrep(self.project_root)
+        if rg is not None:
+            result = self._search_ripgrep(call, str(rg), pattern, rel, base, regex, max_results, context)
             if result is not None:
                 return result
         return self._search_python(call, pattern, path, rel, base, regex, max_results, context)
@@ -131,7 +161,7 @@ class SearchTools:
         if context:
             argv.append(f"--context={context}")
         argv.extend(["--", pattern, rel if rel != "." else "."])
-        env = dict(os.environ)
+        env = self._child_env()
         env["GIT_OPTIONAL_LOCKS"] = "0"
         try:
             proc = subprocess.run(
@@ -244,4 +274,4 @@ class SearchTools:
         return self._finish(call, lines, count, truncated, "python")
 
 
-__all__ = ["TOOLS", "SearchTools"]
+__all__ = ["TOOLS", "SearchTools", "find_ripgrep"]
