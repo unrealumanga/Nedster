@@ -294,15 +294,17 @@ async def test_legacy_escape_cancels_running_turn(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_native_engine_without_wiring_shows_setup_remedy(tmp_path):
+async def test_native_engine_is_wired_and_uses_the_session_store(tmp_path):
+    from nedster_agent.tui import _WiredNativeSession
+
     config = NedsterConfig()
     config.runtime.project_root = tmp_path
+    config.runtime.state_dir = tmp_path / "state"
     config.engine = "native"
     app = NedsterApp(config)
     async with app.run_test(size=(100, 30)) as pilot:
         await _ready(pilot, app)
-        assert "SETUP NEEDED" in str(app.query_one("#identity").render())
-        assert "native engine" in _transcript(app)
-        app.submit_text("hello")
-        await pilot.pause()
-        assert app.query_one("#prompt").text == "hello"  # kept, not lost
+        assert isinstance(app.session, _WiredNativeSession)
+        assert app.session.session_id == app.session.core.session_id
+        assert "SETUP NEEDED" not in str(app.query_one("#identity").render())
+    assert (tmp_path / "state" / "sessions.sqlite3").exists()

@@ -29,6 +29,7 @@ from .widgets.session import (
     EngineSession,
     EventCallback,
     LegacySession,
+    NativeSession,
     SessionEvent,
     SessionNote,
     failure_reason,
@@ -56,6 +57,36 @@ IDLE_ONLY = {"/new", "/resume", "/model", "/undo", "/sessions"}
 
 DoctorProvider = Callable[[NedsterConfig], Mapping[str, Mapping[str, Any]]]
 SessionFactoryFor = Callable[[NedsterConfig, EventCallback], EngineSession]
+
+
+class _WiredNativeSession(NativeSession):
+    """TUI adapter over ``ironclad.native.NativeSession``: shares its store/session and closes its resources."""
+
+    core: Any = None
+
+    async def close(self) -> None:
+        if self.core is not None:
+            await self.core.aclose()
+
+
+def native_session(config: NedsterConfig, emit: EventCallback) -> EngineSession:
+    from ironclad.native import NativeSession as CoreSession
+
+    holder: dict[str, CoreSession] = {}
+
+    def build(engine_emit: Callable[[Any], None]) -> Any:
+        holder["core"] = CoreSession(config, emit=engine_emit, resume_latest=False)
+        return holder["core"].engine
+
+    session = _WiredNativeSession(build, emit, endpoint=config.models.ollama_url)
+    core = holder["core"]
+    info = core.info()
+    session.core = core
+    session.store = core.store
+    session.session_id = core.session_id
+    session.project_root = info["project_root"]
+    session.sandbox, session.isolation = info["sandbox"], info["isolation"]
+    return session
 
 
 def _default_doctor(config: NedsterConfig) -> Mapping[str, Mapping[str, Any]]:
@@ -247,10 +278,7 @@ class NedsterApp(App[None]):
         if self.session_factory is not None:
             return self.session_factory(self.config, self.handle_event)
         if self.config.engine == "native":
-            raise RuntimeError(
-                "the native engine is not wired into the TUI on this build; "
-                'set engine = "legacy" (or NEDSTER_ENGINE=legacy)'
-            )
+            return native_session(self.config, self.handle_event)
         return LegacySession(self.config, self.handle_event, runtime_class=NedsterRuntime)
 
     async def _initialize(self) -> None:

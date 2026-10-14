@@ -52,6 +52,8 @@ from ironclad.engine.state import Budget, TaskState, ToolRecord
 
 REPEAT_LIMIT = 3
 VALIDATION_ARG = "validation"
+EVENT_OUTPUT_CHARS = 4_000  # bounded tool output carried on tool.finished for UIs
+EVENT_DATA_KEYS = ("exit_code", "tests_run", "tests_failed", "diff", "backend", "isolation")
 VALIDATABLE_TOOLS = frozenset({"run_command"})
 COMPACTED: EventKind = cast(EventKind, "context.compacted")  # proposed addition to contracts.EventKind
 JOB_STOP_TIMEOUT_S = 10.0
@@ -372,6 +374,8 @@ class Engine:
                 "summary": _first_line(result.output),
                 "mutated_paths": list(result.mutated_paths),
                 "elapsed_ms": result.elapsed_ms,
+                "output": result.output[:EVENT_OUTPUT_CHARS],
+                **{key: result.data[key] for key in EVENT_DATA_KEYS if key in result.data},
             },
         )
         return record
