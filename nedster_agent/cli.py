@@ -4,7 +4,11 @@ import argparse
 import json
 import os
 import sys
+import threading
+import time
+from contextlib import suppress
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +77,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--jsonl", action="store_true", help="Emit an event stream, one JSON object per line")
     run.add_argument("--engine", choices=("native", "legacy"), default=None, help="Agent engine (default: configuration)")
     run.add_argument("--model", default=None, help="Worker model for the native engine (default: configuration)")
+    run.add_argument(
+        "--expect",
+        choices=("change", "answer"),
+        default=None,
+        help="What a successful run must do: change files, or only answer (default: inferred from the objective)",
+    )
     run.add_argument("--continue", dest="resume_latest", action="store_true", help="Continue the latest session here")
     run.add_argument("--session", default=None, help="Continue a specific session id")
     tui = subcommands.add_parser("tui", help="Open the interactive terminal interface")
@@ -84,6 +94,35 @@ def build_parser() -> argparse.ArgumentParser:
     config = subcommands.add_parser("config", help="Inspect the effective configuration")
     accept_global_options(config)
     config.add_argument("action", nargs="?", choices=("show",), default="show")
+
+    sessions = subcommands.add_parser(
+        "sessions", help="List, show, delete or prune the saved sessions of this project"
+    )
+    accept_global_options(sessions)
+    session_actions = sessions.add_subparsers(dest="action")
+    sessions.set_defaults(action="list")  # `nedster sessions` alone lists (argparse has no subparser default)
+    sessions_list = session_actions.add_parser("list", help="Saved sessions, newest first (default)")
+    accept_global_options(sessions_list)
+    sessions_show = session_actions.add_parser("show", help="One session: metadata + stored transcript")
+    accept_global_options(sessions_show)
+    sessions_show.add_argument("session_id", help="Session id or unique prefix")
+    sessions_delete = session_actions.add_parser(
+        "delete", help="Delete a session; refused while the session is active (locked)"
+    )
+    accept_global_options(sessions_delete)
+    sessions_delete.add_argument("session_id", help="Session id or unique prefix")
+    sessions_prune = session_actions.add_parser(
+        "prune", help="Delete tool outputs older than a cutoff that no message or task state references"
+    )
+    accept_global_options(sessions_prune)
+    sessions_prune.add_argument(
+        "--older-than",
+        dest="older_than",
+        type=float,
+        required=True,
+        metavar="DAYS",
+        help="Only outputs older than DAYS are candidates (required)",
+    )
     return parser
 
 
@@ -308,12 +347,14 @@ def _setup(args: argparse.Namespace) -> int:
 def _doctor(args: argparse.Namespace) -> int:
     from ironclad.hardware import doctor_report
 
-    from .model_manager import OllamaManager, readiness
+    from .model_manager import OllamaManager, context_report, readiness
 
     config, _ = _resolve(args)
     report = doctor_report()
     manager = OllamaManager(config.models.ollama_url)
     tiers = readiness(config, manager)
+    context = context_report(config, manager) if tiers["inference"]["ready"] else None
+    report["context"] = context
     from ironclad.config import config_dir
 
     config_path = config_dir() / "config.toml"
@@ -347,6 +388,12 @@ def _doctor(args: argparse.Namespace) -> int:
             tier = tiers[key]
             mark = "ready" if tier["ready"] else "NOT READY"
             console.print(_ascii(f"{label:<16}{mark} · {tier.get('detail', '')}", args.ascii), highlight=False, markup=False)
+        if context:
+            kv = f"KV {context['kv_cache_type']}, flash attention {'on' if context['flash_attention'] else 'off'}"
+            line = f"{'context':<16}model {context['num_ctx'] or '?'} tokens · engine budget {context['engine_budget']} · {kv}"
+            console.print(_ascii(line, args.ascii), highlight=False, markup=False)
+            for tip in context["advice"]:  # type: ignore[union-attr]
+                console.print(_ascii(f"  tip: {tip}", args.ascii), highlight=False, markup=False)
     for warning in config.warnings:
         _err(f"config warning: {warning}")
     for key, label in labels.items():
@@ -421,6 +468,57 @@ async def _run_objective(args: argparse.Namespace, objective: str) -> int:
     return EXIT_OK if passed else EXIT_RUNTIME
 
 
+class _SessionHeartbeat:
+    """Refreshes the activity lock of the session a `nedster run` is using, then releases it.
+
+    Keeps `sessions delete` from (and against) a long CLI run in another terminal: while the lock is
+    live the store refuses to delete the session, and the run notices a takeover and re-acquires.
+    """
+
+    def __init__(self, store: Any, session_id: str, owner: str, interval_s: float = 10.0) -> None:
+        self._store, self._session_id, self._owner, self._interval = store, session_id, owner, interval_s
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="nedster-session-lock", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self._interval):
+            try:
+                renewed = bool(self._store.refresh_lock(self._session_id, self._owner))
+                if not renewed:
+                    renewed = bool(self._store.acquire_lock(self._session_id, self._owner))
+            except Exception:  # noqa: BLE001 - a dead store ends the heartbeat, never the run
+                return
+            if not renewed:
+                return
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+        with suppress(Exception):
+            self._store.release_lock(self._session_id, self._owner)
+
+
+def _lock_run_session(session: Any) -> _SessionHeartbeat | None:
+    """Take the activity lock for a CLI run; None (with a stderr note) when it cannot be held."""
+    from ironclad.session_store.sqlite_store import make_owner
+
+    store = getattr(session, "store", None)
+    acquire = getattr(store, "acquire_lock", None)
+    session_id = str(getattr(session, "session_id", ""))
+    if not callable(acquire) or not session_id:
+        return None
+    owner = make_owner("run")
+    try:
+        acquired = bool(acquire(session_id, owner))
+    except Exception:  # noqa: BLE001 - never block a run on the lock layer
+        return None
+    if not acquired:
+        _err(f"[warning] session {session_id[:8]} is active in another Nedster; continuing anyway")
+        return None
+    return _SessionHeartbeat(store, session_id, owner)
+
+
 async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> int:
     from dataclasses import asdict
 
@@ -436,9 +534,14 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> 
     session = NativeSession(
         config, emit=emit, model=args.model, session_id=args.session, resume_latest=args.resume_latest
     )
+    heartbeat = _lock_run_session(session)
     try:
-        result = await session.run(objective)
+        from ironclad.engine.intent import parse_expect
+
+        result = await session.run(objective, intent=parse_expect(getattr(args, "expect", None)))
     finally:
+        if heartbeat is not None:
+            heartbeat.close()  # releases the lock; before aclose() closes the store
         await session.aclose()
     if args.json:
         payload = asdict(result)
@@ -488,6 +591,163 @@ def _permissions(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# --- sessions ------------------------------------------------------------------------------
+
+SHOW_TRANSCRIPT_LIMIT = 100  # entries `sessions show` prints without --json
+SHOW_ENTRY_CHARS = 400
+
+
+def _stamp(ns: int) -> str:
+    return datetime.fromtimestamp(int(ns) / 1e9).strftime("%Y-%m-%d %H:%M") if ns else ""
+
+
+def _clip(text: str, limit: int = SHOW_ENTRY_CHARS) -> str:
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
+def _lock_label(lock: Any) -> str:
+    if not lock:
+        return "none"
+    owner = str(lock.get("owner") or "")
+    if lock.get("active"):
+        pid = lock.get("pid")
+        return f"active (pid {pid}) held by {owner}"
+    return f"idle, stale lock by {owner}"
+
+
+def _find_session(store: Any, project_root: Path, wanted: str) -> dict[str, Any]:
+    """Project-bound lookup: only sessions of *this* canonical root can be shown or deleted."""
+    sessions = store.list_sessions(str(project_root), limit=10_000)
+    matches = [entry for entry in sessions if str(entry["id"]).startswith(wanted)]
+    if not matches:
+        raise UsageError(f"no session matches {wanted!r} in this project ({project_root})")
+    if len(matches) > 1:
+        raise UsageError(f"{wanted!r} matches {len(matches)} sessions; give a longer id")
+    return matches[0]
+
+
+def _sessions_list(args: argparse.Namespace, store: Any, project_root: Path) -> int:
+    sessions = store.list_sessions(str(project_root), limit=50)
+    rows = [{**entry, "active": bool(store.is_active(entry["id"]))} for entry in sessions]
+    if args.json:
+        _emit_json({"project_root": str(project_root), "sessions": rows})
+        return EXIT_OK
+    if not rows:
+        if not args.plain:
+            print("No saved sessions for this project.")
+        return EXIT_OK
+    if args.plain:
+        for row in rows:
+            flag = "active" if row["active"] else "-"
+            print(f"{row['id']}\t{_stamp(row['updated_ns'])}\t{flag}\t{row['title']}")
+        return EXIT_OK
+    print(f"{'id':<34}{'updated':<18}{'state':<9}title")
+    for row in rows:
+        flag = "active" if row["active"] else ""
+        print(f"{row['id']:<34}{_stamp(row['updated_ns']):<18}{flag:<9}{row['title']}")
+    print(f"{len(rows)} session(s). Actions: nedster sessions show|delete <id>, nedster sessions prune --older-than DAYS")
+    return EXIT_OK
+
+
+def _sessions_show(args: argparse.Namespace, store: Any, project_root: Path) -> int:
+    session = _find_session(store, project_root, args.session_id)
+    session_id = str(session["id"])
+    entries = store.transcript(session_id, limit=SHOW_TRANSCRIPT_LIMIT)
+    report = store.outputs_report(session_id)
+    lock = store.lock_info(session_id)
+    payload = {
+        "session": session,
+        "messages": len(store.messages(session_id)),
+        "transcript_total": store.transcript_count(session_id),
+        "transcript_limit": SHOW_TRANSCRIPT_LIMIT,
+        "entries": entries,
+        "outputs": report,
+        "state_keys": store.state_keys(session_id),
+        "lock": lock,
+    }
+    if args.json:
+        _emit_json(payload)
+        return EXIT_OK
+    print(f"session     {session_id}")
+    print(f"title       {session['title']}")
+    print(f"project     {session['project_root']}")
+    print(f"created     {_stamp(session['created_ns'])}")
+    print(f"updated     {_stamp(session['updated_ns'])}")
+    print(f"messages    {payload['messages']}")
+    print(f"transcript  {payload['transcript_total']} entries (showing {len(entries)})")
+    print(
+        f"outputs     {report['total']} total, {report['referenced']} referenced, "
+        f"{report['unreferenced']} prunable"
+    )
+    print(f"state       {', '.join(payload['state_keys']) or '-'}")
+    print(f"lock        {_lock_label(lock)}")
+    print("--- transcript ---")
+    if not entries:
+        print("(no transcript stored for this session)")
+    for entry in entries:
+        body = _clip(entry["text"])
+        print(f"[{entry['role']}] {body}" if body else f"[{entry['role']}]")
+    return EXIT_OK
+
+
+def _sessions_delete(args: argparse.Namespace, store: Any, project_root: Path) -> int:
+    session = _find_session(store, project_root, args.session_id)
+    session_id = str(session["id"])
+    if not store.delete_session(session_id):  # atomically refused while a live lock exists
+        _err(f"nedster: session {session_id} is active (locked); close it in the other Nedster and retry")
+        return EXIT_RUNTIME
+    if args.json:
+        _emit_json({"deleted": True, "id": session_id})
+    else:
+        print(f"Deleted session {session_id}.")
+    return EXIT_OK
+
+
+def _sessions_prune(args: argparse.Namespace, store: Any, project_root: Path) -> int:
+    days = float(args.older_than)
+    if not 0 < days < 1_000_000:  # positive, finite, and never older than the store itself
+        raise UsageError("--older-than must be a positive number of days")
+    cutoff_ns = time.time_ns() - int(days * 86_400 * 1e9)
+    stats = store.prune_outputs(str(project_root), cutoff_ns=cutoff_ns)
+    payload = {"project_root": str(project_root), "older_than_days": days, "cutoff_ns": cutoff_ns, **stats}
+    if args.json:
+        _emit_json(payload)
+        return EXIT_OK
+    if args.plain:
+        for key in ("sessions", "outputs", "deleted", "retained_referenced", "retained_recent"):
+            print(f"{key}\t{stats[key]}")
+        return EXIT_OK
+    print(f"Scanned {stats['sessions']} session(s), {stats['outputs']} output(s) older than {days:g} day(s).")
+    print(f"Deleted {stats['deleted']} unreferenced output(s).")
+    print(f"Kept {stats['retained_referenced']} referenced by a message or task state.")
+    print(f"Kept {stats['retained_recent']} newer than the cutoff.")
+    if stats["outputs"] == stats["retained_referenced"] + stats["retained_recent"]:
+        print("Nothing was prunable.")
+    return EXIT_OK
+
+
+def _sessions(args: argparse.Namespace) -> int:
+    from ironclad.session_store.sqlite_store import SqliteSessionStore
+
+    config, _ = _resolve(args)
+    project_root = Path(config.runtime.project_root)
+    store = SqliteSessionStore(Path(config.runtime.state_dir) / "sessions.sqlite3")
+    try:
+        action = str(getattr(args, "action", None) or "list")
+        if action == "show":
+            return _sessions_show(args, store, project_root)
+        if action == "delete":
+            return _sessions_delete(args, store, project_root)
+        if action == "prune":
+            return _sessions_prune(args, store, project_root)
+        if action == "list":
+            return _sessions_list(args, store, project_root)
+        raise UsageError(f"unknown sessions action: {action}")
+    finally:
+        store.close()
+
+
 def _tui_or_help(args: argparse.Namespace) -> int:
     machine = args.json or args.plain or args.no_tui
     interactive_tui = not machine and sys.stdout.isatty()
@@ -522,6 +782,8 @@ def _dispatch(args: argparse.Namespace) -> int:
         return _verify_ledger(args)
     if command == "permissions":
         return _permissions(args)
+    if command == "sessions":
+        return _sessions(args)
     if command == "run":
         import asyncio
 
@@ -538,7 +800,17 @@ def _map_error(exc: Exception) -> tuple[str, int]:
     return f"{type(exc).__name__}: {exc}" if not str(exc) else str(exc), EXIT_RUNTIME
 
 
+def _utf8_streams() -> None:
+    """Pipes on Windows default to the ANSI code page, which turns every non-ASCII glyph into mojibake."""
+    for stream in (sys.stdout, sys.stderr):
+        encoding = (getattr(stream, "encoding", None) or "").lower().replace("-", "")
+        if encoding != "utf8" and hasattr(stream, "reconfigure"):
+            with suppress(OSError, ValueError):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main(argv: list[str] | None = None) -> int:
+    _utf8_streams()
     args = build_parser().parse_args(argv)
     try:
         return _dispatch(args)

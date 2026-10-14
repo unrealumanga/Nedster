@@ -36,17 +36,25 @@ from ironclad.contracts import (
     TurnFinished,
 )
 from ironclad.engine import acceptance
-from ironclad.engine.acceptance import StopReason
+from ironclad.engine.acceptance import (
+    DECLARE_NO_CHANGE,
+    DECLARE_NO_CHANGE_SPEC,
+    StopReason,
+    declare_no_change_result,
+)
 from ironclad.engine.context import (
     SHOW_OUTPUT,
     SHOW_OUTPUT_SPEC,
     ContextManager,
     Estimator,
     OutputVault,
+    SummaryData,
+    completion_reserve,
     estimate_tokens,
     run_show_output,
     tool_message,
 )
+from ironclad.engine.intent import Intent, classify
 from ironclad.engine.prompt import build_system_prompt, project_facts
 from ironclad.engine.state import Budget, TaskState, ToolRecord
 
@@ -56,8 +64,12 @@ EVENT_OUTPUT_CHARS = 4_000  # bounded tool output carried on tool.finished for U
 EVENT_DATA_KEYS = ("exit_code", "tests_run", "tests_failed", "diff", "backend", "isolation")
 VALIDATABLE_TOOLS = acceptance.FLAGGABLE_TOOLS
 TRUNCATED = ("length", "error")  # done reasons whose tool calls may be cut off: never executed
+COMPACTION_STATE = "compaction_state"  # session state: {"compactions": n, "summary": SummaryData.to_dict()}
+CONTEXT_EXHAUSTED = "context budget exhausted: the request cannot fit the model window even after compaction"
 COMPACTED: EventKind = cast(EventKind, "context.compacted")  # proposed addition to contracts.EventKind
 JOB_STOP_TIMEOUT_S = 10.0
+ENGINE_TOOLS = frozenset({SHOW_OUTPUT, DECLARE_NO_CHANGE})  # answered by the engine itself; never mutate
+TRANSCRIPT_TEXT_CHARS = 2_000
 
 Stop = tuple[StopReason, str]
 
@@ -70,6 +82,7 @@ class _Session:
     vault: OutputVault
     context: ContextManager
     records: list[ToolRecord] = field(default_factory=list)  # all runs, for task state
+    compactions: int = 0  # every compaction (mask or whole-group), persisted so a restart keeps counting
 
 
 @dataclass(slots=True)
@@ -82,10 +95,23 @@ class _Run:
     tokens: int = 0
     invalid: dict[str, int] = field(default_factory=dict)
     prose: str = ""
+    intent: Intent = Intent.UNKNOWN  # what this user message asks for; decides whether "no change" can pass
 
 
 def _signature(call: ToolCall) -> str:
     return call.name + json.dumps(dict(call.arguments), sort_keys=True, default=str)
+
+
+def _latest_change(records: Sequence[ToolRecord]) -> int | None:
+    """Highest workspace revision produced by a change (not by a validation) among all session records."""
+    rejected = (ToolStatus.INVALID, ToolStatus.DENIED)
+    bumps = [
+        r.revision_after.counter
+        for r in records
+        if (r.result.status is ToolStatus.OK and r.result.mutated_paths)
+        or (r.bumped and r.result.status not in rejected and acceptance.validation_verdict(r) is None)
+    ]
+    return max(bumps) if bumps else None
 
 
 def _first_line(text: str) -> str:
@@ -152,6 +178,7 @@ class Engine:
         estimator: Estimator = estimate_tokens,
         think: bool | str = False,
         temperature: float | None = None,
+        completion_reserve_tokens: int | None = None,
     ) -> None:
         self.transport = transport
         self.tools = tools
@@ -163,6 +190,7 @@ class Engine:
         self.estimator = estimator
         self.think = think
         self.temperature = temperature
+        self.completion_reserve_tokens = completion_reserve_tokens
         self.last_answer = ""
         self._sessions: dict[str, _Session] = {}
         self._running: set[JobHandle] = set()
@@ -181,9 +209,11 @@ class Engine:
         """Current active context (system, pinned state, history) of a session."""
         return list(self._session(session_id).messages)
 
-    async def run(self, session_id: str, user_text: str) -> AcceptanceResult:
+    async def run(self, session_id: str, user_text: str, *, intent: Intent | None = None) -> AcceptanceResult:
+        """Run one user message. ``intent`` (e.g. from ``--expect``) overrides the deterministic classifier."""
         session = self._session(session_id)
-        run = _Run(uuid.uuid4().hex[:12], time.monotonic())
+        run = _Run(uuid.uuid4().hex[:12], time.monotonic(), intent=classify(user_text, intent))
+        session.state.intent = run.intent.value
         self._event("turn.started", session, run, {"user_text": user_text})
         self._task = asyncio.create_task(self._drive(session, run, user_text))
         try:
@@ -216,8 +246,13 @@ class Engine:
             ChatMessage(role="system", content=state.render()),
             *history,
         ]
-        context = ContextManager(self.budget.context_tokens, vault, self.estimator)
-        session = _Session(session_id, messages, state, vault, context)
+        reserve = self.completion_reserve_tokens
+        if reserve is None:
+            reserve = completion_reserve(self.budget.context_tokens)
+        context = ContextManager(self.budget.context_tokens, vault, self.estimator, reserve_tokens=reserve)
+        saved = (store.get_state(session_id, COMPACTION_STATE) if store else None) or {}
+        context.summary = SummaryData.from_dict(saved.get("summary"))
+        session = _Session(session_id, messages, state, vault, context, compactions=int(saved.get("compactions", 0)))
         self._sessions[session_id] = session
         return session
 
@@ -252,6 +287,8 @@ class Engine:
             specs.append(spec)
         if all(s.name != SHOW_OUTPUT for s in specs):
             specs.append(SHOW_OUTPUT_SPEC)
+        if all(s.name != DECLARE_NO_CHANGE for s in specs):
+            specs.append(DECLARE_NO_CHANGE_SPEC)
         self._validating = {s.name for s in specs if s.validates}
         return specs
 
@@ -282,6 +319,8 @@ class Engine:
             if budget.max_tokens is not None and run.tokens >= budget.max_tokens:
                 return "budget", f"token budget exhausted ({run.tokens}/{budget.max_tokens})"
             self._maybe_compact(session, run, specs)
+            if not session.context.fits(session.messages, specs):
+                return "budget", CONTEXT_EXHAUSTED
             message, done_reason = await self._model_turn(session, run, specs)
             run.steps += 1
             self._append(session, message)
@@ -361,7 +400,7 @@ class Engine:
 
         def mutating(call: ToolCall) -> bool:
             spec = by_name.get(call.name)
-            return spec.mutates if spec is not None else call.name != SHOW_OUTPUT
+            return spec.mutates if spec is not None else call.name not in ENGINE_TOOLS
 
         answered: set[int] = set()  # indexes into calls (ids are not guaranteed unique)
         tasks: list[asyncio.Task[ToolRecord]] = []
@@ -423,6 +462,8 @@ class Engine:
         before = self.tools.revision()
         if call.name == SHOW_OUTPUT:
             result = run_show_output(session.vault, call, self.budget.max_output_chars)
+        elif call.name == DECLARE_NO_CHANGE:
+            result = declare_no_change_result(call.arguments, call.id)
         else:
             result = await self._start_and_wait(self._runtime_call(call))
         record = ToolRecord(call, result, before, self.tools.revision(), mutating, validation)
@@ -486,10 +527,17 @@ class Engine:
         if not session.context.over(session.messages, specs):
             return
         protect = self._failing_validation(session)
-        compaction = session.context.compact(session.messages, specs, protect=protect)
-        if compaction is None:  # nothing left to mask: keep the prefix instead of churning the pinned state
+        compaction = session.context.compact(
+            session.messages,
+            specs,
+            protect=protect,
+            records=session.records,
+            latest_change=_latest_change(session.records),
+        )
+        if compaction is None:  # nothing left to drop: keep the prefix instead of churning the pinned state
             return
-        current = acceptance.evaluate(run.records)
+        session.compactions += 1
+        current = acceptance.evaluate(run.records, intent=run.intent)
         session.state.validation = acceptance.validation_status(session.records)
         session.state.obligations = acceptance.obligations(run.records, current) if run.records else []
         session.messages[1] = ChatMessage(role="system", content=session.state.render())
@@ -498,11 +546,19 @@ class Engine:
             if callable(replace_messages):
                 replace_messages(session.session_id, session.messages[2:])
             self.store.set_state(session.session_id, "task_state", session.state.to_dict())
+            self.store.set_state(
+                session.session_id,
+                COMPACTION_STATE,
+                {"compactions": session.compactions, "summary": session.context.summary.to_dict()},
+            )
         data = {
             "elided": compaction.elided,
             "handles": list(compaction.handles),
             "tokens_before": compaction.tokens_before,
             "tokens_after": compaction.tokens_after,
+            "compaction": session.compactions,
+            "stage": compaction.stage,
+            "dropped_groups": compaction.dropped_groups,
         }
         self._event(COMPACTED, session, run, data)
 
@@ -518,9 +574,29 @@ class Engine:
         session.messages.append(message)
         if self.store is not None:
             self.store.append_message(session.session_id, message)
+            self._transcript(session, message)
+
+    def _transcript(self, session: _Session, message: ChatMessage) -> None:
+        """Display history for /resume: separate from (and never rewritten by) model-history compaction."""
+        append = getattr(self.store, "append_transcript", None)
+        if not callable(append):
+            return
+        meta: dict[str, Any] = {}
+        text = message.content or ""
+        if message.role == "assistant":
+            if message.tool_calls:
+                meta["tool_calls"] = [call.name for call in message.tool_calls]
+            if message.thinking:
+                meta["thinking"] = message.thinking[:TRANSCRIPT_TEXT_CHARS]
+            if not text and not meta:
+                return
+        elif message.role == "tool":
+            meta.update(tool=message.name, call_id=message.tool_call_id)
+            text = _first_line(text)
+        append(session.session_id, message.role, text[:TRANSCRIPT_TEXT_CHARS], meta)
 
     def _finish(self, session: _Session, run: _Run, stop: StopReason, detail: str) -> AcceptanceResult:
-        result = acceptance.evaluate(run.records, stop, detail)
+        result = acceptance.evaluate(run.records, stop, detail, intent=run.intent)
         session.state.validation = acceptance.validation_status(session.records)
         session.state.obligations = acceptance.obligations(run.records, result)
         if self.store is not None:
@@ -528,6 +604,9 @@ class Engine:
         prose = run.prose.strip()
         summary = acceptance.render_summary(run.records, result)
         self.last_answer = f"{prose}\n\n{summary}" if prose else summary
+        append = getattr(self.store, "append_transcript", None) if self.store is not None else None
+        if callable(append):
+            append(session.session_id, "assistant", summary[:TRANSCRIPT_TEXT_CHARS], {"outcome": result.outcome.value})
         self._event(
             "acceptance",
             session,

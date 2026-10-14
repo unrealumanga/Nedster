@@ -74,6 +74,7 @@ class RuntimeConfig:
     answer_max_tokens: int = 768
     conversation_history_chars: int = 6_000
     max_grounding_sources: int = 5
+    context_tokens: int = 0  # engine context budget; 0 = the worker model's num_ctx (from Ollama), else 32768
 
 
 @dataclass(slots=True)

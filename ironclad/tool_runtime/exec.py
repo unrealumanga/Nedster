@@ -840,10 +840,39 @@ class Executor:
         )
         if has_python_tests:
             # resolve_argv swaps in the project's venv interpreter when it is a verified one.
-            return ["python" if IS_WINDOWS else "python3", "-m", "pytest", "-q"]
+            python = "python" if IS_WINDOWS else "python3"
+            if self._uses_pytest():
+                return [python, "-m", "pytest", "-q"]
+            tests = root / "tests"
+            if tests.is_dir() and not (tests / "__init__.py").is_file() and not any(root.glob("test_*.py")):
+                return [python, "-m", "unittest", "discover", "-s", "tests", "-t", "."]
+            return [python, "-m", "unittest", "discover"]
         raise ArgumentError(
             "could not detect a test suite (no Cargo.toml, go.mod, package.json or Python tests)"
         )
+
+    def _uses_pytest(self) -> bool:
+        """Static evidence only (nothing is executed): pytest config, a conftest, or pytest in the verified venv.
+
+        Without it a plain ``python -m pytest`` usually fails with "No module named pytest", so stdlib unittest is used.
+        """
+        root = self.project_root
+        if (root / "pytest.ini").is_file() or (root / "conftest.py").is_file() or (root / "tests" / "conftest.py").is_file():
+            return True
+        for name in ("pyproject.toml", "setup.cfg", "tox.ini"):
+            try:
+                if "pytest" in (root / name).read_text(encoding="utf-8", errors="replace")[:200_000]:
+                    return True
+            except OSError:
+                continue
+        if self._container():
+            return False
+        venv = self.venv_python()
+        if venv is not None:
+            lib = root / ".venv" / ("Lib" if IS_WINDOWS else "lib")
+            patterns = ("site-packages/pytest",) if IS_WINDOWS else ("python3*/site-packages/pytest",)
+            return any(path.is_dir() for pattern in patterns for path in lib.glob(pattern))
+        return find_program("pytest", self._search_path, self.project_root) is not None
 
     def _container(self) -> bool:
         backend = self.selection().backend

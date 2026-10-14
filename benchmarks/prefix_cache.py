@@ -1,11 +1,16 @@
 """Prove KV prefix reuse on a real Ollama: cold vs warm vs mutated-early-message requests.
 
     python -m benchmarks.prefix_cache --model nedster-worker [--url http://127.0.0.1:11434] [--kv-info]
+    python -m benchmarks.prefix_cache --dry-run        # offline: no network, no model; checks request construction
+
+Byte equality of the request prefix is necessary but not sufficient for cache reuse; the real run compares
+prompt_eval_count/duration (cold vs warm) reported by Ollama. Run it only when the GPU is free.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -30,6 +35,20 @@ def conversation(first_user: str) -> list[list[dict]]:
     turn2 = [*base, call, result, {"role": "user", "content": "Now summarise it in one sentence."}]
     turn3 = [*turn2, {"role": "assistant", "content": "It defines add."}, {"role": "user", "content": "Any bugs?"}]
     return [base, turn2, turn3]
+
+
+def dry_run() -> int:
+    """Offline: build the three requests per series and verify the prefix properties the real run relies on."""
+    cold, warm, mutated = (conversation(u) for u in ("a.py", "a.py", "b.py"))
+    wire = [[json.dumps({"messages": m, "tools": TOOLS}, sort_keys=True) for m in series] for series in (cold, warm)]
+    assert wire[0] == wire[1], "identical conversations must serialise identically"
+    for series in (cold, warm, mutated):  # each turn extends the previous one
+        for prev, nxt in zip(series, series[1:], strict=False):
+            assert nxt[: len(prev)] == prev
+    assert mutated[0][1] != cold[0][1] and mutated[0][0] == cold[0][0]
+    print(f"dry-run ok: 3 series x {len(cold)} requests; request chars " + ", ".join(str(len(w)) for w in wire[0]))
+    print("no model was contacted; run without --dry-run (GPU free) to measure cold vs warm prefill")
+    return 0
 
 
 def ms(ns: int | None) -> float:
@@ -82,7 +101,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default="nedster-worker")
     parser.add_argument("--url", default=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"))
     parser.add_argument("--kv-info", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="offline check of request construction; no network")
     args = parser.parse_args(argv)
+    if args.dry_run:
+        return dry_run()
     url = args.url if "://" in args.url else f"http://{args.url}"
     if args.kv_info:
         for key, value in kv_info().items():

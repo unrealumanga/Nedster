@@ -255,6 +255,8 @@ def test_run_tests_resolves_runner_before_execution(tmp_path: Path):
         with pytest.raises(ArgumentError):
             ex.resolve_argv(ToolCall("c", "run_tests", {}))
         (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+        assert ex.detect_test_argv()[1:] == ["-m", "unittest", "discover"]  # no evidence the project uses pytest
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n[tool.pytest.ini_options]\n", encoding="utf-8")
         assert ex.detect_test_argv()[1:] == ["-m", "pytest", "-q"]
         argv = ex.resolve_argv(ToolCall("c", "run_tests", {}))
         assert Path(argv[0]).is_absolute() and argv[1:] == ["-m", "pytest", "-q"]
@@ -469,3 +471,21 @@ async def test_host_cancel_is_honest_about_detached_processes(executor: Executor
     assert result.status is ToolStatus.CANCELLED
     assert "not tracked on the host backend" in result.output
     assert "docker" in result.data["remedy"]
+
+
+def test_python_runner_is_chosen_from_static_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    ex = Executor(tmp_path, SandboxConfig())
+    monkeypatch.setattr(ex, "_container", lambda: False)
+    try:
+        monkeypatch.setattr("ironclad.tool_runtime.exec.find_program", lambda *a: None)
+        (tmp_path / "test_a.py").write_text("", encoding="utf-8")
+        assert ex.detect_test_argv()[1:] == ["-m", "unittest", "discover"]
+        (tmp_path / "conftest.py").write_text("", encoding="utf-8")
+        assert ex.detect_test_argv()[1:] == ["-m", "pytest", "-q"]
+        (tmp_path / "conftest.py").unlink()
+        (tmp_path / "test_a.py").unlink()
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_b.py").write_text("", encoding="utf-8")
+        assert ex.detect_test_argv()[1:] == ["-m", "unittest", "discover", "-s", "tests", "-t", "."]
+    finally:
+        ex.close()

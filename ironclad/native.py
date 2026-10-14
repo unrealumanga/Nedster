@@ -9,6 +9,7 @@ from typing import Any
 from .contracts import AcceptanceResult, EngineEvent
 
 DEFAULT_WORKER = "nedster-worker"
+FALLBACK_CONTEXT_TOKENS = 32_768
 
 
 def worker_model(config: Any, override: str | None = None) -> str:
@@ -16,6 +17,29 @@ def worker_model(config: Any, override: str | None = None) -> str:
         return override
     coder = str(getattr(config.models, "coder", "") or "")
     return coder if coder and coder != "auto" else DEFAULT_WORKER
+
+
+def context_budget(config: Any, model: str) -> int:
+    """``runtime.context_tokens`` when set; otherwise the window Ollama actually serves ``model`` with (num_ctx).
+
+    Compacting against a smaller budget than the served window wastes context; a larger one gets silently truncated.
+    """
+    configured = int(getattr(config.runtime, "context_tokens", 0) or 0)
+    if configured > 0:
+        return configured
+    import httpx
+
+    url = str(config.models.ollama_url).rstrip("/")
+    try:
+        response = httpx.post(f"{url}/api/show", json={"model": model}, timeout=3)
+        response.raise_for_status()
+        for line in str(response.json().get("parameters") or "").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "num_ctx" and parts[1].isdigit():
+                return max(2_048, int(parts[1]))
+    except (httpx.HTTPError, ValueError, AttributeError):
+        pass
+    return FALLBACK_CONTEXT_TOKENS
 
 
 def git_inventory(git: Any) -> Callable[[Path], list[str]]:
@@ -38,8 +62,8 @@ def git_inventory(git: Any) -> Callable[[Path], list[str]]:
     return inventory
 
 
-def build_tools(project_root: Path, config: Any) -> tuple[Any, Any]:
-    """Return (CompositeToolRuntime, Executor) for ``project_root``."""
+def build_tools(project_root: Path, config: Any, journal: Any = None) -> tuple[Any, Any]:
+    """Return (CompositeToolRuntime, Executor) for ``project_root``; ``journal`` (a CheckpointStore) records undo data."""
     from .tool_runtime.composite import CompositeToolRuntime
     from .tool_runtime.exec import Executor
     from .tool_runtime.files import FileTools
@@ -50,10 +74,11 @@ def build_tools(project_root: Path, config: Any) -> tuple[Any, Any]:
     git = SafeGit(project_root, executor)
     inventory = git_inventory(git)
     runtime = CompositeToolRuntime(
-        sync_tools=[FileTools(project_root, inventory=inventory), SearchTools(project_root, inventory=inventory)],
+        sync_tools=[FileTools(project_root, inventory=inventory, journal=journal), SearchTools(project_root, inventory=inventory)],
         job_tools=[executor, git],
         policy=config.policy,
         resolve_argv=executor.resolve_argv,
+        journal=journal,
     )
     return runtime, executor
 
@@ -73,6 +98,7 @@ class NativeSession:
     ) -> None:
         from .engine.loop import Engine
         from .engine.state import Budget
+        from .session_store.checkpoints import CheckpointStore
         from .session_store.sqlite_store import SqliteSessionStore
         from .transport.ollama import OllamaTransport
 
@@ -80,20 +106,24 @@ class NativeSession:
         self.project_root = Path(config.runtime.project_root).resolve()
         state_dir = Path(config.runtime.state_dir)
         state_dir.mkdir(parents=True, exist_ok=True)
-        self.store = SqliteSessionStore(state_dir / "sessions.sqlite3")
+        db_path = state_dir / "sessions.sqlite3"
+        self.store = SqliteSessionStore(db_path)
+        self.checkpoints = CheckpointStore(db_path)
+        self.recovery_notes = self.checkpoints.recover()
         root = str(self.project_root)
         if session_id is None and resume_latest:
             session_id = self.store.latest_session(root)
         self.session_id = session_id or self.store.create(root, title)
         self.model = worker_model(config, model)
-        self.tools, self.executor = build_tools(self.project_root, config)
+        self.tools, self.executor = build_tools(self.project_root, config, self.checkpoints)
+        self.checkpoints.on_undone.append(self.tools.invalidate_after_undo)
         self.transport = OllamaTransport(config.models.ollama_url)
         self.engine = Engine(
             self.transport,
             self.tools,
             model=self.model,
             store=self.store,
-            budget=Budget(context_tokens=int(getattr(config.runtime, "context_tokens", 32_768) or 32_768)),
+            budget=Budget(context_tokens=context_budget(config, self.model)),
             emit=emit,
             project_root=self.project_root,
         )
@@ -102,14 +132,25 @@ class NativeSession:
         status = self.executor.backend_status()
         return {
             "model": self.model,
+            "context_tokens": self.engine.budget.context_tokens,
             "session_id": self.session_id,
             "project_root": str(self.project_root),
             "sandbox": status.name if status else "none",
             "isolation": status.isolation if status else "none",
         }
 
-    async def run(self, text: str) -> AcceptanceResult:
-        return await self.engine.run(self.session_id, text)
+    async def run(self, text: str, *, intent: Any = None) -> AcceptanceResult:
+        """``intent``: an ``engine.intent.Intent`` that overrides the classifier (``nedster run --expect``)."""
+        self.checkpoints.begin_turn(self.session_id, self.project_root)
+        try:
+            return await self.engine.run(self.session_id, text, intent=intent)
+        finally:
+            self.checkpoints.end_turn()  # also on cancel/error: stores post-images of partial writes
+
+    def undo_last(self) -> Any:
+        """Undo the last turn's file-tool changes (UndoReport; ``str()`` is the user message). Command side
+        effects are not covered and the message says so."""
+        return self.checkpoints.undo_last(self.session_id)
 
     def cancel(self) -> None:
         """Request cancellation; ``run`` returns CANCELLED once running jobs have really stopped."""
@@ -118,4 +159,5 @@ class NativeSession:
     async def aclose(self) -> None:
         await self.transport.aclose()
         self.executor.close()
+        self.checkpoints.close()
         self.store.close()

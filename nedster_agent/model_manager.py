@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import platform
@@ -9,7 +10,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -212,6 +213,13 @@ class OllamaManager:
         response = httpx.get(f"{self.url}/api/tags", timeout=10)
         response.raise_for_status()
         return [str(item["name"]) for item in response.json().get("models", [])]
+
+    def context_window(self, model: str) -> tuple[int | None, int | None]:
+        """(configured num_ctx, trained context length) from /api/show; None when unknown."""
+        response = httpx.post(f"{self.url}/api/show", json={"model": model}, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return _num_ctx(str(data.get("parameters") or "")), _trained_ctx(data.get("model_info") or {})
 
     def install(self, *, dry_run: bool = False) -> None:
         if self.executable:
@@ -597,6 +605,59 @@ def probe_execution(config: Any) -> dict[str, object]:
         return {"ready": False, "backend": requested, "isolation": "unknown", "detail": detail}
     detail = HOST_DETAIL if status.name == "host" else f"{status.name} ({status.isolation} isolation)"
     return {"ready": True, "backend": status.name, "isolation": status.isolation, "detail": detail}
+
+
+def _num_ctx(parameters: str) -> int | None:
+    for line in parameters.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "num_ctx" and parts[1].isdigit():
+            return int(parts[1])
+    return None
+
+
+def _trained_ctx(model_info: dict[str, Any]) -> int | None:
+    for key, value in model_info.items():
+        if key.endswith(".context_length") and isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+KV_CACHE_TYPES = ("f16", "q8_0", "q4_0")
+
+
+def context_report(
+    config: Any, manager: OllamaManager, env: Mapping[str, str] | None = None
+) -> dict[str, object]:
+    """Context window and KV-cache settings that bound how long a task can run.
+
+    Ollama reads OLLAMA_FLASH_ATTENTION / OLLAMA_KV_CACHE_TYPE from the *server's* environment; Nedster can only see its
+    own, so the KV values are reported as "as seen by this shell" and are advice, not a readiness gate.
+    """
+    env = os.environ if env is None else env
+    models_cfg = config.models
+    worker = models_cfg.coder if models_cfg.coder != "auto" else "nedster-worker"
+    budget = int(getattr(config.runtime, "context_tokens", 0) or 0)
+    report: dict[str, object] = {"worker": worker, "engine_budget": budget, "num_ctx": None, "trained": None}
+    with contextlib.suppress(httpx.HTTPError, ValueError):
+        report["num_ctx"], report["trained"] = manager.context_window(worker)
+    flash = env.get("OLLAMA_FLASH_ATTENTION", "").strip().lower() in {"1", "true", "yes", "on"}
+    kv_type = env.get("OLLAMA_KV_CACHE_TYPE", "").strip().lower() or "f16"
+    report.update(flash_attention=flash, kv_cache_type=kv_type)
+    advice: list[str] = []
+    num_ctx = report["num_ctx"]
+    if not budget:
+        report["engine_budget"] = num_ctx or 32_768
+    elif isinstance(num_ctx, int) and budget < num_ctx:
+        advice.append(f"engine budget {budget} < model num_ctx {num_ctx}: set runtime.context_tokens = {num_ctx}")
+    if isinstance(num_ctx, int) and budget > num_ctx:
+        advice.append(f"engine budget {budget} > model num_ctx {num_ctx}: Ollama will truncate; lower runtime.context_tokens")
+    if not flash or kv_type == "f16":
+        advice.append(
+            "set OLLAMA_FLASH_ATTENTION=1 and OLLAMA_KV_CACHE_TYPE=q8_0 for the Ollama server (then restart it): "
+            "halves KV-cache memory, so the same VRAM holds about twice the context"
+        )
+    report["advice"] = advice
+    return report
 
 
 def readiness(config: Any, manager: OllamaManager | None = None) -> dict[str, dict[str, object]]:
