@@ -489,3 +489,61 @@ def test_python_runner_is_chosen_from_static_evidence(tmp_path: Path, monkeypatc
         assert ex.detect_test_argv()[1:] == ["-m", "unittest", "discover", "-s", "tests"]
     finally:
         ex.close()
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason="Windows Job Object tests require Windows")
+async def test_spawn_fails_when_new_winjob_raises_oserror(executor: Executor, monkeypatch: pytest.MonkeyPatch):
+    """If _new_winjob returns None (WinJob raises OSError), the process must not start."""
+
+    from ironclad.tool_runtime.exec import Job as JobClass
+
+    def patched_new_winjob(self, *a, **kw):  # type: ignore[no-untyped-def]
+        return None
+
+    monkeypatch.setattr(JobClass, "_new_winjob", patched_new_winjob)  # type: ignore[attr-defined]
+    result = await executor.start(call(py("print('should not run')"))).wait()
+    assert result.status is ToolStatus.FAILED
+    assert "could not create a Windows Job Object" in result.output
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason="Windows Job Object tests require Windows")
+async def test_spawn_fails_when_assign_raises_oserror(executor: Executor, monkeypatch: pytest.MonkeyPatch):
+    """If job.assign raises OSError, the suspended child must be terminated and never resumed."""
+    import subprocess as _subprocess
+    from unittest.mock import patch
+
+    captured_proc = []  # type: list[_subprocess.Popen]
+
+    original_popen = _subprocess.Popen
+
+    def mock_popen(*args, **kwargs):
+        result = original_popen(*args, **kwargs)
+        captured_proc.append(result)
+        return result
+
+    with patch.object(_subprocess, "Popen", side_effect=mock_popen):
+        from ironclad.tool_runtime.backends.winjob import WinJob
+
+        original_assign = WinJob.assign
+
+        def failing_assign(self, process):  # type: ignore[no-untyped-def]
+            raise OSError("simulated assign failure")
+
+        WinJob.assign = failing_assign  # type: ignore[attr-defined]
+        try:
+            result = await executor.start(call(py("print('should not run')"))).wait()
+
+            assert result.status is ToolStatus.FAILED
+            assert "could not assign the process to a Windows Job Object" in result.output
+
+            # The suspended child was killed, never resumed outside the job.
+            # Verify it's no longer alive (it should have been terminated in _assign_and_resume).
+            if captured_proc:
+                proc = captured_proc[0]
+                import time
+
+                time.sleep(0.1)
+                assert proc.poll() is not None or psutil.pid_exists(proc.pid) is False  # noqa: SIM114
+
+        finally:
+            WinJob.assign = original_assign  # type: ignore[attr-defined]

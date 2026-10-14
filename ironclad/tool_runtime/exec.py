@@ -508,6 +508,8 @@ class Job:
             "shell": False,
         }
         job = self._new_winjob() if IS_WINDOWS else None
+        if IS_WINDOWS and job is None:
+            raise OSError("process containment unavailable: could not create a Windows Job Object")
         if IS_WINDOWS:
             suspended = CREATE_SUSPENDED if job is not None else 0
             kwargs["creationflags"] = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | suspended
@@ -538,7 +540,13 @@ class Job:
             self._winjob = job
             self._winjob_used = True
         except OSError:
+            # Fail closed: terminate the suspended child, never resume it outside the job.
+            with contextlib.suppress(OSError):
+                self._proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                self._proc.wait(timeout=2.0)
             job.close()
+            raise OSError("process containment failed: could not assign the process to a Windows Job Object")
         try:
             resume_process(self._proc)
         except OSError:
