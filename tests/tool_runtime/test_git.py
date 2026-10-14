@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 
+from ironclad.config import NedsterConfig
 from ironclad.contracts import ToolCall, ToolStatus
+from ironclad.tool_runtime.exec import Executor, executable_name, is_within
 from ironclad.tool_runtime.git import SafeGit
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
@@ -147,7 +149,8 @@ async def test_hostile_environment_is_dropped(safe: SafeGit, monkeypatch: pytest
 
 def test_argv_hardening(safe: SafeGit):
     argv = safe.argv_for(call("git_diff", paths=["a.txt"]))
-    assert argv[:2] == ["git", "--no-pager"]
+    assert Path(argv[0]).is_absolute() and executable_name(argv[0]).lower() == "git"
+    assert not is_within(argv[0], safe.project_root) and argv[1] == "--no-pager"
     joined = " ".join(argv)
     for flag in ("core.fsmonitor=false", "diff.external=", "core.pager=cat", "core.hooksPath=",
                  "--no-optional-locks", "--no-ext-diff", "--no-textconv", "log.showSignature=false"):  # fmt: skip
@@ -181,3 +184,55 @@ def test_specs_are_read_only(safe: SafeGit):
     specs = safe.specs()
     assert {spec.name for spec in specs} == {"git_diff", "git_status", "git_log", "git_show"}
     assert all(not spec.mutates and spec.risk == 0 for spec in specs)
+
+
+# ---------------------------------------------------------------------------------------------
+# FIX-EXEC regressions (#2): git is never taken from the project
+# ---------------------------------------------------------------------------------------------
+
+
+def _planted_git(repo: Path, marker: Path) -> Path:
+    bindir = repo / ".venv" / ("Scripts" if os.name == "nt" else "bin")
+    bindir.mkdir(parents=True)
+    if os.name == "nt":
+        script = bindir / "git.bat"
+        script.write_text(f'@echo off\r\necho owned> "{marker}"\r\n', encoding="utf-8")
+    else:
+        script = bindir / "git"
+        script.write_text(f"#!/bin/sh\necho owned > '{marker}'\n", encoding="utf-8")
+        script.chmod(0o755)
+    return bindir
+
+
+async def test_repo_supplied_venv_git_never_runs(repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """repro_host_exec A: a project .venv git ran on the host for git_status, even with execution disabled."""
+    marker = tmp_path / "PWNED_A"
+    bindir = _planted_git(repo, marker)
+    # Even when the user's shell has the project venv activated (first on PATH).
+    monkeypatch.setenv("PATH", os.pathsep.join([str(bindir), os.environ["PATH"]]))
+    executor = Executor(repo, NedsterConfig())  # default: no sandbox opt-in needed for read-only git
+    try:
+        safe = SafeGit(repo, executor)
+        assert not is_within(safe.git_path(), repo)
+        assert safe.untrusted_filters() == []  # runs git config through the absolute git too
+        assert str(bindir) not in safe.env()["PATH"].split(os.pathsep)
+        result = await safe.run(call("git_status"))
+    finally:
+        executor.close()
+    assert result.status is ToolStatus.OK, result.output
+    assert not marker.exists()
+
+
+async def test_missing_git_fails_cleanly(repo: Path, monkeypatch: pytest.MonkeyPatch):
+    executor = Executor(repo, NedsterConfig())
+    monkeypatch.setattr(executor, "_git", None)
+    try:
+        result = await SafeGit(repo, executor).run(call("git_status"))
+    finally:
+        executor.close()
+    assert result.status is ToolStatus.FAILED and "git was not found" in result.output
+
+
+def test_hooks_dir_is_not_sandbox_writable(safe: SafeGit):
+    """core.hooksPath must not point into the temp dir that sandboxed commands can write."""
+    assert not is_within(safe.hooks_dir, safe.executor.temp_dir)

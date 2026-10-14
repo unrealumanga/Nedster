@@ -1,7 +1,9 @@
 """The native engine's ToolRuntime: file, search, execution and git tools behind one policy gate.
 
 Policy is evaluated on what will actually run: for execution tools that is the argv the Executor resolves
-(for example the project's venv python for ``run_tests``), never the model's raw arguments.
+(an absolute program from the user's PATH, or the project's verified venv python for ``run_tests``), never the
+model's raw arguments, and the Executor launches exactly that argv. A program that resolves inside the project
+is DENIED; malformed arguments are INVALID.
 """
 
 from __future__ import annotations
@@ -10,13 +12,12 @@ import asyncio
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
-from pathlib import PurePath
 from typing import Any, Protocol
 
 from ..contracts import JobHandle, ToolCall, ToolResult, ToolSpec, ToolStatus, WorkspaceRevision
 from ..types import RiskLevel
+from .exec import ResolutionDenied, executable_name
 
-WINDOWS_SUFFIXES = (".exe", ".cmd", ".bat", ".com")
 VALIDATING_TOOLS = frozenset({"run_tests"})
 # Commands may change the workspace without reporting paths; treat every execution as a potential mutation.
 EXECUTION_TOOLS = frozenset({"run_command", "run_tests"})
@@ -32,16 +33,6 @@ class JobTools(Protocol):
     def specs(self) -> list[ToolSpec]: ...
 
     def start(self, call: ToolCall) -> JobHandle: ...
-
-
-def executable_name(program: str) -> str:
-    """Basename without a Windows launcher suffix; splits both separators on every OS."""
-    name = PurePath(program.replace("\\", "/")).name
-    lowered = name.lower()
-    for suffix in WINDOWS_SUFFIXES:
-        if lowered.endswith(suffix):
-            return name[: -len(suffix)]
-    return name
 
 
 class _Done:
@@ -137,9 +128,9 @@ class CompositeToolRuntime:
         if "__invalid__" in call.arguments:
             raw = str(call.arguments["__invalid__"])[:300]
             return _Done(ToolResult(call.id, call.name, ToolStatus.INVALID, f"arguments are not valid JSON: {raw}"))
-        denied = self._authorize(call)
-        if denied is not None:
-            return _Done(ToolResult(call.id, call.name, ToolStatus.DENIED, denied))
+        refused = self._authorize(call)
+        if refused is not None:
+            return _Done(ToolResult(call.id, call.name, refused[0], refused[1]))
         kind, tools = owner
         if kind == "sync":
             return _Threaded(self, tools, call)
@@ -165,15 +156,16 @@ class CompositeToolRuntime:
     def _bump(self, paths: tuple[str, ...]) -> None:
         self._revision = self._revision.bump(tuple(paths))
 
-    def _authorize(self, call: ToolCall) -> str | None:
+    def _authorize(self, call: ToolCall) -> tuple[ToolStatus, str] | None:
         policy = self._policy
         if policy is None:
             return None
         spec = self._specs[call.name]
         risk = RiskLevel(spec.risk)
         ceiling = _ceiling(policy)
+        denied = ToolStatus.DENIED
         if risk > ceiling:
-            return (
+            return denied, (
                 f"{call.name} needs {risk.name.lower()} permission but the policy allows up to "
                 f"{ceiling.name.lower()} (set policy.max_auto_risk or enable autonomy)"
             )
@@ -181,18 +173,22 @@ class CompositeToolRuntime:
             return None
         try:
             argv = list(self._resolve_argv(call)) if self._resolve_argv else list(call.arguments.get("argv") or [])
+        except ResolutionDenied as exc:
+            return denied, str(exc)
+        except ValueError as exc:  # exec.ArgumentError: malformed or unrunnable arguments
+            return ToolStatus.INVALID, str(exc)
         except Exception as exc:
-            return f"cannot resolve command: {exc}"
+            return denied, f"cannot resolve command: {exc}"
         if not argv:
-            return "empty command"
+            return denied, "empty command"
         allowed = {name.lower() for name in getattr(policy, "allowed_commands", [])}
-        program = executable_name(str(argv[0]))
+        program = executable_name(str(argv[0]))  # the resolved program's basename
         if program.lower() not in allowed:
-            return f"executable is not allowlisted: {program} (allowed: {', '.join(sorted(allowed))})"
+            return denied, f"executable is not allowlisted: {program} (allowed: {', '.join(sorted(allowed))})"
         rendered = " ".join(argv).lower()
         for fragment in getattr(policy, "denied_fragments", []):
             if fragment.lower() in rendered:
-                return f"command contains a denied fragment: {fragment!r}"
+                return denied, f"command contains a denied fragment: {fragment!r}"
         return None
 
 

@@ -4,8 +4,15 @@ Invariants:
 - argv only; never a shell. Windows .cmd/.bat go through ``cmd.exe /d /s /c`` only after
   rejecting cmd metacharacters in every argument.
 - No execution without a ready backend or an explicit host opt-in (DENIED + remedy).
-- ``Job.cancel()`` returns only after the whole process tree is gone (POSIX process group,
-  Windows Job Object, Docker container).
+- Programs are resolved against the user's PATH with every directory inside the project
+  removed; a program that resolves inside the project is DENIED. The only exception is the
+  project's verified venv interpreter, and only for ``run_tests``. Policy sees the resolved
+  argv and the launch runs exactly that argv.
+- ``run_tests`` runs only known test runners; test counts are parsed with that runner's own
+  format (last summary line). ``data["runner"]`` is set only for a known runner invocation.
+- ``Job.cancel()`` returns after the tracked process tree is gone (POSIX process group,
+  Windows Job Object, Docker container). On the host backend a process deliberately detached
+  from the tree (WMI, launchd, systemd-run, ...) is not tracked; results say so.
 - Output is bounded to head 32 KB + tail 32 KB; the total byte count is always reported.
 - Unknown test counts are ``None``, never 0.
 """
@@ -14,18 +21,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.machinery
 import os
 import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import weakref
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 import psutil
@@ -57,10 +67,26 @@ WINDOWS_BATCH = {".bat", ".cmd"}
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_NO_WINDOW = 0x08000000
 CREATE_SUSPENDED = 0x00000004
+WINDOWS_SUFFIXES = (".exe", ".cmd", ".bat", ".com")
+EXECUTABLE_MAGIC = (b"MZ", b"\x7fELF", b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe",
+                    b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce")  # fmt: skip
+PYTHON_NAME = re.compile(r"^python(?:\d+(?:\.\d+)?)?$")
+KNOWN_RUNNERS = ("pytest", "python -m pytest", "python -m unittest", "npm test", "cargo test", "go test",
+                 "node --test")  # fmt: skip
+HOST_UNTRACKED = (
+    "processes detached from the tree (e.g. started through WMI, launchd, systemd-run or a service) "
+    "are not tracked on the host backend"
+)
+HOST_REMEDY = "use the docker backend (or bwrap/seatbelt) for full containment"
+RESOLUTION_CACHE = 64
 
 
 class ArgumentError(ValueError):
     """Arguments rejected before anything executes (ToolStatus.INVALID)."""
+
+
+class ResolutionDenied(Exception):  # noqa: N818 - mirrors ToolStatus.DENIED
+    """The resolved program may not run, e.g. it lives inside the project (ToolStatus.DENIED)."""
 
 
 # ---------------------------------------------------------------------------
@@ -80,13 +106,137 @@ def _is_secret(name: str) -> bool:
     return any(marker in upper for marker in SECRET_MARKERS)
 
 
-def venv_bin(root: Path) -> Path | None:
-    candidate = root / ".venv" / ("Scripts" if IS_WINDOWS else "bin")
-    return candidate if candidate.is_dir() else None
+def executable_name(program: str) -> str:
+    """Basename without a Windows launcher suffix; splits both separators on every OS."""
+    name = PurePath(program.replace("\\", "/")).name
+    lowered = name.lower()
+    for suffix in WINDOWS_SUFFIXES:
+        if lowered.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
 
 
-def build_env(root: Path, temp: Path, base: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Per-OS allowlisted environment with a private temp dir; secrets never pass."""
+def _path_key(path: str | Path, *, real: bool) -> str:
+    text = os.path.realpath(path) if real else os.path.abspath(path)
+    text = os.path.normcase(text)
+    return text.casefold() if IS_WINDOWS or sys.platform == "darwin" else text  # case-insensitive filesystems
+
+
+def is_within(path: str | Path, root: str | Path) -> bool:
+    """True when ``path`` is ``root`` or below it, by its literal location or after following links."""
+    for real in (False, True):
+        key, base = _path_key(path, real=real), _path_key(root, real=True)
+        if key == base or key.startswith(base.rstrip(os.sep) + os.sep):
+            return True
+    return False
+
+
+def is_path_qualified(program: str) -> bool:
+    return "/" in program or "\\" in program or os.path.isabs(program)
+
+
+def host_search_path(root: Path, path_value: str) -> str:
+    """The user's PATH without relative entries and without any directory inside the project."""
+    kept: list[str] = []
+    for raw in path_value.split(os.pathsep):
+        entry = raw.strip().strip('"')
+        if entry and os.path.isabs(entry) and not is_within(entry, root):
+            kept.append(entry)
+    return os.pathsep.join(dict.fromkeys(kept))
+
+
+def _pathext() -> list[str]:
+    return [ext.lower() for ext in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if ext]
+
+
+def _executable_file(path: Path) -> bool:
+    if not os.path.exists(path) or os.path.isdir(path):
+        return False
+    return IS_WINDOWS or os.access(path, os.X_OK)
+
+
+def find_program(name: str, search_path: str, root: Path) -> Path | None:
+    """Look ``name`` up in ``search_path`` only (never the current directory); never a project file."""
+    candidates = [name]
+    if IS_WINDOWS and PurePath(name).suffix.lower() not in _pathext():
+        candidates = [name + ext for ext in _pathext()]
+    for directory in search_path.split(os.pathsep):
+        if not directory:
+            continue
+        for candidate in candidates:
+            path = Path(directory) / candidate
+            if _executable_file(path) and not is_within(path, root):
+                return Path(os.path.abspath(path))
+    return None
+
+
+def venv_python(root: Path) -> Path | None:
+    """The project's ``.venv`` interpreter, only when it is a structurally real venv interpreter.
+
+    Without executing anything: ``pyvenv.cfg`` must name a ``home`` outside the project that
+    holds a Python, and the interpreter must be a symlink that leaves the project or a native
+    executable image. A repo-supplied script named ``python`` fails these checks.
+    """
+    venv = root / ".venv"
+    interpreter = venv / ("Scripts/python.exe" if IS_WINDOWS else "bin/python")
+    try:
+        lines = (venv / "pyvenv.cfg").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    home = next((line.split("=", 1)[1].strip() for line in lines
+                 if line.split("=", 1)[0].strip().lower() == "home" and "=" in line), "")  # fmt: skip
+    if not home or not os.path.isabs(home) or not os.path.isdir(home) or is_within(home, root):
+        return None
+    names = ("python.exe", "python3.exe") if IS_WINDOWS else ("python3", "python")
+    if not any(os.path.exists(Path(home) / name) for name in names):
+        return None
+    try:
+        if interpreter.is_symlink():
+            target = Path(os.path.realpath(interpreter))
+            return interpreter if target.is_file() and not is_within(target, root) else None
+        if not interpreter.is_file():
+            return None
+        with interpreter.open("rb") as handle:
+            magic = handle.read(4)
+    except OSError:
+        return None
+    return interpreter if magic.startswith(EXECUTABLE_MAGIC) else None
+
+
+def _shadowed_module(root: Path, module: str) -> bool:
+    """``python -m <module>`` from the project root would import a project file instead."""
+    suffixes = importlib.machinery.all_suffixes()
+    return any((root / f"{module}{suffix}").exists() for suffix in suffixes) or any(
+        (root / module / f"__init__{suffix}").exists() for suffix in suffixes
+    )
+
+
+def runner_for(argv: list[str], root: Path) -> str | None:
+    """Name of the known test runner that ``argv`` invokes, or ``None``."""
+    if not argv:
+        return None
+    name, rest = executable_name(argv[0]).lower(), argv[1:]
+    if name in ("pytest", "py.test"):
+        return "pytest"
+    if PYTHON_NAME.match(name) and len(rest) >= 2 and rest[0] == "-m" and rest[1] in ("pytest", "unittest"):
+        return None if _shadowed_module(root, rest[1]) else rest[1]
+    if name == "npm" and rest[:1] in (["test"], ["t"]):
+        return "npm"
+    if name in ("cargo", "go") and rest[:1] == ["test"]:
+        return name
+    if name == "node" and "--test" in rest:
+        return "node"
+    return None
+
+
+def build_env(
+    root: Path, temp: Path, base: Mapping[str, str] | None = None, *, venv: Path | None = None
+) -> dict[str, str]:
+    """Per-OS allowlisted environment with a private temp dir; secrets never pass.
+
+    PATH never contains a directory inside the project. ``venv`` (a verified venv interpreter)
+    puts that venv's bin directory first, for test runs that use it.
+    """
     source = dict(os.environ if base is None else base)
     if IS_WINDOWS:
         upper = {key.upper(): value for key, value in source.items()}
@@ -98,26 +248,25 @@ def build_env(root: Path, temp: Path, base: Mapping[str, str] | None = None) -> 
         env["TMPDIR"] = str(temp)
     env = {key: value for key, value in env.items() if not _is_secret(key)}
     env["PYTHONIOENCODING"] = "utf-8"
-    bin_dir = venv_bin(root)
-    if bin_dir is not None:
-        env["PATH"] = os.pathsep.join(item for item in (str(bin_dir), env.get("PATH", "")) if item)
-        env["VIRTUAL_ENV"] = str(bin_dir.parent)
+    env["PATH"] = host_search_path(root, env.get("PATH", ""))
+    if venv is not None:
+        env["PATH"] = os.pathsep.join(item for item in (str(venv.parent), env["PATH"]) if item)
+        env["VIRTUAL_ENV"] = str(venv.parent.parent)
     return env
 
 
 def _which(name: str, env: Mapping[str, str], cwd: Path) -> Path | None:
-    if "/" in name or "\\" in name:
-        base = Path(name) if Path(name).is_absolute() else cwd / name
+    if is_path_qualified(name):
+        # abspath, not resolve(): a venv interpreter symlink must keep its venv location.
+        base = Path(os.path.abspath(name if os.path.isabs(name) else cwd / name))
         if base.is_file():
-            return base.resolve()
+            return base
         if IS_WINDOWS and not base.suffix:
-            for ext in env.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";"):
-                if ext and base.with_suffix(ext.lower()).is_file():
-                    return base.with_suffix(ext.lower()).resolve()
+            for ext in _pathext():
+                if base.with_suffix(ext).is_file():
+                    return base.with_suffix(ext)
         return None
-    # An explicit PATH keeps Windows from searching the current directory first.
-    found = shutil.which(name, path=env.get("PATH", ""))
-    return Path(found) if found else None
+    return find_program(name, env.get("PATH", ""), cwd)
 
 
 def _cmd_quote(arg: str) -> str:
@@ -201,41 +350,71 @@ class BoundedOutput:
         return (head + marker + tail).decode("utf-8", errors="replace")
 
 
-_CARGO = re.compile(r"test result: \w+\. (\d+) passed; (\d+) failed")
+_CARGO = re.compile(r"^test result: \w+\. (\d+) passed; (\d+) failed", re.MULTILINE)
 _JEST = re.compile(r"^Tests:\s+.*?(\d+) total", re.MULTILINE)
 _VITEST = re.compile(r"^\s*Tests\s+.*?\((\d+)\)\s*$", re.MULTILINE)
-_PYTEST_LINE = re.compile(r"^[=\s]*(?:\d+ \w+(?:, )?)+.* in [\d.]+s", re.MULTILINE)
+_NODE = re.compile(r"^(?:ℹ|#) tests (\d+)\s*$", re.MULTILINE)  # spec reporter (info sign) or TAP
+_PYTEST_LINE = re.compile(r"^[=\s]*(?:(?:\d+ \w+(?:, )?)+|no tests ran)\b.* in [\d.]+s\b.*$", re.MULTILINE)
 _PYTEST_COUNT = re.compile(r"(\d+) (passed|failed|errors?|xfailed|xpassed)\b")
-_PYTEST_NONE = re.compile(r"\bno tests ran\b")
 _UNITTEST = re.compile(r"^Ran (\d+) tests? in ", re.MULTILINE)
 _GO_RESULT = re.compile(r"^\s*--- (?:PASS|FAIL): ", re.MULTILINE)
 _GO_VERBOSE = re.compile(r"^=== RUN ", re.MULTILINE)
 
 
-def parse_tests_run(text: str) -> int | None:
-    """Number of tests executed per the runner's own summary; ``None`` when unknown."""
-    cargo = _CARGO.findall(text)
-    if cargo:
-        return sum(int(passed) + int(failed) for passed, failed in cargo)
-    jest = _JEST.findall(text)
-    if jest:
-        return int(jest[-1])
-    vitest = _VITEST.findall(text)
-    if vitest:
-        return int(vitest[-1])
-    pytest_lines = _PYTEST_LINE.findall(text)
-    if pytest_lines:
-        counts = _PYTEST_COUNT.findall(pytest_lines[-1])
-        if counts:
-            return sum(int(number) for number, _kind in counts)
-    if _PYTEST_NONE.search(text):
-        return 0
-    unittest = _UNITTEST.findall(text)
-    if unittest:
-        return int(unittest[-1])
-    if _GO_VERBOSE.search(text):
-        return len(_GO_RESULT.findall(text))
-    return None
+def _last(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
+    matches = list(pattern.finditer(text))
+    return matches[-1] if matches else None
+
+
+def _pytest_count(text: str) -> int | None:
+    line = _last(_PYTEST_LINE, text)
+    if line is None:
+        return None
+    return sum(int(number) for number, _kind in _PYTEST_COUNT.findall(line.group(0)))
+
+
+def _js_count(text: str) -> int | None:
+    """npm test runs whatever the project configured: jest, vitest or node --test; last summary wins."""
+    found = [match for match in (_last(_JEST, text), _last(_VITEST, text), _last(_NODE, text)) if match]
+    return int(max(found, key=lambda match: match.start()).group(1)) if found else None
+
+
+def _single(pattern: re.Pattern[str]) -> Any:
+    def count(text: str) -> int | None:
+        match = _last(pattern, text)
+        return int(match.group(1)) if match else None
+
+    return count
+
+
+def _cargo_count(text: str) -> int | None:
+    # One summary line per test binary (unit, integration, doc tests): they add up.
+    results = _CARGO.findall(text)
+    return sum(int(passed) + int(failed) for passed, failed in results) if results else None
+
+
+def _go_count(text: str) -> int | None:
+    return len(_GO_RESULT.findall(text)) if _GO_VERBOSE.search(text) else None
+
+
+_PARSERS: dict[str, Any] = {
+    "pytest": _pytest_count,
+    "unittest": _single(_UNITTEST),
+    "npm": _js_count,
+    "node": _single(_NODE),
+    "cargo": _cargo_count,
+    "go": _go_count,
+}
+
+
+def parse_tests_run(text: str, runner: str | None) -> int | None:
+    """Tests executed per ``runner``'s own summary format only; ``None`` when unknown.
+
+    Other runners' formats are ignored, so output printed by a test ("test result: ok. 999
+    passed") cannot override the real summary.
+    """
+    parser = _PARSERS.get(runner or "")
+    return parser(text) if parser else None
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +434,7 @@ class LaunchSpec:
     backend: Backend
     isolation: str
     count_tests: bool = False
+    runner: str | None = None
     extra_data: dict[str, Any] = field(default_factory=dict)
 
 
@@ -477,12 +657,14 @@ class Job:
         exit_code = proc.returncode
         with self._lock:
             reason = self._reason
+        on_host = spec.backend.name == "host"
+        killed = "tracked process tree terminated" + (f"; {HOST_UNTRACKED}" if on_host else "")
         if reason == "cancelled":
             status = ToolStatus.CANCELLED
-            text += "\n[cancelled: process tree terminated]"
+            text += f"\n[cancelled: {killed}]"
         elif reason == "timeout":
             status = ToolStatus.TIMEOUT
-            text += f"\n[timed out after {spec.timeout_s:g}s: process tree terminated]"
+            text += f"\n[timed out after {spec.timeout_s:g}s: {killed}]"
         else:
             status = ToolStatus.OK if exit_code == 0 else ToolStatus.FAILED
         data: dict[str, Any] = {
@@ -496,9 +678,12 @@ class Job:
             "job_object": self._winjob_used if IS_WINDOWS else None,
             **spec.extra_data,
         }
-        tests_run = parse_tests_run(text)
-        if spec.count_tests or tests_run is not None:
-            data["tests_run"] = tests_run
+        if reason is not None and on_host:
+            data["remedy"] = f"{HOST_UNTRACKED}; {HOST_REMEDY}"
+        if spec.runner is not None:
+            data["runner"] = spec.runner
+        if spec.count_tests or spec.runner is not None:
+            data["tests_run"] = parse_tests_run(text, spec.runner)
         self._result = ToolResult(spec.call_id, spec.tool, status, text, data, elapsed_ms=duration_ms)
         self._done.set()
 
@@ -509,7 +694,7 @@ class Job:
         return self._result
 
     async def cancel(self) -> None:
-        """Idempotent; returns only after the owned process tree is gone."""
+        """Idempotent; returns after the tracked process tree is gone (see HOST_UNTRACKED)."""
         if self._done.is_set():
             return
         with self._lock:
@@ -545,14 +730,36 @@ class Executor:
         self.project_root = Path(project_root).resolve()
         self.config = config
         self._settings = sandbox_settings(config)
-        self._temp = Path(tempfile.mkdtemp(prefix="nedster-exec-"))
-        self._finalizer = weakref.finalize(self, shutil.rmtree, str(self._temp), True)
+        base = Path(tempfile.mkdtemp(prefix="nedster-exec-"))
+        self._finalizer = weakref.finalize(self, shutil.rmtree, str(base), True)
+        # The sandbox may write to ``tmp``; ``private`` (e.g. SafeGit's empty hooks dir) is never exposed to it.
+        self._temp, self._private = base / "tmp", base / "private"
+        self._temp.mkdir()
+        self._private.mkdir()
+        # Resolved once, from the user's own PATH, before the model can influence anything.
+        self._search_path = host_search_path(self.project_root, os.environ.get("PATH", ""))
+        self._git: Path | None = find_program("git", self._search_path, self.project_root)
+        self._resolved: OrderedDict[str, tuple[Any, list[str]]] = OrderedDict()
         self._selection: Selection | None = None
         self._selection_lock = threading.Lock()
 
     @property
     def temp_dir(self) -> Path:
+        """Private temp directory handed to commands (sandboxes may write here)."""
         return self._temp
+
+    @property
+    def private_dir(self) -> Path:
+        """Executor-owned directory that sandboxed commands can neither see nor write."""
+        return self._private
+
+    @property
+    def search_path(self) -> str:
+        return self._search_path
+
+    def git_program(self) -> Path | None:
+        """Absolute git from the user's PATH (project directories excluded), or None."""
+        return self._git
 
     @property
     def max_timeout_s(self) -> float:
@@ -570,8 +777,14 @@ class Executor:
     def backend_status(self) -> BackendStatus | None:
         return self.selection().status
 
-    def env(self) -> dict[str, str]:
-        return build_env(self.project_root, self._temp)
+    def env(self, venv: Path | None = None) -> dict[str, str]:
+        return build_env(self.project_root, self._temp, venv=venv)
+
+    def venv_python(self) -> Path | None:
+        return venv_python(self.project_root)
+
+    def runner_for(self, argv: list[str]) -> str | None:
+        return runner_for(argv, self.project_root)
 
     def specs(self) -> list[ToolSpec]:
         timeout = {"type": "number", "exclusiveMinimum": 0, "maximum": self.max_timeout_s,
@@ -626,26 +839,92 @@ class Executor:
             or any(root.glob("*/test_*.py"))
         )
         if has_python_tests:
-            bin_dir = venv_bin(root)
-            python = None
-            if bin_dir is not None:
-                candidate = bin_dir / ("python.exe" if IS_WINDOWS else "python")
-                python = str(candidate) if candidate.exists() else None
-            return [python or ("python" if IS_WINDOWS else "python3"), "-m", "pytest", "-q"]
+            # resolve_argv swaps in the project's venv interpreter when it is a verified one.
+            return ["python" if IS_WINDOWS else "python3", "-m", "pytest", "-q"]
         raise ArgumentError(
             "could not detect a test suite (no Cargo.toml, go.mod, package.json or Python tests)"
         )
 
+    def _container(self) -> bool:
+        backend = self.selection().backend
+        return backend is not None and not backend.host_paths
+
+    def _prefer_venv(self, argv: list[str]) -> list[str]:
+        """run_tests only: bare python/pytest use the project's verified venv interpreter."""
+        venv = self.venv_python()
+        if venv is None or self._container() or is_path_qualified(argv[0]):
+            return argv
+        name = executable_name(argv[0]).lower()
+        if PYTHON_NAME.match(name):
+            return [str(venv), *argv[1:]]
+        if name in ("pytest", "py.test"):
+            return [str(venv), "-m", "pytest", *argv[1:]]
+        return argv
+
+    def resolve_program_argv(self, argv: list[str], *, allow_venv: bool = False) -> list[str]:
+        """``argv`` with argv[0] replaced by the absolute program that will run.
+
+        Raises ResolutionDenied for a program inside the project (except the verified venv
+        interpreter when ``allow_venv``) and ArgumentError when nothing is found.
+        """
+        program, rest = argv[0], argv[1:]
+        venv = self.venv_python() if allow_venv else None
+        if is_path_qualified(program):
+            location = Path(program) if os.path.isabs(program) else self.project_root / program
+            if venv is not None and _path_key(location, real=False) == _path_key(venv, real=False):
+                return ["python" if self._container() else str(venv), *rest]
+            if is_within(location, self.project_root):
+                raise ResolutionDenied(
+                    f"{program!r} is inside the project; project files cannot be run as programs. "
+                    "Run scripts through an allowlisted interpreter, e.g. ['python', 'script.py']."
+                )
+            if self._container():
+                raise ResolutionDenied(
+                    f"{program!r}: host paths do not exist in the container; use a program name from the image"
+                )
+            found = _which(program, {"PATH": ""}, self.project_root)
+            if found is None:
+                raise ArgumentError(f"program not found: {program!r}")
+            if is_within(found, self.project_root):
+                raise ResolutionDenied(f"{program!r} resolves into the project; project files cannot be run")
+            return [str(found), *rest]
+        if self._container():
+            return list(argv)  # looked up on the image's PATH, which the project cannot change
+        found = find_program(program, self._search_path, self.project_root)
+        if found is None:
+            raise ArgumentError(
+                f"program not found on PATH: {program!r} (directories inside the project are never searched)"
+            )
+        return [str(found), *rest]
+
     def resolve_argv(self, call: ToolCall) -> list[str]:
-        """The argv that ``start(call)`` would run; raises ArgumentError if invalid."""
+        """The resolved argv that ``start(call)`` will run; raises ArgumentError/ResolutionDenied."""
         args = call.arguments or {}
         if call.name == RUN_COMMAND:
-            return _argv_argument(args.get("argv"))
-        if call.name == RUN_TESTS:
-            if args.get("argv") is not None:
-                return _argv_argument(args.get("argv"))
-            return self.detect_test_argv()
-        raise ArgumentError(f"unknown execution tool {call.name!r}")
+            argv = self.resolve_program_argv(_argv_argument(args.get("argv")))
+        elif call.name == RUN_TESTS:
+            raw = args.get("argv")
+            requested = _argv_argument(raw) if raw is not None else self.detect_test_argv()
+            argv = self.resolve_program_argv(self._prefer_venv(requested), allow_venv=True)
+            if self.runner_for(argv) is None:
+                raise ArgumentError(
+                    f"run_tests only runs known test runners ({', '.join(KNOWN_RUNNERS)}); got {requested[0]!r}. "
+                    "A project file named like the runner module (e.g. pytest.py) also disqualifies it."
+                )
+        else:
+            raise ArgumentError(f"unknown execution tool {call.name!r}")
+        self._resolved[call.id] = (dict(args), argv)
+        while len(self._resolved) > RESOLUTION_CACHE:
+            self._resolved.popitem(last=False)
+        return list(argv)
+
+    def _argv_for_start(self, call: ToolCall) -> list[str]:
+        """Exactly the argv the policy layer authorized for this call, when it resolved it first."""
+        cached = self._resolved.pop(call.id, None)
+        if cached is not None and cached[0] == dict(call.arguments or {}):
+            return list(cached[1])
+        self._resolved.pop(call.id, None)
+        return self.resolve_argv(call)
 
     def resolve_timeout(self, call: ToolCall) -> float:
         raw = (call.arguments or {}).get("timeout_s")
@@ -664,22 +943,36 @@ class Executor:
 
     def start(self, call: ToolCall) -> Job:
         try:
-            argv = self.resolve_argv(call)
+            argv = self._argv_for_start(call)
             timeout = self.resolve_timeout(call)
+        except ResolutionDenied as exc:
+            return self._result(
+                call, ToolStatus.DENIED, str(exc), argv=list((call.arguments or {}).get("argv") or [])
+            )
         except ArgumentError as exc:
             return self._result(call, ToolStatus.INVALID, str(exc))
         selection = self.selection()
         if selection.backend is None or selection.status is None:
             return self._result(call, ToolStatus.DENIED, selection.remedy, remedy=selection.remedy)
+        venv = self.venv_python()
+        uses_venv = venv is not None and selection.backend.host_paths and argv[0] == str(venv)
         return self.launch(
             call.id, call.name, argv, timeout, selection.backend, selection.status.isolation,
-            count_tests=call.name == RUN_TESTS,
+            env=self.env(venv if uses_venv else None), count_tests=call.name == RUN_TESTS,
+            runner=self.runner_for(argv),
         )  # fmt: skip
 
     def start_host(
         self, call_id: str, tool: str, argv: list[str], timeout_s: float, env: Mapping[str, str] | None = None
     ) -> Job:
-        """Host execution of a code-constructed (never model-provided) read-only argv, e.g. git."""
+        """Host execution of a code-constructed (never model-provided) read-only argv, e.g. git.
+
+        argv[0] must be an absolute program outside the project (see ``git_program``).
+        """
+        if not os.path.isabs(argv[0]) or is_within(argv[0], self.project_root):
+            result = ToolResult(call_id, tool, ToolStatus.DENIED, f"refusing host program {argv[0]!r}: "
+                                "host programs must be absolute and outside the project")  # fmt: skip
+            return Job.completed(result)
         return self.launch(call_id, tool, argv, timeout_s, HostBackend(), "none", env=env)
 
     def launch(
@@ -693,19 +986,21 @@ class Executor:
         *,
         env: Mapping[str, str] | None = None,
         count_tests: bool = False,
+        runner: str | None = None,
     ) -> Job:
+        """Run ``argv`` as given (already resolved by ``resolve_argv`` for model calls)."""
         environment = dict(env) if env is not None else self.env()
         cwd = self.project_root
         try:
             resolved = resolve_program(argv, cwd, environment) if backend.host_paths else list(argv)
-        except ArgumentError as exc:
+            popen_args = resolved if isinstance(resolved, str) else backend.wrap(resolved, cwd, environment)
+        except (ArgumentError, ValueError) as exc:
             return Job.completed(
                 ToolResult(call_id, tool, ToolStatus.INVALID, str(exc), {"argv": list(argv)})
             )
-        popen_args = resolved if isinstance(resolved, str) else backend.wrap(resolved, cwd, environment)
         spec = LaunchSpec(
             call_id, tool, list(argv), popen_args, cwd, environment, timeout_s, backend, isolation,
-            count_tests=count_tests,
+            count_tests=count_tests, runner=runner,
         )  # fmt: skip
         return Job(spec)
 
@@ -716,8 +1011,15 @@ __all__ = [
     "Executor",
     "Job",
     "LaunchSpec",
+    "ResolutionDenied",
     "batch_command_line",
     "build_env",
+    "executable_name",
+    "find_program",
+    "host_search_path",
+    "is_within",
     "parse_tests_run",
     "resolve_program",
+    "runner_for",
+    "venv_python",
 ]

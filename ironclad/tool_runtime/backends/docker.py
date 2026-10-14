@@ -3,21 +3,39 @@
 Cancellation kills the container itself (``docker kill <name>``), not only the CLI.
 Host PATH/TEMP make no sense inside a Linux image, so only locale/terminal variables
 are forwarded, by name (values come from the CLI's own filtered environment).
+
+``--mount`` values are CSV-parsed by Docker, so host paths containing ``,``, ``"`` or a line
+break are refused instead of being allowed to inject mount options. ``.git`` and ``.nedster``
+are mounted read-only even when missing (see ``bwrap.protected_mounts``). On POSIX hosts the
+container runs as the invoking user; memory and CPUs are capped.
 """
 
 from __future__ import annotations
 
 import contextlib
+import os
 import shutil
 import subprocess
 import uuid
 from pathlib import Path
 
 from . import BackendStatus, Isolation
-from .bwrap import protected_paths
+from .bwrap import EmptyDir, protected_mounts
 
 WORKSPACE = "/workspace"
 FORWARDED = ("LANG", "TERM", "PYTHONIOENCODING")
+MOUNT_UNSAFE = frozenset(',"\r\n')
+DEFAULT_MEMORY = "4g"
+DEFAULT_CPUS = "2"
+
+
+def mount_safe(path: str | Path) -> str:
+    """The path as a ``--mount`` field value; raises ValueError if it could inject options."""
+    text = str(path)
+    bad = sorted(set(text) & MOUNT_UNSAFE)
+    if bad:
+        raise ValueError(f"path {text!r} contains {''.join(bad)!r}, which docker --mount cannot carry safely")
+    return text
 
 
 class DockerBackend:
@@ -25,9 +43,18 @@ class DockerBackend:
     isolation: Isolation = "full"
     host_paths = False
 
-    def __init__(self, root: Path, image: str = "python:3.13-slim"):
+    def __init__(
+        self,
+        root: Path,
+        image: str = "python:3.13-slim",
+        *,
+        memory: str = DEFAULT_MEMORY,
+        cpus: str = DEFAULT_CPUS,
+    ):
         self.root, self.image = Path(root).resolve(), image
+        self.memory, self.cpus = str(memory), str(cpus)
         self.binary = shutil.which("docker")
+        self.empty = EmptyDir()
 
     def _run(self, *args: str, timeout: float = 10) -> subprocess.CompletedProcess[bytes]:
         assert self.binary
@@ -38,6 +65,10 @@ class DockerBackend:
     def probe(self) -> BackendStatus:
         if not self.binary:
             return BackendStatus(self.name, False, self.isolation, "docker is not installed")
+        try:
+            mount_safe(self.root)
+        except ValueError as exc:
+            return BackendStatus(self.name, False, self.isolation, str(exc))
         try:
             info = self._run("info", "--format", "{{.ServerVersion}}")
             if info.returncode != 0:
@@ -62,15 +93,19 @@ class DockerBackend:
         cmd = [
             self.binary, "run", "--rm", "-i", "--name", f"nedster-{uuid.uuid4().hex}",
             "--network", "none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
-            "--pids-limit", "512", "--tmpfs", "/tmp:rw,nosuid,size=256m",
-            "--mount", f"type=bind,src={self.root},dst={WORKSPACE}",
+            "--pids-limit", "512", "--memory", self.memory, "--cpus", self.cpus,
+            "--tmpfs", "/tmp:rw,nosuid,size=256m",
+            "--mount", f"type=bind,src={mount_safe(self.root)},dst={WORKSPACE}",
         ]  # fmt: skip
-        for path in protected_paths(self.root):
+        if hasattr(os, "getuid"):
+            cmd.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
+        for source, target in protected_mounts(self.root, self.empty.path):
             try:
-                rel_protected = path.relative_to(self.root).as_posix()
+                rel_protected = target.relative_to(self.root).as_posix()
             except ValueError:
-                continue
-            cmd.extend(["--mount", f"type=bind,src={path},dst={WORKSPACE}/{rel_protected},readonly"])
+                continue  # a gitdir outside the project is not mounted at all
+            dst = mount_safe(f"{WORKSPACE}/{rel_protected}")
+            cmd.extend(["--mount", f"type=bind,src={mount_safe(source)},dst={dst},readonly"])
         cmd.extend(["--workdir", workdir, "--env", "TMPDIR=/tmp", "--env", "HOME=/tmp"])
         for key in env:
             if key in FORWARDED or key.startswith("LC_"):

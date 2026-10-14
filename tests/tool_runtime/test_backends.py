@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import psutil
 import pytest
@@ -14,7 +16,7 @@ from ironclad.config import NedsterConfig, SandboxConfig
 from ironclad.contracts import ToolCall, ToolStatus
 from ironclad.tool_runtime import backends as backends_mod
 from ironclad.tool_runtime.backends import BackendStatus, select_backend
-from ironclad.tool_runtime.backends.bwrap import BwrapBackend, protected_paths
+from ironclad.tool_runtime.backends.bwrap import BwrapBackend, protected_mounts, protected_paths
 from ironclad.tool_runtime.backends.docker import DockerBackend
 from ironclad.tool_runtime.backends.host import HostBackend
 from ironclad.tool_runtime.backends.seatbelt import SeatbeltBackend
@@ -275,3 +277,122 @@ def test_winjob_kills_the_tree(tmp_path: Path):
         if proc.poll() is None:
             proc.kill()
         proc.wait()
+
+
+# ---------------------------------------------------------------------------------------------
+# FIX-EXEC regressions (#5, #11, #14, #19)
+# ---------------------------------------------------------------------------------------------
+
+
+def _ro_binds(argv: list[str]) -> dict[str, str]:
+    """target -> source for every ``--ro-bind source target`` in a bwrap argv."""
+    return {argv[i + 2]: argv[i + 1] for i, item in enumerate(argv[:-2]) if item == "--ro-bind"}
+
+
+def test_bwrap_protects_missing_git_and_nedster(tmp_path: Path):
+    """#5: protected_paths() skipped missing dirs, so a sandboxed command could create .nedster/config.toml."""
+    backend = BwrapBackend(tmp_path, tmp_path / "t")
+    backend.binary = "/usr/bin/bwrap"
+    argv = backend.wrap(["true"], backend.root, {})
+    binds = _ro_binds(argv)
+    git, nedster = str(backend.root / ".git"), str(backend.root / ".nedster")
+    assert git in binds and nedster in binds
+    assert binds[nedster] == nedster and (backend.root / ".nedster").is_dir()  # pre-created, then read-only
+    empty = Path(binds[git])
+    assert empty.is_dir() and not any(empty.iterdir()) and not empty.is_relative_to(backend.root)
+    assert not empty.is_relative_to(backend.temp)  # not reachable through the writable temp bind
+    root_bind = argv.index("--bind")
+    assert all(argv.index(target) > root_bind for target in (git, nedster))  # ro re-binds come later
+
+
+def test_protected_mounts_keep_existing_and_refuse_dangling_links(tmp_path: Path):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".nedster").write_text("not a dir", encoding="utf-8")
+    empty = tmp_path / "empty"
+    mounts = protected_mounts(tmp_path, empty)
+    assert (tmp_path / ".git", tmp_path / ".git") in mounts
+    assert (tmp_path / ".nedster", tmp_path / ".nedster") in mounts  # a file is protected too
+    link_root = tmp_path / "linked"
+    link_root.mkdir()
+    try:
+        (link_root / ".nedster").symlink_to(link_root / "sub" / "x")
+    except OSError:
+        pytest.skip("symlinks are not available")
+    with pytest.raises(ValueError, match="dangling"):
+        protected_mounts(link_root, empty)
+
+
+def test_docker_protects_missing_git_and_nedster(tmp_path: Path):
+    """#5 for Docker: .git and .nedster are read-only mounts even when they did not exist."""
+    backend = DockerBackend(tmp_path, "img:1")
+    backend.binary = "docker"
+    argv = backend.wrap(["pytest"], tmp_path, {})
+    mounts = [argv[i + 1] for i, item in enumerate(argv[:-1]) if item == "--mount"]
+    assert any(item.endswith("dst=/workspace/.git,readonly") for item in mounts)
+    assert any(item.endswith("dst=/workspace/.nedster,readonly") for item in mounts)
+    assert (tmp_path / ".nedster").is_dir()
+
+
+@pytest.mark.parametrize("bad", ["x,readonly=false,dst=/workspace/.git", 'x"y'])
+def test_docker_refuses_mount_injection(tmp_path: Path, bad: str):
+    """#19: a project path with ',' could append --mount options (e.g. undo readonly)."""
+    if os.name == "nt" and '"' in bad:
+        pytest.skip('Windows paths cannot contain "')
+    root = tmp_path / bad
+    root.mkdir(parents=True)
+    backend = DockerBackend(root, "img:1")
+    backend.binary = "docker"
+    with pytest.raises(ValueError, match="--mount"):
+        backend.wrap(["pytest"], backend.root, {})
+    status = backend.probe()
+    assert not status.ready and "--mount" in status.detail
+
+
+def test_docker_user_and_resource_limits(tmp_path: Path):
+    """#19: no root-owned files on Linux hosts; memory/CPU capped; limits configurable."""
+    backend = DockerBackend(tmp_path, "img:1")
+    backend.binary = "docker"
+    argv = backend.wrap(["pytest"], tmp_path, {})
+    assert argv[argv.index("--memory") + 1] == "4g" and argv[argv.index("--cpus") + 1] == "2"
+    if hasattr(os, "getuid"):
+        assert argv[argv.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
+    else:
+        assert "--user" not in argv
+    settings = SimpleNamespace(docker_image="img:2", docker_memory="1g", docker_cpus="0.5")
+    configured = backends_mod.build_backend("docker", tmp_path, tmp_path, settings)
+    configured.binary = "docker"
+    argv = configured.wrap(["pytest"], tmp_path, {})
+    assert argv[argv.index("--memory") + 1] == "1g" and argv[argv.index("--cpus") + 1] == "0.5"
+
+
+async def test_launch_with_unsafe_docker_path_is_invalid_not_a_crash(tmp_path: Path):
+    root = tmp_path / "a,b"
+    root.mkdir()
+    backend = DockerBackend(root, "img:1")
+    backend.binary = "docker"
+    executor = Executor(root, SandboxConfig())
+    try:
+        result = await executor.launch("c1", "run_command", ["pytest"], 10, backend, "full").wait()
+    finally:
+        executor.close()
+    assert result.status is ToolStatus.INVALID and "--mount" in result.output
+
+
+def test_seatbelt_limits_mach_lookup_and_home_reads(tmp_path: Path):
+    """#11: (allow mach-lookup) reached LaunchServices; $HOME (~/.git-credentials, ~/.npmrc, ...) was readable."""
+    profile = SeatbeltBackend(tmp_path, tmp_path / "t").profile()
+    lines = profile.splitlines()
+    assert "(allow mach-lookup)" not in lines
+    mach = next(line for line in lines if line.startswith("(allow mach-lookup"))
+    assert "(global-name " in mach and "launchservices" not in mach.lower() and "coreservices" not in mach.lower()
+    deny_home = lines.index('(deny file-read* (subpath (param "HOME")))')
+    allow_back = next(i for i, line in enumerate(lines) if line.startswith('(allow file-read* (subpath (param "ROOT"))'))
+    sensitive = next(i for i, line in enumerate(lines) if line.startswith("(deny file-read*") and "/.ssh" in line)
+    assert lines.index("(allow file-read*)") < deny_home < allow_back < sensitive  # later rules win
+    assert '(param "TMP")' in lines[allow_back] and '"/.git-credentials"' not in lines[allow_back]
+
+
+def test_host_probe_is_honest_about_untracked_processes():
+    """#14: the host backend cannot contain processes detached from the tree (WMI, launchd, ...)."""
+    detail = HostBackend().probe().detail
+    assert "no filesystem/network isolation" in detail and "not tracked" in detail

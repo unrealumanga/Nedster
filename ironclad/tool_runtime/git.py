@@ -1,7 +1,9 @@
 """Safe, read-only git: diff / status / log / show.
 
 The argv is always constructed here (never taken from the model) and runs on the host
-through ``Executor.start_host``. Every repository-controlled way of executing code during
+through ``Executor.start_host``. ``git`` itself is the absolute program the Executor resolved
+from the user's PATH with every project directory removed, so a repository can never supply
+its own ``git`` (e.g. ``.venv/Scripts/git.bat``). Every repository-controlled way of executing code during
 these commands is switched off: fsmonitor, external diff drivers, textconv, hooks, pagers,
 signature verification (gpg.program), and filter drivers defined outside the user's global
 config. Submodules are ignored so their (unscanned) configs never run.
@@ -17,7 +19,7 @@ from typing import Any
 from ironclad.contracts import ToolCall, ToolResult, ToolSpec, ToolStatus
 from ironclad.types import RiskLevel
 
-from .exec import ArgumentError, Executor, Job
+from .exec import ArgumentError, Executor, Job, is_within
 
 GIT_DIFF, GIT_STATUS, GIT_LOG, GIT_SHOW = "git_diff", "git_status", "git_log", "git_show"
 TOOLS = (GIT_DIFF, GIT_STATUS, GIT_LOG, GIT_SHOW)
@@ -35,13 +37,23 @@ class SafeGit:
         self.project_root = Path(project_root).resolve()
         self.executor = executor or Executor(self.project_root)
         self.timeout_s = timeout_s
-        self.hooks_dir = self.executor.temp_dir / "empty-hooks"
+        # Outside the sandbox-writable temp dir, so a sandboxed command cannot plant hooks here.
+        self.hooks_dir = self.executor.private_dir / "empty-hooks"
         self.hooks_dir.mkdir(parents=True, exist_ok=True)
 
     # -- environment and base argv -------------------------------------------------------
 
+    def git_path(self) -> str:
+        """Absolute git outside the project; raises ArgumentError when there is none."""
+        program = self.executor.git_program()
+        if program is None or is_within(program, self.project_root):
+            raise ArgumentError(
+                "git was not found on PATH (directories inside the project are never searched)"
+            )
+        return str(program)
+
     def env(self) -> dict[str, str]:
-        env = self.executor.env()
+        env = self.executor.env()  # no project directory on PATH, no venv
         for key in [key for key in env if key.upper().startswith("GIT_")]:
             del env[key]
         env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat", "PAGER": "cat",
@@ -63,17 +75,17 @@ class SafeGit:
         return args
 
     def base_argv(self) -> list[str]:
-        return ["git", "--no-pager", *self._hardening(), "--no-optional-locks"]
+        return [self.git_path(), "--no-pager", *self._hardening(), "--no-optional-locks"]
 
     def untrusted_filters(self) -> list[str]:
         """Filter drivers configured by repository-controlled config (local/worktree/includes)."""
-        argv = [*self.base_argv(), "config", "--show-scope", "--includes", "--get-regexp", r"^filter\."]
         try:
+            argv = [*self.base_argv(), "config", "--show-scope", "--includes", "--get-regexp", r"^filter\."]
             result = subprocess.run(
                 argv, cwd=self.project_root, env=self.env(), capture_output=True, timeout=10, check=False,
                 stdin=subprocess.DEVNULL,
             )  # fmt: skip
-        except (OSError, subprocess.TimeoutExpired):
+        except (ArgumentError, OSError, subprocess.TimeoutExpired):
             return []
         drivers: set[str] = set()
         for line in result.stdout.decode("utf-8", errors="replace").splitlines():
@@ -169,6 +181,10 @@ class SafeGit:
         ]  # fmt: skip
 
     def start(self, call: ToolCall) -> Job:
+        try:
+            self.git_path()
+        except ArgumentError as exc:
+            return Job.completed(ToolResult(call.id, call.name, ToolStatus.FAILED, str(exc)))
         try:
             argv = self.argv_for(call)
         except ArgumentError as exc:

@@ -65,7 +65,12 @@ def build_backend(name: str, root: Path, temp: Path, config: Any) -> Backend:
     if name == "docker":
         from .docker import DockerBackend
 
-        return DockerBackend(root, getattr(settings, "docker_image", "python:3.13-slim"))
+        return DockerBackend(
+            root,
+            getattr(settings, "docker_image", "python:3.13-slim"),
+            memory=getattr(settings, "docker_memory", None) or "4g",
+            cpus=getattr(settings, "docker_cpus", None) or "2",
+        )
     if name == "host":
         from .host import HostBackend
 
