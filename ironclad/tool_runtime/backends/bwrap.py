@@ -21,7 +21,7 @@ import tempfile
 import weakref
 from pathlib import Path
 
-from . import BackendStatus, Isolation
+from . import BackendStatus, Isolation, probe_env, resolve_binary
 
 SYSTEM_DIRS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc", "/opt")
 PROTECTED = (".git", ".nedster")
@@ -88,7 +88,7 @@ class BwrapBackend:
 
     def __init__(self, root: Path, temp: Path):
         self.root, self.temp = Path(root).resolve(), Path(temp).resolve()
-        self.binary = shutil.which("bwrap") or shutil.which("bubblewrap")
+        self.binary = resolve_binary(self.root, "bwrap", "bubblewrap")
         self.empty = EmptyDir()
 
     def probe(self) -> BackendStatus:
@@ -96,7 +96,7 @@ class BwrapBackend:
             return BackendStatus(self.name, False, self.isolation, "bubblewrap is Linux only")
         if not self.binary:
             return BackendStatus(self.name, False, self.isolation, "bwrap is not installed")
-        env = {"PATH": "/usr/bin:/bin"}
+        env = probe_env(self.root)
         try:
             result = subprocess.run(
                 self.wrap(["true"], self.root, env),

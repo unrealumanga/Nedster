@@ -24,7 +24,7 @@ from pathlib import Path
 from ..contracts import ToolCall, ToolResult, ToolSpec, ToolStatus
 from ..types import RiskLevel
 from .exec import build_env, find_program, host_search_path
-from .files import Inventory, ToolError, locate, walk_inventory
+from .files import Inventory, ToolError, locate, read_regular, walk_inventory
 from .schema import validate
 
 SEARCH_TEXT = "search_text"
@@ -225,12 +225,10 @@ class SearchTools:
         count = 0
         truncated = False
         for entry in entries:
-            full = base / entry
-            try:
-                if full.stat().st_size > MAX_SEARCH_FILE_BYTES:
-                    continue
-                data = full.read_bytes()
-            except OSError:
+            try:  # same validation as read_file: contained after resolution, regular file, bounded read
+                located = locate(base, entry, for_write=False)
+                data, _digest = read_regular(located.path, located.rel, MAX_SEARCH_FILE_BYTES)
+            except (ToolError, OSError):
                 continue
             if b"\x00" in data:
                 continue

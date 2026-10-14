@@ -17,13 +17,13 @@ from __future__ import annotations
 
 import contextlib
 import os
-import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
-from . import BackendStatus, Isolation
+from . import BackendStatus, Isolation, probe_env, resolve_binary
 from .bwrap import EmptyDir, protected_mounts
 
 WORKSPACE = "/workspace"
@@ -87,7 +87,7 @@ class DockerBackend:
     ):
         self.root, self.image = Path(root).resolve(), image
         self.memory, self.cpus = str(memory), str(cpus)
-        self.binary = shutil.which("docker")
+        self.binary = resolve_binary(self.root, "docker")
         self.empty = EmptyDir()
         # Overridable so tests can exercise both branches on any host.
         self.case_insensitive = CASE_FOLDING_HOSTS
@@ -95,7 +95,13 @@ class DockerBackend:
     def _run(self, *args: str, timeout: float = 10) -> subprocess.CompletedProcess[bytes]:
         assert self.binary
         return subprocess.run(
-            [self.binary, *args], capture_output=True, timeout=timeout, check=False, stdin=subprocess.DEVNULL
+            [self.binary, *args],
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env=probe_env(self.root),
+            cwd=tempfile.gettempdir(),
         )
 
     def probe(self) -> BackendStatus:

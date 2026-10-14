@@ -118,6 +118,65 @@ def is_protected(parts: Sequence[str], protected: Sequence[str]) -> bool:
     return False
 
 
+def _same_or_below(path: Path, base: Path) -> bool:
+    key, anchor = os.path.normcase(str(path)), os.path.normcase(str(base))
+    return key == anchor or key.startswith(anchor.rstrip(os.sep) + os.sep)
+
+
+def _gitdir_targets(git_file: Path) -> list[Path]:
+    """Directories named by a ``.git`` file (``gitdir: <path>``), plus a worktree's common dir."""
+    try:
+        text = git_file.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return []
+    if not text.startswith("gitdir:"):
+        return []
+    named = Path(text.split(":", 1)[1].strip())
+    gitdir = named if named.is_absolute() else git_file.parent / named
+    targets = [gitdir]
+    try:
+        common = (gitdir / "commondir").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        common = ""
+    if common:
+        targets.append(Path(common) if os.path.isabs(common) else gitdir / common)
+    return targets
+
+
+def metadata_targets(root: Path, protected: Sequence[str]) -> list[Path]:
+    """Resolved metadata locations that must stay unwritable whatever spelling reaches them: the
+    protected names themselves (after following a link/junction), a ``.git`` file's gitdir target."""
+    targets: list[Path] = []
+    for name in protected:
+        entry = root / name
+        if not os.path.lexists(entry):
+            continue
+        candidates = [entry]
+        if entry.is_file():
+            candidates += _gitdir_targets(entry)
+        for item in candidates:
+            try:
+                targets.append(item.resolve())
+            except OSError:
+                continue
+    return targets
+
+
+def _check_write_target(root: Path, raw: str, candidate: Path, resolved: Path, protected: Sequence[str]) -> None:
+    """Writes are refused through a protected spelling (lexical, before resolution) or onto metadata targets."""
+    lexical: list[str] = []
+    for spelling in (candidate, Path(os.path.normpath(candidate))):
+        with contextlib.suppress(ValueError):
+            lexical += spelling.relative_to(root).parts
+    if not Path(raw).is_absolute():
+        lexical += Path(raw).parts
+    if is_protected(lexical, protected):
+        raise ToolError(f"path is inside a protected directory: {raw}")
+    for target in metadata_targets(root, protected):
+        if _same_or_below(resolved, target):
+            raise ToolError(f"path is inside a protected directory (repository metadata): {raw}")
+
+
 def locate(
     root: Path,
     raw: str,
@@ -141,8 +200,10 @@ def locate(
             rel = resolved.relative_to(base)
         except ValueError:
             continue
-        if for_write and is_protected(rel.parts, protected):
-            raise ToolError(f"path is inside a protected directory: {rel.as_posix()}")
+        if for_write:
+            if is_protected(rel.parts, protected):
+                raise ToolError(f"path is inside a protected directory: {rel.as_posix()}")
+            _check_write_target(base, raw, candidate, resolved, protected)
         return Located(resolved, rel.as_posix(), base)
     raise ToolError(f"path escapes the project root: {raw}")
 
@@ -473,6 +534,14 @@ class FileTools:
             if not expected or not hash_matches(str(expected), digest):
                 raise self._stale_error(located.rel, digest)
             payload = apply_newline(content, detect_newline(current)).encode("utf-8")
+            if payload == current:
+                return ToolResult(
+                    call.id,
+                    call.name,
+                    ToolStatus.OK,
+                    f"no change: {located.rel} already has this content, sha256:{digest[:16]}",
+                    {"sha256": digest, "sha": digest[:16], "created": False},
+                )
             self._journal_before(located)
             atomic_replace(target, payload, stat.S_IMODE(target.stat().st_mode))
         else:

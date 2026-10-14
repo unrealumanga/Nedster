@@ -47,6 +47,31 @@ class Selection:
     probes: tuple[BackendStatus, ...] = ()
 
 
+def resolve_binary(root: Path, *names: str) -> str | None:
+    """First of ``names`` found with the executor's trusted resolver (absolute PATH entries outside ``root`` only).
+
+    Never ``shutil.which``: that honours relative PATH entries and project directories, so a planted
+    ``docker``/``bwrap`` in the repository would be executed by the readiness probe.
+    """
+    from ..exec import find_program, host_search_path  # lazy: exec imports this package
+
+    search_path = host_search_path(Path(root), os.environ.get("PATH", ""))
+    for name in names:
+        found = find_program(name, search_path, Path(root))
+        if found is not None:
+            return str(found)
+    return None
+
+
+def probe_env(root: Path) -> dict[str, str]:
+    """Allowlisted environment (``exec.build_env``) for backend probes and helper commands."""
+    import tempfile
+
+    from ..exec import build_env  # lazy: exec imports this package
+
+    return build_env(Path(root), Path(tempfile.gettempdir()))
+
+
 def sandbox_settings(config: Any) -> Any:
     """Accept a NedsterConfig, a SandboxConfig, or None."""
     return getattr(config, "sandbox", config)
@@ -137,6 +162,8 @@ __all__ = [
     "Isolation",
     "Selection",
     "build_backend",
+    "probe_env",
+    "resolve_binary",
     "sandbox_settings",
     "select_backend",
 ]

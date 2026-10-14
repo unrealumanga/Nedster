@@ -17,7 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import BackendStatus, Isolation
+from . import BackendStatus, Isolation, probe_env
 from .bwrap import protected_paths
 
 BINARY = "/usr/bin/sandbox-exec"
@@ -117,6 +117,7 @@ class SeatbeltBackend:
                 timeout=5,
                 check=False,
                 stdin=subprocess.DEVNULL,
+                env=probe_env(self.root),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             return BackendStatus(self.name, False, self.isolation, f"sandbox-exec probe failed: {exc}")
