@@ -1,0 +1,9 @@
+{
+  "prompt": "Ensure add() handles negative numbers.",
+  "kind": "noop",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [],
+  "requires": [],
+  "forbidden_commands": []
+}
