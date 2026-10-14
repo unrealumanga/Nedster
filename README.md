@@ -1,9 +1,27 @@
 # Nedster
 
+[![CI](https://github.com/unrealumanga/Nedster/actions/workflows/ci.yml/badge.svg)](https://github.com/unrealumanga/Nedster/actions/workflows/ci.yml)
+
 **A local-first coding agent for Ollama.** One native tool-calling loop reads, edits, searches and runs your
 project's tests. What happened is decided from the tool records, never from what the model says about itself.
+Windows, macOS and Linux.
 
 > Status: **4.0 alpha.** The v3 engine is gone; see [Upgrading from v3](#upgrading-from-v3).
+
+## New in v4
+
+- **No fake success.** A "fix X" request that changed nothing ends `INCOMPLETE`, not "done"; "already done" is
+  reported as a claim backed by the files it cites. 16/16 eval fixtures pass with 0 false successes
+  ([Evals](#evals)); the v3 engine scored 1/8 with one false success on the same tasks.
+- **Auto-verify.** If the model edits files but skips the tests, Nedster runs them itself and gives the model one
+  repair turn when they fail.
+- **Undo and sessions.** `/undo` restores the last turn's file edits (refusing if you changed them since);
+  `nedster sessions` and `/resume` bring back earlier conversations.
+- **Long tasks.** The context budget follows the model's real window; old history is compacted deterministically
+  from tool records. Append-only history keeps Ollama's prompt cache warm (measured ~47x faster prefill at 56K tokens).
+- **Faster, cheaper edits.** `edit_file` applies several edits to a file in one atomic call and returns the new hash.
+- **Safer execution.** Commands run only with your consent, in Docker / bubblewrap / Seatbelt, or on the host
+  when you opt in (Windows process trees are always contained in a Job Object, and fail closed).
 
 ## What it is
 
