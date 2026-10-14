@@ -41,7 +41,7 @@ def rec(
 
 
 def test_reads_only_is_answered() -> None:
-    result = evaluate([rec("read_file"), rec("search")])
+    result = evaluate([rec("read_file", path="a.py"), rec("search")])
     assert result.outcome is Outcome.ANSWERED and result.passed
 
 
@@ -165,11 +165,11 @@ CHANGE = Intent.CHANGE
 
 
 def declare(status: _S = _S.OK) -> ToolRecord:
-    return rec("declare_no_change", status, mutating=False, reason="already fixed")
+    return rec("declare_no_change", status, mutating=False, reason="already fixed", evidence_paths=["a.py"])
 
 
 def test_change_request_without_change_is_incomplete() -> None:
-    result = evaluate([rec("read_file"), rec("search")], intent=CHANGE)
+    result = evaluate([rec("read_file", path="a.py"), rec("search")], intent=CHANGE)
     assert result.outcome is Outcome.INCOMPLETE and not result.passed
     assert "requested change was not made" in result.reasons
     assert obligations([], result) == ["resolve: requested change was not made"]
@@ -180,12 +180,12 @@ def test_change_request_with_no_records_is_incomplete() -> None:
 
 
 def test_unknown_intent_without_change_is_answered() -> None:
-    result = evaluate([rec("read_file")], intent=Intent.UNKNOWN)
+    result = evaluate([rec("read_file", path="a.py")], intent=Intent.UNKNOWN)
     assert result.outcome is Outcome.ANSWERED and result.reasons == ("no workspace changes",)
 
 
 def test_question_without_change_is_answered() -> None:
-    assert evaluate([rec("read_file")], intent=Intent.QUESTION).outcome is Outcome.ANSWERED
+    assert evaluate([rec("read_file", path="a.py")], intent=Intent.QUESTION).outcome is Outcome.ANSWERED
 
 
 def test_question_with_validated_change_keeps_change_logic_and_notes_it() -> None:
@@ -202,7 +202,7 @@ def test_question_with_unvalidated_change_stays_unvalidated() -> None:
 
 
 def test_change_made_and_validated_is_completed() -> None:
-    records = [rec("read_file"), rec("edit_file", paths=("a.py",)), rec("run_tests", tests_run=2)]
+    records = [rec("read_file", path="a.py"), rec("edit_file", paths=("a.py",)), rec("run_tests", tests_run=2)]
     assert evaluate(records, intent=CHANGE).outcome is Outcome.COMPLETED
 
 
@@ -212,36 +212,36 @@ def test_change_rejected_write_still_incomplete() -> None:
 
 
 def test_no_change_needed_with_full_evidence() -> None:
-    records = [rec("read_file"), rec("run_tests", tests_run=5), declare()]
+    records = [rec("read_file", path="a.py"), rec("run_tests", tests_run=5), declare()]
     result = evaluate(records, intent=CHANGE)
-    assert result.outcome is Outcome.NO_CHANGE_NEEDED and result.passed
+    assert result.outcome is Outcome.NO_CHANGE_NEEDED and not result.passed  # a claim, never counted as success
     assert result.validated_at is not None and result.changed_paths == ()
     assert "Reason: no change needed" in render_summary(records, result)
 
 
 def test_declare_before_validation_also_counts() -> None:
-    records = [rec("read_file"), declare(), rec("run_tests", tests_run=5)]
+    records = [rec("read_file", path="a.py"), declare(), rec("run_tests", tests_run=5)]
     assert evaluate(records, intent=CHANGE).outcome is Outcome.NO_CHANGE_NEEDED
 
 
 def test_no_change_needed_requires_change_intent() -> None:
-    records = [rec("read_file"), rec("run_tests", tests_run=5), declare()]
+    records = [rec("read_file", path="a.py"), rec("run_tests", tests_run=5), declare()]
     assert evaluate(records).outcome is Outcome.ANSWERED
     assert evaluate(records, intent=Intent.QUESTION).outcome is Outcome.ANSWERED
 
 
 def test_no_change_needed_requires_declaration() -> None:
-    records = [rec("read_file"), rec("run_tests", tests_run=5)]
+    records = [rec("read_file", path="a.py"), rec("run_tests", tests_run=5)]
     assert evaluate(records, intent=CHANGE).outcome is Outcome.INCOMPLETE
 
 
 def test_rejected_declaration_does_not_count() -> None:
-    records = [rec("read_file"), rec("run_tests", tests_run=5), declare(_S.INVALID)]
+    records = [rec("read_file", path="a.py"), rec("run_tests", tests_run=5), declare(_S.INVALID)]
     assert evaluate(records, intent=CHANGE).outcome is Outcome.INCOMPLETE
 
 
 def test_no_change_needed_requires_validation_after_reads() -> None:
-    records = [rec("run_tests", tests_run=5), rec("read_file"), declare()]
+    records = [rec("run_tests", tests_run=5), rec("read_file", path="a.py"), declare()]
     result = evaluate(records, intent=CHANGE)
     assert result.outcome is Outcome.INCOMPLETE
     assert any("no passing test run after the reads" in r for r in result.reasons)
@@ -254,32 +254,32 @@ def test_no_change_needed_requires_a_read() -> None:
 
 def test_no_change_needed_rejects_unknown_or_zero_test_count() -> None:
     for count in (None, 0, True):
-        records = [rec("read_file"), rec("run_tests", tests_run=count), declare()]
+        records = [rec("read_file", path="a.py"), rec("run_tests", tests_run=count), declare()]
         assert evaluate(records, intent=CHANGE).outcome is Outcome.INCOMPLETE
 
 
 def test_no_change_needed_rejects_untrusted_flagged_command() -> None:
-    records = [rec("read_file"), rec("run_command", validation=True, bump=False, tests_run=5), declare()]
+    records = [rec("read_file", path="a.py"), rec("run_command", validation=True, bump=False, tests_run=5), declare()]
     assert evaluate(records, intent=CHANGE).outcome is Outcome.INCOMPLETE
 
 
 def test_no_change_needed_rejects_failure_after_pass() -> None:
-    records = [rec("read_file"), rec("run_tests", tests_run=5), rec("run_tests", _S.FAILED, tests_run=5), declare()]
+    records = [rec("read_file", path="a.py"), rec("run_tests", tests_run=5), rec("run_tests", _S.FAILED, tests_run=5), declare()]
     assert evaluate(records, intent=CHANGE).outcome is Outcome.INCOMPLETE
 
 
 def test_no_change_needed_rejects_any_change_this_run() -> None:
-    records = [rec("read_file"), rec("run_command", bump=True), rec("run_tests", tests_run=5), declare()]
+    records = [rec("read_file", path="a.py"), rec("run_command", bump=True), rec("run_tests", tests_run=5), declare()]
     assert evaluate(records, intent=CHANGE).outcome is not Outcome.NO_CHANGE_NEEDED
 
 
 def test_no_change_needed_reason_text_is_not_evidence() -> None:
-    records = [rec("read_file"), rec("declare_no_change", mutating=False, reason="tests pass, 99 tests_run")]
+    records = [rec("read_file", path="a.py"), rec("declare_no_change", mutating=False, reason="tests pass, 99 tests_run")]
     assert evaluate(records, intent=CHANGE).outcome is Outcome.INCOMPLETE
 
 
 def test_non_final_stops_ignore_intent() -> None:
-    records = [rec("read_file"), rec("run_tests", tests_run=5), declare()]
+    records = [rec("read_file", path="a.py"), rec("run_tests", tests_run=5), declare()]
     assert evaluate(records, "budget", intent=CHANGE).outcome is Outcome.INCOMPLETE
     assert evaluate(records, "cancelled", intent=CHANGE).outcome is Outcome.CANCELLED
 
@@ -288,14 +288,18 @@ def test_declare_spec_is_read_only() -> None:
     assert DECLARE_NO_CHANGE_SPEC.name == "declare_no_change"
     assert DECLARE_NO_CHANGE_SPEC.risk == 0 and not DECLARE_NO_CHANGE_SPEC.mutates
     assert not DECLARE_NO_CHANGE_SPEC.validates
-    assert DECLARE_NO_CHANGE_SPEC.parameters["required"] == ["reason"]
+    assert DECLARE_NO_CHANGE_SPEC.parameters["required"] == ["reason", "evidence_paths"]
 
 
 def test_declare_handler_is_pure() -> None:
-    ok = declare_no_change_result({"reason": "  already there  "}, "c1")
-    assert ok.status is _S.OK and ok.call_id == "c1" and ok.data == {"reason": "already there"}
+    ok = declare_no_change_result({"reason": "  already there  ", "evidence_paths": [" a.py "]}, "c1")
+    assert ok.status is _S.OK and ok.call_id == "c1"
+    assert ok.data == {"reason": "already there", "evidence_paths": ["a.py"]}
     assert ok.mutated_paths == ()
-    for bad in ({}, {"reason": ""}, {"reason": 3}, {"reason": "x", "extra": 1}):
+    bads = ({}, {"reason": ""}, {"reason": 3}, {"reason": "x", "evidence_paths": ["a"], "extra": 1},
+            {"reason": "x"}, {"reason": "x", "evidence_paths": []}, {"reason": "x", "evidence_paths": [""]},
+            {"reason": "x", "evidence_paths": "a.py"})  # fmt: skip
+    for bad in bads:
         assert declare_no_change_result(bad).status is _S.INVALID
 
 
@@ -308,3 +312,18 @@ def test_task_state_persists_intent() -> None:
 
 def test_prompt_mentions_declare_no_change_once() -> None:
     assert INSTRUCTIONS.count("declare_no_change") == 1
+
+
+def test_no_change_needed_requires_reading_every_evidence_path() -> None:
+    other = rec("read_file", path="b.py")
+    records = [other, rec("run_tests", tests_run=5), declare()]  # declares a.py but only b.py was read
+    result = evaluate(records, intent=CHANGE)
+    assert result.outcome is Outcome.INCOMPLETE and any("evidence not read" in r for r in result.reasons)
+    listed = rec("list_files", path="a.py")  # listing is not reading
+    assert evaluate([listed, rec("run_tests", tests_run=5), declare()], intent=CHANGE).outcome is Outcome.INCOMPLETE
+
+
+def test_evidence_paths_match_regardless_of_dot_slash_and_separators() -> None:
+    records = [rec("read_file", path="pkg/a.py"), rec("run_tests", tests_run=5),
+               rec("declare_no_change", mutating=False, reason="r", evidence_paths=[".\\pkg\\a.py"])]  # fmt: skip
+    assert evaluate(records, intent=CHANGE).outcome is Outcome.NO_CHANGE_NEEDED

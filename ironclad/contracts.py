@@ -196,7 +196,9 @@ class AcceptanceResult:
 
     @property
     def passed(self) -> bool:
-        return self.outcome in {Outcome.COMPLETED, Outcome.ANSWERED, Outcome.NO_CHANGE_NEEDED}
+        # NO_CHANGE_NEEDED rests on the model's claim plus a green suite that may not cover the request, so it is
+        # reported as its own outcome and never counted as success (exit code, evals, UI badge).
+        return self.outcome in {Outcome.COMPLETED, Outcome.ANSWERED}
 
 
 # ---------------------------------------------------------------------------

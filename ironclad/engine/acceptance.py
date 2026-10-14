@@ -59,17 +59,26 @@ NOT_MADE = "requested change was not made"
 QUESTION_CHANGED = "changes were made for a question"
 DECLARE_NO_CHANGE = "declare_no_change"
 MAX_REASON_CHARS = 1000
+MAX_EVIDENCE_PATHS = 20
 DECLARE_NO_CHANGE_SPEC = ToolSpec(
     name=DECLARE_NO_CHANGE,
     description=(
         "Declare that the requested change is already in place, so nothing needs editing. Only call this after "
-        "reading the relevant code and running the tests (run_tests) with a passing result; without passing "
-        "tests after your reads the declaration is not accepted."
+        "read_file on every file in evidence_paths and a passing run_tests; otherwise it is not accepted."
     ),
     parameters={
         "type": "object",
-        "properties": {"reason": {"type": "string", "minLength": 1, "maxLength": MAX_REASON_CHARS}},
-        "required": ["reason"],
+        "properties": {
+            "reason": {"type": "string", "minLength": 1, "maxLength": MAX_REASON_CHARS},
+            "evidence_paths": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+                "maxItems": MAX_EVIDENCE_PATHS,
+                "description": "Files you read that show the request is already satisfied",
+            },
+        },
+        "required": ["reason", "evidence_paths"],
         "additionalProperties": False,
     },
     risk=0,  # RiskLevel.READ; no side effects
@@ -80,16 +89,26 @@ DECLARE_NO_CHANGE_SPEC = ToolSpec(
 def declare_no_change_result(args: Mapping[str, Any], call_id: str = "") -> ToolResult:
     """Pure handler: records the claim; acceptance decides from tool evidence whether it holds."""
     reason = args.get("reason") if isinstance(args, Mapping) else None
-    extra = set(args) - {"reason"} if isinstance(args, Mapping) else set()
-    if not isinstance(reason, str) or not reason.strip() or extra:
-        text = "declare_no_change needs exactly one argument: a non-empty string 'reason'."
+    paths = args.get("evidence_paths") if isinstance(args, Mapping) else None
+    extra = set(args) - {"reason", "evidence_paths"} if isinstance(args, Mapping) else set()
+    valid_paths = (
+        isinstance(paths, list)
+        and 0 < len(paths) <= MAX_EVIDENCE_PATHS
+        and all(isinstance(path, str) and path.strip() for path in paths)
+    )
+    if not isinstance(reason, str) or not reason.strip() or not valid_paths or extra:
+        text = (
+            "declare_no_change needs 'reason' (non-empty string) and 'evidence_paths' "
+            f"(1-{MAX_EVIDENCE_PATHS} files you read) and nothing else."
+        )
         return ToolResult(call_id, DECLARE_NO_CHANGE, ToolStatus.INVALID, text)
     reason = reason.strip()[:MAX_REASON_CHARS]
     text = (
-        "Recorded. The engine accepts 'no change needed' only if a passing test run happened after your reads "
-        "and nothing was changed."
+        "Recorded. 'No change needed' is accepted only if every evidence path was read this run, a passing test "
+        "run followed those reads, and nothing was changed. It is reported to the user as a claim, not a success."
     )
-    return ToolResult(call_id, DECLARE_NO_CHANGE, ToolStatus.OK, text, data={"reason": reason})
+    data = {"reason": reason, "evidence_paths": [path.strip() for path in paths]}  # type: ignore[union-attr]
+    return ToolResult(call_id, DECLARE_NO_CHANGE, ToolStatus.OK, text, data=data)
 
 
 def is_validation(record: ToolRecord) -> bool:
@@ -188,14 +207,21 @@ def _names(records: Sequence[ToolRecord]) -> str:
 
 def _no_change_evidence(records: Sequence[ToolRecord]) -> tuple[ToolRecord | None, str]:
     """The passing validation that justifies NO_CHANGE_NEEDED, or ``None`` and why not."""
-    if not any(r.call.name == DECLARE_NO_CHANGE and r.result.status is ToolStatus.OK for r in records):
+    declarations = [r for r in records if r.call.name == DECLARE_NO_CHANGE and r.result.status is ToolStatus.OK]
+    if not declarations:
         return None, ""
     if any(_is_change(r) for r in records):
         return None, "declare_no_change ignored: the workspace changed this run"
-    reads = [i for i, r in enumerate(records) if _is_read(r)]
-    if not any(records[i].result.status is ToolStatus.OK for i in reads):
-        return None, "declare_no_change ignored: nothing was read first"
-    passes = [i for i, r in enumerate(records) if validation_verdict(r) == "pass" and i > reads[-1]]
+    wanted = {_norm_path(path) for path in declarations[-1].result.data.get("evidence_paths", ())}
+    read_at: dict[str, int] = {}
+    for i, r in enumerate(records):
+        if r.call.name == "read_file" and r.result.status is ToolStatus.OK:
+            read_at[_norm_path(str(r.result.data.get("path") or r.call.arguments.get("path", "")))] = i
+    missing = sorted(path for path in wanted if path not in read_at)
+    if not wanted or missing:
+        return None, f"declare_no_change ignored: evidence not read this run ({', '.join(missing) or 'none given'})"
+    last_read = max(read_at[path] for path in wanted)
+    passes = [i for i, r in enumerate(records) if validation_verdict(r) == "pass" and i > last_read]
     if not passes:
         return None, "declare_no_change ignored: no passing test run after the reads"
     index = passes[-1]
@@ -205,8 +231,12 @@ def _no_change_evidence(records: Sequence[ToolRecord]) -> tuple[ToolRecord | Non
     return records[index], ""
 
 
-def _is_read(record: ToolRecord) -> bool:
-    return record.call.name != DECLARE_NO_CHANGE and not is_validation(record)
+def _norm_path(path: str) -> str:
+    text = path.strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text.casefold()
+
 
 
 def _with_reason(result: AcceptanceResult, reason: str) -> AcceptanceResult:
