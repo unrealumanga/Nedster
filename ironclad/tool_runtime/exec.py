@@ -539,14 +539,14 @@ class Job:
             job.assign(self._proc)
             self._winjob = job
             self._winjob_used = True
-        except OSError:
+        except OSError as exc:
             # Fail closed: terminate the suspended child, never resume it outside the job.
             with contextlib.suppress(OSError):
                 self._proc.kill()
             with contextlib.suppress(subprocess.TimeoutExpired):
                 self._proc.wait(timeout=2.0)
             job.close()
-            raise OSError("process containment failed: could not assign the process to a Windows Job Object")
+            raise OSError("process containment failed: could not assign the process to a Windows Job Object") from exc
         try:
             resume_process(self._proc)
         except OSError:
