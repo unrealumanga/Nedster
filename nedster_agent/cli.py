@@ -158,6 +158,8 @@ def _config_show(args: argparse.Namespace) -> int:
             node = node[part]
         value = json.dumps(node) if not isinstance(node, str) else node
         print(f"{key} = {value}  [{provenance[key]}]")
+    for warning in config.warnings:
+        print(f"# warning: {warning}")
     return EXIT_OK
 
 
@@ -254,6 +256,7 @@ def _doctor(args: argparse.Namespace) -> int:
         "configured": config_path.exists(),
     }
     report["tiers"] = tiers
+    report["config_warnings"] = list(config.warnings)
     ready = bool(tiers["inference"]["ready"])
     if args.json:
         _emit_json(report)
@@ -276,6 +279,8 @@ def _doctor(args: argparse.Namespace) -> int:
             tier = tiers[key]
             mark = "ready" if tier["ready"] else "NOT READY"
             console.print(_ascii(f"{label:<16}{mark} · {tier.get('detail', '')}", args.ascii), highlight=False, markup=False)
+    for warning in config.warnings:
+        _err(f"config warning: {warning}")
     for key, label in labels.items():
         if not tiers[key]["ready"]:
             _err(f"{label}: {tiers[key].get('remedy', 'see detail above')}")

@@ -46,8 +46,10 @@ class SandboxConfig:
 
 @dataclass(slots=True)
 class PolicyConfig:
+    # Execute-level autonomy needs an explicit opt-in (policy.max_auto_risk = "execute").
+    # denied_fragments is advisory substring matching, NOT a security boundary.
     autonomous: bool = True
-    max_auto_risk: str = "execute"
+    max_auto_risk: str = "write"
     allowed_commands: list[str] = field(default_factory=lambda: [
         "python", "python3", "pytest", "git", "rg", "ruff", "uv", "npm", "node", "cargo", "go"
     ])
@@ -79,6 +81,7 @@ class NedsterConfig:
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     engine: str = "legacy"
+    warnings: list[str] = field(default_factory=list)
 
 
 Config = NedsterConfig
@@ -87,6 +90,17 @@ Config = NedsterConfig
 _BOOL_TRUE = {"1", "true", "yes", "on"}
 _BOOL_FALSE = {"0", "false", "no", "off", ""}
 _ENGINES = ("native", "legacy")
+_RISK_ORDER = ("read", "write", "execute", "destructive", "external")
+# A cloned repo's .nedster/config.toml is untrusted: it may only pick model names / tuning,
+# and may only tighten (never loosen) the security settings below.
+_PROJECT_SAFE_KEYS = frozenset({
+    "models.router", "models.coder", "models.reasoner", "models.critic", "models.summarizer",
+    "runtime.context_tokens", "runtime.profile", "engine",
+})
+_PROJECT_TIGHTEN_KEYS = frozenset({
+    "sandbox.allow_host_execution", "policy.autonomous", "policy.max_auto_risk",
+    "policy.allowed_commands", "policy.denied_fragments",
+})
 _SECTIONS = ("models", "sandbox", "policy", "runtime")
 # Legacy / convenience variables -> dotted field. Applied before NEDSTER_<SECTION>__<FIELD>.
 _ENV_ALIASES: tuple[tuple[str, str], ...] = (
@@ -192,6 +206,52 @@ def _read(path: Path) -> dict[str, Any]:
         raise ValueError(f"Invalid TOML in {path}: {exc}") from exc
 
 
+def _apply_project_layer(config: Config, values: dict[str, Any], provenance: dict[str, str]) -> None:
+    """Apply an untrusted repo-supplied layer: allowlisted keys plus tighten-only security keys."""
+    for key, value in values.items():
+        if key in _PROJECT_SAFE_KEYS:
+            if _set(config, key, value):
+                provenance[key] = "project"
+        elif key in _PROJECT_TIGHTEN_KEYS:
+            _tighten(config, key, value, provenance)
+        else:
+            config.warnings.append(f"ignored project config key {key!r}: not allowed in .nedster/config.toml")
+
+
+def _tighten(config: Config, key: str, value: Any, provenance: dict[str, str]) -> None:
+    probe = Config()
+    if not _set(probe, key, value):
+        return
+    wanted = _get(probe, key)
+    current = _get(config, key)
+    if key == "sandbox.allow_host_execution" or key == "policy.autonomous":
+        result = current and wanted
+    elif key == "policy.max_auto_risk":
+        wanted_text = str(wanted).lower()
+        if wanted_text not in _RISK_ORDER:
+            config.warnings.append(f"ignored project config key {key!r}: unknown risk level {wanted!r}")
+            return
+        current_rank = _RISK_ORDER.index(str(current).lower()) if str(current).lower() in _RISK_ORDER else 1
+        result = wanted_text if _RISK_ORDER.index(wanted_text) < current_rank else current
+    elif key == "policy.allowed_commands":
+        allowed = {str(item) for item in wanted}
+        result = [item for item in current if item in allowed]
+    else:  # policy.denied_fragments: union
+        result = list(current) + [item for item in wanted if item not in current]
+    if result != current:
+        _set(config, key, result)
+        provenance[key] = "project"
+    if key != "policy.denied_fragments" and wanted != result:
+        config.warnings.append(f"project config key {key!r}: loosening ignored, only tightening is accepted")
+
+
+def _get(config: Config, key: str) -> Any:
+    target: Any = config
+    for part in key.split("."):
+        target = getattr(target, part)
+    return target
+
+
 def resolve_config(
     cli_overrides: dict[str, Any] | None = None,
     project_root: str | Path | None = None,
@@ -214,6 +274,9 @@ def resolve_config(
     if root is not None:
         layers.append(("project", _read(root / ".nedster" / "config.toml")))
     for source, values in layers:
+        if source == "project":
+            _apply_project_layer(config, values, provenance)
+            continue
         for key, value in values.items():
             if _set(config, key, value):
                 provenance[key] = source
