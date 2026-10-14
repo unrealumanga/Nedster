@@ -1,0 +1,11 @@
+{
+  "prompt": "test_utils.py fails: clamp_percent in utils.py returns the wrong value at the upper bound. Fix it.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [
+    "utils.py"
+  ],
+  "requires": [],
+  "forbidden_commands": []
+}

@@ -1,0 +1,171 @@
+"""Docker backend: a throwaway, network-less container named ``nedster-<uuid>``.
+
+Cancellation kills the container itself (``docker kill <name>``), not only the CLI.
+Host PATH/TEMP make no sense inside a Linux image, so only locale/terminal variables
+are forwarded, by name (values come from the CLI's own filtered environment).
+
+``--mount`` values are CSV-parsed by Docker, so host paths containing ``,``, ``"`` or a line
+break are refused instead of being allowed to inject mount options. ``.git`` and ``.nedster``
+are mounted read-only even when missing (see ``bwrap.protected_mounts``). On case-insensitive
+hosts (Windows/macOS) every case spelling of those two names is read-only too, so writing to
+e.g. ``/workspace/.GIT/config`` cannot slip past the ``/workspace/.git`` mount and reach the
+host's real ``.git``. On POSIX hosts the container runs as the invoking user; memory and
+CPUs are capped.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import subprocess
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+
+from . import BackendStatus, Isolation, probe_env, resolve_binary
+from .bwrap import EmptyDir, protected_mounts
+
+WORKSPACE = "/workspace"
+FORWARDED = ("LANG", "TERM", "PYTHONIOENCODING")
+MOUNT_UNSAFE = frozenset(',"\r\n')
+DEFAULT_MEMORY = "4g"
+DEFAULT_CPUS = "2"
+# Host filesystems that fold case, so ``.GIT`` and ``.git`` are the same host directory.
+CASE_FOLDING_HOSTS = os.name == "nt" or sys.platform == "darwin"
+# Names whose case aliases must be protected on those hosts (matches bwrap.PROTECTED).
+PROTECTED_NAMES = (".git", ".nedster")
+
+
+def case_variants(name: str) -> tuple[str, ...]:
+    """Every case spelling of ``name``; non-letters (the leading dot) are left untouched."""
+    indexes = [index for index, char in enumerate(name) if char.isalpha()]
+    variants: list[str] = []
+    for mask in range(1 << len(indexes)):
+        chars = list(name)
+        for bit, index in enumerate(indexes):
+            chars[index] = chars[index].upper() if mask >> bit & 1 else chars[index].lower()
+        variants.append("".join(chars))
+    return tuple(variants)
+
+
+def _mount_alias_names(name: str, case_insensitive: bool) -> tuple[str, ...]:
+    """Mount names to cover for a protected path: all case variants on case-folding hosts."""
+    if case_insensitive and name.casefold() in PROTECTED_NAMES:
+        return case_variants(name)
+    return (name,)
+
+
+def mount_alias_relpaths(rel: str, case_insensitive: bool) -> tuple[str, ...]:
+    """Every in-container path spelling a protected ``rel`` needs so no case alias escapes read-only."""
+    parent, _, name = rel.rpartition("/")
+    names = _mount_alias_names(name, case_insensitive)
+    return tuple(f"{parent}/{item}" if parent else item for item in names)
+
+
+def mount_safe(path: str | Path) -> str:
+    """The path as a ``--mount`` field value; raises ValueError if it could inject options."""
+    text = str(path)
+    bad = sorted(set(text) & MOUNT_UNSAFE)
+    if bad:
+        raise ValueError(f"path {text!r} contains {''.join(bad)!r}, which docker --mount cannot carry safely")
+    return text
+
+
+class DockerBackend:
+    name = "docker"
+    isolation: Isolation = "full"
+    host_paths = False
+
+    def __init__(
+        self,
+        root: Path,
+        image: str = "python:3.13-slim",
+        *,
+        memory: str = DEFAULT_MEMORY,
+        cpus: str = DEFAULT_CPUS,
+    ):
+        self.root, self.image = Path(root).resolve(), image
+        self.memory, self.cpus = str(memory), str(cpus)
+        self.binary = resolve_binary(self.root, "docker")
+        self.empty = EmptyDir()
+        # Overridable so tests can exercise both branches on any host.
+        self.case_insensitive = CASE_FOLDING_HOSTS
+
+    def _run(self, *args: str, timeout: float = 10) -> subprocess.CompletedProcess[bytes]:
+        assert self.binary
+        return subprocess.run(
+            [self.binary, *args],
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env=probe_env(self.root),
+            cwd=tempfile.gettempdir(),
+        )
+
+    def probe(self) -> BackendStatus:
+        if not self.binary:
+            return BackendStatus(self.name, False, self.isolation, "docker is not installed")
+        try:
+            mount_safe(self.root)
+        except ValueError as exc:
+            return BackendStatus(self.name, False, self.isolation, str(exc))
+        try:
+            info = self._run("info", "--format", "{{.ServerVersion}}")
+            if info.returncode != 0:
+                return BackendStatus(self.name, False, self.isolation, "docker daemon is not reachable")
+            image = self._run("image", "inspect", "--format", "{{.Id}}", self.image)
+            if image.returncode != 0:
+                return BackendStatus(
+                    self.name,
+                    False,
+                    self.isolation,
+                    f"image {self.image!r} is not present (docker pull it first)",
+                )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return BackendStatus(self.name, False, self.isolation, f"docker probe failed: {exc}")
+        return BackendStatus(self.name, True, self.isolation, f"container from {self.image}; network none")
+
+    def wrap(self, argv: list[str], cwd: Path, env: dict[str, str]) -> list[str]:
+        if not self.binary:
+            raise RuntimeError("docker is not installed")
+        rel = Path(cwd).resolve().relative_to(self.root).as_posix()
+        workdir = WORKSPACE if rel == "." else f"{WORKSPACE}/{rel}"
+        cmd = [
+            self.binary, "run", "--rm", "-i", "--name", f"nedster-{uuid.uuid4().hex}",
+            "--network", "none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+            "--pids-limit", "512", "--memory", self.memory, "--cpus", self.cpus,
+            "--tmpfs", "/tmp:rw,nosuid,size=256m",
+            "--mount", f"type=bind,src={mount_safe(self.root)},dst={WORKSPACE}",
+        ]  # fmt: skip
+        if hasattr(os, "getuid"):
+            cmd.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
+        for source, target in protected_mounts(self.root, self.empty.path):
+            try:
+                rel_protected = target.relative_to(self.root).as_posix()
+            except ValueError:
+                continue  # a gitdir outside the project is not mounted at all
+            safe_source = mount_safe(source)
+            for alias in mount_alias_relpaths(rel_protected, self.case_insensitive):
+                dst = mount_safe(f"{WORKSPACE}/{alias}")
+                cmd.extend(["--mount", f"type=bind,src={safe_source},dst={dst},readonly"])
+        cmd.extend(["--workdir", workdir, "--env", "TMPDIR=/tmp", "--env", "HOME=/tmp"])
+        for key in env:
+            if key in FORWARDED or key.startswith("LC_"):
+                cmd.extend(["--env", key])
+        return [*cmd, self.image, *argv]
+
+    @staticmethod
+    def container_name(wrapped: list[str]) -> str | None:
+        for index, item in enumerate(wrapped[:-1]):
+            if item == "--name" and wrapped[index + 1].startswith("nedster-"):
+                return wrapped[index + 1]
+        return None
+
+    def on_cancel(self, wrapped: list[str]) -> None:
+        name = self.container_name(wrapped)
+        if not name or not self.binary:
+            return
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            self._run("kill", name, timeout=15)

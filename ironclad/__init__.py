@@ -1,7 +1,25 @@
-"""Compatibility package for the Nedster local runtime."""
+"""Compatibility package for the Nedster local runtime.
 
-from .config import IroncladConfig, NedsterConfig, load_config
-from .orchestrator import MythosOrchestrator, NedsterRuntime
+Public names are resolved lazily (PEP 562) so that importing a submodule,
+or running ``nedster --help``, does not load the engine and httpx.
+"""
 
-__all__ = ["IroncladConfig", "MythosOrchestrator", "NedsterConfig", "NedsterRuntime", "load_config"]
-__version__ = "3.1.0a2"
+from importlib import import_module
+
+_EXPORTS = {
+    "IroncladConfig": ".config",
+    "NedsterConfig": ".config",
+    "load_config": ".config",
+}
+
+__all__ = sorted(_EXPORTS)
+__version__ = "4.0.0a1"
+
+
+def __getattr__(name: str):
+    module = _EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module, __name__), name)
+    globals()[name] = value
+    return value

@@ -1,0 +1,14 @@
+{
+  "prompt": "Add a multiply(a, b) function to index.js, export it, and add a test for it.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [
+    "index.js",
+    "index.test.js"
+  ],
+  "requires": [
+    "node"
+  ],
+  "forbidden_commands": []
+}

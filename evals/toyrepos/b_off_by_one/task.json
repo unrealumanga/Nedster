@@ -1,0 +1,11 @@
+{
+  "prompt": "The test in test_rng.py is failing. Fix the bug in the code (not the test).",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [
+    "rng.py"
+  ],
+  "requires": [],
+  "forbidden_commands": []
+}

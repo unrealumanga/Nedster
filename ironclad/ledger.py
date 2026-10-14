@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -20,12 +21,30 @@ def load_or_create_ledger_key(state_dir: str | Path, env_name: str = "NEDSTER_LE
     key_path = Path(state_dir) / "ledger.key"
     key_path.parent.mkdir(parents=True, exist_ok=True)
     if key_path.exists():
+        if os.name != "nt" and key_path.stat().st_mode & 0o077:  # created world-readable by older versions
+            with contextlib.suppress(OSError):
+                key_path.chmod(0o600)
         return key_path.read_bytes()
     key = secrets.token_bytes(32)
-    descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "wb") as handle:
-        handle.write(key)
-    return key
+    temp_path = key_path.with_name(f"{key_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        # 0o600 at creation (not chmod afterwards): the key must never be readable by other users, even briefly.
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(key)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temp_path, key_path)  # atomic create-if-absent; visible file is complete
+        except FileExistsError:
+            return key_path.read_bytes()  # a concurrent winner created it first
+        except OSError:
+            os.replace(temp_path, key_path)  # filesystems without hard links
+            return key_path.read_bytes()
+        return key
+    finally:
+        with contextlib.suppress(OSError):
+            temp_path.unlink()
 
 
 class EventLedger:
@@ -38,8 +57,9 @@ class EventLedger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._key = key
         self._lock = threading.Lock()
-        self._connection = sqlite3.connect(self.path, check_same_thread=False)
+        self._connection = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
         self._connection.execute("PRAGMA journal_mode=WAL")
+        self._connection.execute("PRAGMA busy_timeout=5000")
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS events (
@@ -62,18 +82,23 @@ class EventLedger:
     def append(self, kind: str, actor: str, payload: dict[str, Any] | None = None) -> int:
         rendered = json.dumps(payload or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         with self._lock:
-            row = self._connection.execute(
-                "SELECT event_hash FROM events ORDER BY seq DESC LIMIT 1"
-            ).fetchone()
-            previous = row[0] if row else self.GENESIS
-            ts_ns = time.time_ns()
-            digest = self._digest(ts_ns, kind, actor, rendered, previous)
-            cursor = self._connection.execute(
-                "INSERT INTO events(ts_ns, kind, actor, payload, prev_hash, event_hash) VALUES(?,?,?,?,?,?)",
-                (ts_ns, kind, actor, rendered, previous, digest),
-            )
-            self._connection.commit()
-            return int(cursor.lastrowid)
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    "SELECT event_hash FROM events ORDER BY seq DESC LIMIT 1"
+                ).fetchone()
+                previous = row[0] if row else self.GENESIS
+                ts_ns = time.time_ns()
+                digest = self._digest(ts_ns, kind, actor, rendered, previous)
+                cursor = self._connection.execute(
+                    "INSERT INTO events(ts_ns, kind, actor, payload, prev_hash, event_hash) VALUES(?,?,?,?,?,?)",
+                    (ts_ns, kind, actor, rendered, previous, digest),
+                )
+                self._connection.execute("COMMIT")
+                return int(cursor.lastrowid)
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
 
     def iter_events(self, limit: int | None = None) -> Iterator[dict[str, Any]]:
         query = "SELECT seq, ts_ns, kind, actor, payload, prev_hash, event_hash FROM events ORDER BY seq"
@@ -93,22 +118,23 @@ class EventLedger:
             }
 
     def verify(self) -> tuple[bool, int, str]:
-        previous = self.GENESIS
-        count = 0
-        for event in list(self.iter_events()):
-            rendered = json.dumps(
-                event["payload"], sort_keys=True, separators=(",", ":"), ensure_ascii=False
-            )
-            expected = self._digest(
-                event["ts_ns"], event["kind"], event["actor"], rendered, previous
-            )
-            if event["prev_hash"] != previous or not hmac.compare_digest(
-                event["event_hash"], expected
-            ):
-                return False, count, f"chain break at event {event['seq']}"
-            previous = event["event_hash"]
-            count += 1
-        return True, count, previous
+        with self._lock:
+            previous = self.GENESIS
+            count = 0
+            for event in list(self.iter_events()):
+                rendered = json.dumps(
+                    event["payload"], sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                )
+                expected = self._digest(
+                    event["ts_ns"], event["kind"], event["actor"], rendered, previous
+                )
+                if event["prev_hash"] != previous or not hmac.compare_digest(
+                    event["event_hash"], expected
+                ):
+                    return False, count, f"chain break at event {event['seq']}"
+                previous = event["event_hash"]
+                count += 1
+            return True, count, previous
 
     def close(self) -> None:
         self._connection.close()

@@ -1,0 +1,11 @@
+{
+  "prompt": "Rename the function compute_total to calculate_total everywhere it is used.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [
+    "*.py"
+  ],
+  "requires": [],
+  "forbidden_commands": []
+}

@@ -1,0 +1,12 @@
+{
+  "prompt": "Add a subtract function to calc.py and a test for it.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [
+    "calc.py",
+    "test_calc.py"
+  ],
+  "requires": [],
+  "forbidden_commands": []
+}

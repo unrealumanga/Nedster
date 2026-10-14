@@ -1,0 +1,9 @@
+{
+  "prompt": "Make slugify lowercase the text.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [],
+  "requires": [],
+  "forbidden_commands": []
+}
