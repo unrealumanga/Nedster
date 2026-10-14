@@ -1,0 +1,9 @@
+{
+  "prompt": "Rename `normalize_sku` to `canonical_sku` everywhere in the shop package, tests included. Don't touch CHANGELOG.md, and leave the text of that log warning alone, our alerting matches on it.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": ["CHANGELOG.md"],
+  "may_change": ["shop/*.py", "tests/*.py", "README.md"],
+  "requires": [],
+  "forbidden_commands": []
+}

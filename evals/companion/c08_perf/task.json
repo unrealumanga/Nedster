@@ -1,0 +1,9 @@
+{
+  "prompt": "join_orders() in reports.py is unusably slow on the real export (about 200k orders and 200k payments). Make it fast without changing what it returns.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": ["reports.py", "test_*.py"],
+  "requires": [],
+  "forbidden_commands": []
+}

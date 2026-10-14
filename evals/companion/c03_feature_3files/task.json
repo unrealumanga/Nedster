@@ -1,0 +1,15 @@
+{
+  "prompt": "Add priorities to the todo tool: `add --priority high|normal|low` (normal by default), and `list` should order high, normal, low, keeping the existing ID order within each priority. Existing task files without a priority must keep working. Please add a unittest regression test too.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [
+    "models.py",
+    "service.py",
+    "cli.py",
+    "tests/**",
+    "test_*.py"
+  ],
+  "requires": [],
+  "forbidden_commands": []
+}

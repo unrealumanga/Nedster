@@ -1,0 +1,9 @@
+{
+  "prompt": "In engine.py, shipping_cost() needs a heavy-parcel surcharge: anything over 20 kg gets a flat 15.00 added on top of the normal price (exactly 20 kg doesn't). Please don't touch anything else in that file, it's big and other teams own most of it.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": ["engine.py"],
+  "requires": [],
+  "forbidden_commands": []
+}

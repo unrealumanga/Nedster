@@ -1,0 +1,7 @@
+number,customer,currency,region,item,qty,unit_price
+1001,Acme,EUR,DE,Widget,10,12.50
+1001,Acme,EUR,DE,Gadget,2,99.99
+1002,Globex,USD,US-CA,Widget,4,14.00
+1003,Initech,GBP,UK,Support,1,450.00
+1004,Acme,JPY,NONE,Import fee,3,1500
+1005,Hooli,USD,NONE,Widget,100,10.00

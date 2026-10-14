@@ -43,6 +43,19 @@ def context_budget(config: Any, model: str) -> int:
     return FALLBACK_CONTEXT_TOKENS
 
 
+def engine_budget(config: Any, model: str) -> Any:
+    """Run limits from ``runtime.max_steps`` / ``runtime.max_tool_calls`` (0 = no limit)."""
+    from .engine.state import Budget
+
+    steps = int(getattr(config.runtime, "max_steps", 40))
+    tool_calls = int(getattr(config.runtime, "max_tool_calls", 120))
+    return Budget(
+        max_steps=steps if steps > 0 else None,
+        max_tool_calls=tool_calls if tool_calls > 0 else None,
+        context_tokens=context_budget(config, model),
+    )
+
+
 def git_inventory(git: Any) -> Callable[[Path], list[str]]:
     """Inventory via hardened ``git ls-files`` (respects .gitignore); falls back to a directory walk."""
     import subprocess
@@ -113,7 +126,6 @@ class NativeSession:
         title: str = "",
     ) -> None:
         from .engine.loop import Engine
-        from .engine.state import Budget
         from .session_store.checkpoints import CheckpointStore
         from .session_store.sqlite_store import SqliteSessionStore
         from .transport.ollama import OllamaTransport
@@ -139,7 +151,7 @@ class NativeSession:
             self.tools,
             model=self.model,
             store=self.store,
-            budget=Budget(context_tokens=context_budget(config, self.model)),
+            budget=engine_budget(config, self.model),
             emit=emit,
             project_root=self.project_root,
         )

@@ -1,0 +1,11 @@
+{
+  "prompt": "I'm new to this codebase. Can you walk me through how an alert posted to our webhook ends up as a Slack message, naming the key functions along the way? Include signature verification, duplicate suppression, routing, the queue/worker handoff and retry behavior. Just explain, don't change anything.",
+  "kind": "question",
+  "check": "check.py",
+  "forbidden_changes": [
+    "**"
+  ],
+  "may_change": [],
+  "requires": [],
+  "forbidden_commands": []
+}

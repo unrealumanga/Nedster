@@ -131,19 +131,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=900.0, help="Seconds per run")
     parser.add_argument("--out", type=Path, default=None, help="Write one JSON record per run (jsonl)")
+    parser.add_argument("--prompts", type=Path, default=None,
+                        help='JSON {"<fixture>": "<prompt>"}: run only those fixtures, with these prompts')
+    parser.add_argument("--root", type=Path, default=TOYREPOS, help="Fixture suite directory (default: evals/toyrepos)")
     args = parser.parse_args(argv)
 
     prefixes = [p.strip() for p in args.only.split(",") if p.strip()]
-    dirs = sorted(d for d in TOYREPOS.iterdir() if (d / "task.json").is_file())
+    dirs = sorted(d for d in args.root.iterdir() if (d / "task.json").is_file())
     if prefixes:
         dirs = [d for d in dirs if any(d.name.startswith(p) for p in prefixes)]
     if not dirs:
         print("no fixtures selected", file=sys.stderr)
         return 2
+    overrides = json.loads(args.prompts.read_text(encoding="utf-8")) if args.prompts else {}
+    if overrides:
+        dirs = [d for d in dirs if d.name in overrides]
     records: list[dict] = []
     for _ in range(max(1, args.repeat)):
         for directory in dirs:
-            records.append(run_task(load_task(directory), args.model, args.timeout))
+            task = load_task(directory)
+            if task.name in overrides:
+                task.prompt = overrides[task.name]
+            records.append(run_task(task, args.model, args.timeout))
     if args.out:
         args.out.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
     print(format_table(records))

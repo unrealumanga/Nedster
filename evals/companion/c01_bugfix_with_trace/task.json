@@ -1,0 +1,9 @@
+{
+  "prompt": "The nightly billing report started crashing and nobody touched the invoices. Here's the traceback:\n\nTraceback (most recent call last):\n  File \"run_report.py\", line 13, in <module>\n    main()\n  File \"run_report.py\", line 9, in main\n    print(billing.format_summary(billing.summarize(invoices, rates)))\n  File \"billing.py\", line 260, in summarize\n    amount = convert(invoice_total(invoice), invoice.currency, base, rates)\n  File \"billing.py\", line 134, in convert\n    return amount / rates[src] * rates[dst]\nKeyError: 'EUR'\n\nPlease fix it.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": ["billing.py", "run_report.py", "test_*.py"],
+  "requires": [],
+  "forbidden_commands": []
+}

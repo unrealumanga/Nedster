@@ -342,8 +342,7 @@ class NedsterApp(App[None]):
         self.status_bar.set_info(info)
         g = self.glyphs
         provider = str(info.get("provider") or "LOCAL")
-        oracle = str(info.get("cloud_oracle") or "")
-        where = f"{provider} + CLOUD oracle ({oracle})" if oracle else provider
+        where = provider
         self.query_one("#identity", Static).update(
             g.text(f"Nedster / {self._project_name()}{g.sep}{where}{g.sep}{info.get('model') or 'no model'}")
         )

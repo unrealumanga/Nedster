@@ -1,0 +1,5 @@
+# currency, rate per 1 USD
+USD, 1.0
+GBP, 0.79   # pound sterling
+EUR, 0.92   # euro
+JPY, 151.2

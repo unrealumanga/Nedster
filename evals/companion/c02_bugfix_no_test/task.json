@@ -1,0 +1,12 @@
+{
+  "prompt": "People are complaining that when we split a bill the shares sometimes don't add up to the total. Like $100.00 between 3 people comes out a cent short. Can you sort that out, keeping shares within a cent of each other and preserving support for refunds and rounding inputs to cents?",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [
+    "splitter.py",
+    "test_*.py"
+  ],
+  "requires": [],
+  "forbidden_commands": []
+}

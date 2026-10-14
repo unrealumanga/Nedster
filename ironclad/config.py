@@ -25,11 +25,6 @@ class ModelConfig:
     router_keep_alive: str = "-1"
     worker_keep_alive: str = "90s"
     local_thinking: bool | str = True
-    cloud_oracle_enabled: bool = False
-    cloud_model: str = "gpt-5.6-sol"
-    cloud_reasoning_effort: str = "high"
-    cloud_reasoning_mode: str = "standard"
-    cloud_reasoning_context: str = "current_turn"
 
 
 @dataclass(slots=True)
@@ -75,6 +70,8 @@ class RuntimeConfig:
     conversation_history_chars: int = 6_000
     max_grounding_sources: int = 5
     context_tokens: int = 0  # engine context budget; 0 = the worker model's num_ctx (from Ollama), else 32768
+    max_steps: int = 40  # model calls per run; 0 = no limit
+    max_tool_calls: int = 120  # tool calls per run; 0 = no limit
 
 
 @dataclass(slots=True)
@@ -108,8 +105,6 @@ _SECTIONS = ("models", "sandbox", "policy", "runtime")
 # Legacy / convenience variables -> dotted field. Applied before NEDSTER_<SECTION>__<FIELD>.
 _ENV_ALIASES: tuple[tuple[str, str], ...] = (
     ("OLLAMA_HOST", "models.ollama_url"),
-    ("NEDSTER_CLOUD_MODEL", "models.cloud_model"),
-    ("NEDSTER_CLOUD_ORACLE", "models.cloud_oracle_enabled"),
     ("NEDSTER_AUTONOMOUS", "policy.autonomous"),
     ("NEDSTER_PROJECT", "runtime.project_root"),
     ("NEDSTER_STATE_DIR", "runtime.state_dir"),
