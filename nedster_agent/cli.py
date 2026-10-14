@@ -67,6 +67,10 @@ def build_parser() -> argparse.ArgumentParser:
     accept_global_options(run)
     run.add_argument("objective", nargs="?", help="Objective (default: read from piped stdin)")
     run.add_argument("--jsonl", action="store_true", help="Emit an event stream, one JSON object per line")
+    run.add_argument("--engine", choices=("native", "legacy"), default=None, help="Agent engine (default: configuration)")
+    run.add_argument("--model", default=None, help="Worker model for the native engine (default: configuration)")
+    run.add_argument("--continue", dest="resume_latest", action="store_true", help="Continue the latest session here")
+    run.add_argument("--session", default=None, help="Continue a specific session id")
     tui = subcommands.add_parser("tui", help="Open the interactive terminal interface")
     accept_global_options(tui)
     ledger = subcommands.add_parser("verify-ledger", help="Verify the local event chain")
@@ -317,9 +321,11 @@ def _read_objective(args: argparse.Namespace) -> str:
 
 
 async def _run_objective(args: argparse.Namespace, objective: str) -> int:
+    config, _ = _resolve(args)
+    if (getattr(args, "engine", None) or config.engine) == "native":
+        return await _run_native(args, config, objective)
     from ironclad.orchestrator import NedsterRuntime
 
-    config, _ = _resolve(args)
     runtime = NedsterRuntime(config)
     jsonl = args.jsonl
     if jsonl:
@@ -340,6 +346,37 @@ async def _run_objective(args: argparse.Namespace, objective: str) -> int:
         steps = f"{result.get('completed_steps', 0)}/{result.get('total_steps', 0)} steps"
         _err(f"[{'passed' if passed else 'failed'} · {result.get('mode', 'ask')} · {steps}]")
     return EXIT_OK if passed else EXIT_RUNTIME
+
+
+async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> int:
+    from dataclasses import asdict
+
+    from ironclad.native import NativeSession
+
+    def emit(event: Any) -> None:
+        if args.jsonl:
+            _emit_json({"kind": event.kind, "session_id": event.session_id, "run_id": event.run_id, "data": dict(event.data)})
+        elif event.kind == "tool.finished" and not args.json:
+            data = event.data
+            _err(f"  {data.get('tool')} -> {data.get('status')} ({data.get('elapsed_ms', 0):.0f} ms)")
+
+    session = NativeSession(
+        config, emit=emit, model=args.model, session_id=args.session, resume_latest=args.resume_latest
+    )
+    try:
+        result = await session.run(objective)
+    finally:
+        await session.aclose()
+    if args.json:
+        payload = asdict(result)
+        payload["outcome"] = result.outcome.value
+        payload["validated_at"] = result.validated_at.counter if result.validated_at else None
+        payload["session_id"] = session.session_id
+        _emit_json(payload)
+    elif not args.jsonl:
+        print(result.answer)
+        _err(f"[{result.outcome.value} · session {session.session_id[:8]}]")
+    return EXIT_OK if result.passed else EXIT_RUNTIME
 
 
 def _verify_ledger(args: argparse.Namespace) -> int:

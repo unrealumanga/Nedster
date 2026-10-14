@@ -116,7 +116,7 @@ def evaluate(records: Sequence[ToolRecord], stop: StopReason = "final", detail: 
         rejected = [r for r in records if r.mutating and not r.validation and r.result.status in _REJECTED]
         if rejected:
             names = ", ".join(sorted({f"{r.call.name} {r.result.status.value}" for r in rejected}))
-            return AcceptanceResult(Outcome.INCOMPLETE, (f"requested change was not applied ({names})",))
+            return AcceptanceResult(Outcome.INCOMPLETE, (f"tool calls were rejected and nothing was changed ({names})",))
         return AcceptanceResult(Outcome.ANSWERED, ("no workspace changes",))
 
     fresh = _fresh_validations(records)
@@ -164,6 +164,8 @@ def render_summary(records: Sequence[ToolRecord], result: AcceptanceResult) -> s
         lines.append(f"Last validation: {_describe(validations[-1])}")
     elif result.changed_paths:
         lines.append("Last validation: none")
+    if not any(r.result.status is ToolStatus.OK for r in records):
+        lines.append("Evidence: none - no tool call succeeded, so this answer is not verified against the project")
     if not result.passed:
         lines.extend(f"Reason: {reason}" for reason in result.reasons)
     return "\n".join(lines)

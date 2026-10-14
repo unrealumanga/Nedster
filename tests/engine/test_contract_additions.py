@@ -43,3 +43,11 @@ async def test_without_validates_flag_same_tool_is_unvalidated() -> None:
     engine, _, _, _ = make(script, {"edit_file": edit, "lint": lint_ok})
     result = await engine.run("s", "tidy calc.py")
     assert result.outcome is Outcome.UNVALIDATED
+
+
+async def test_answer_without_any_successful_tool_is_flagged_unverified() -> None:
+    engine, _, _, _ = make([Turn("It returns {'debug': False}.")], {"read_file": read})
+    result = await engine.run("s", "what does parse_config return?")
+    assert result.outcome is Outcome.ANSWERED
+    assert "Evidence: none" in result.answer
+
