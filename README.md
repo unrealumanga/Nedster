@@ -219,7 +219,7 @@ Latest local run on the release branch (`nedster-worker`, one run per fixture, R
 
 **16/16 checks passed, 0 false successes** (a false success = Nedster claimed success while the check failed).
 Small repos, one run each, one local model. Five runs ended `unvalidated`: the files were changed correctly but
-there was no trusted passing test record (no test suite, or one the runner could not collect), so Nedster did
+there was no trusted passing test record afterwards, so Nedster did
 not call them completed. For comparison, the removed v3 engine scored 1/8 with one false success on a-h.
 
 ## Upgrading from v3
