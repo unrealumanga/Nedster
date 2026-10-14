@@ -26,6 +26,13 @@ from ironclad.contracts import (
     TurnFinished,
     Usage,
 )
+from ironclad.transport._common import (
+    DEFAULT_MAX_LINE_BYTES,
+    DEFAULT_MAX_STREAM_BYTES,
+    ensure_unique_call_ids,
+    iter_stream_lines,
+    new_call_id,
+)
 
 _DONE_REASONS = {"stop": "stop", "length": "length"}
 
@@ -130,16 +137,16 @@ def _parse_arguments(raw: str) -> Mapping[str, Any]:
 
 def _finalize(builders: dict[int, _CallBuilder]) -> tuple[ToolCall, ...]:
     calls: list[ToolCall] = []
-    for index, key in enumerate(sorted(builders)):
+    for key in sorted(builders):
         builder = builders[key]
         calls.append(
             ToolCall(
-                id=builder.id or f"call_{index}",
+                id=builder.id or new_call_id(),
                 name=builder.name,
                 arguments=_parse_arguments(builder.args),
             )
         )
-    return tuple(calls)
+    return ensure_unique_call_ids(calls)
 
 
 class OpenAICompatTransport:
@@ -151,11 +158,15 @@ class OpenAICompatTransport:
         api_key: str,
         *,
         timeout: float = 600,
+        max_stream_bytes: int = DEFAULT_MAX_STREAM_BYTES,
+        max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        self.max_stream_bytes = max_stream_bytes
+        self.max_line_bytes = max_line_bytes
         self._client = client
         self._owns_client = client is None
 
@@ -223,7 +234,12 @@ class OpenAICompatTransport:
         try:
             async with self._http().stream("POST", url, json=payload, headers=headers) as response:
                 response.raise_for_status()
-                async for line in response.aiter_lines():
+                lines = iter_stream_lines(
+                    response,
+                    max_line_bytes=self.max_line_bytes,
+                    max_total_bytes=self.max_stream_bytes,
+                )
+                async for line in lines:
                     stripped = line.strip()
                     if not stripped or not stripped.startswith("data:"):
                         continue

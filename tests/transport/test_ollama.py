@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import httpx
 import pytest
@@ -17,6 +18,8 @@ from ironclad.contracts import (
 )
 from ironclad.transport.fake import FakeTransport
 from ironclad.transport.ollama import OllamaTransport
+
+CALL_ID_RE = re.compile(r"^call_[0-9a-f]{12}$")
 
 
 def ndjson(*chunks: dict) -> bytes:
@@ -83,7 +86,10 @@ async def test_tool_call_split_across_chunks():
     events, error = await drain(make_transport(body))
     assert error is None
     ready = next(event for event in events if isinstance(event, ToolCallsReady))
-    assert ready.calls == (ToolCall(id="call_0", name="read_file", arguments={"path": "a.py"}),)
+    assert len(ready.calls) == 1
+    assert CALL_ID_RE.match(ready.calls[0].id)
+    assert ready.calls[0].name == "read_file"
+    assert ready.calls[0].arguments == {"path": "a.py"}
     finished = events[-1]
     assert isinstance(finished, TurnFinished)
     assert finished.message.tool_calls == list(ready.calls)
@@ -138,7 +144,9 @@ async def test_two_calls_in_one_turn():
     assert error is None
     ready = next(event for event in events if isinstance(event, ToolCallsReady))
     assert [call.name for call in ready.calls] == ["a", "b"]
-    assert [call.id for call in ready.calls] == ["call_0", "call_1"]
+    ids = [call.id for call in ready.calls]
+    assert all(CALL_ID_RE.match(call_id) for call_id in ids)
+    assert len(set(ids)) == 2
     assert ready.calls[1].arguments == {"n": 2}
 
 
@@ -302,3 +310,76 @@ async def test_error_chunk_raises_transport_error():
     events, error = await drain(make_transport(body))
     assert isinstance(error, TransportError)
     assert "system memory" in str(error)
+
+
+# --- regression #13: unique call ids ---------------------------------------
+
+
+def _id_less_call_body(name: str = "read_file") -> bytes:
+    return ndjson(
+        {"message": {"role": "assistant", "tool_calls": [{"function": {"name": name, "arguments": {"path": "a"}}}]},
+         "done": True, "done_reason": "stop"},
+    )
+
+
+async def test_fallback_call_ids_are_unique_across_turns():
+    transport = make_transport(_id_less_call_body())
+    first_ids = []
+    second_ids = []
+    for target in (first_ids, second_ids):
+        events, error = await drain(transport)
+        assert error is None
+        ready = next(event for event in events if isinstance(event, ToolCallsReady))
+        assert CALL_ID_RE.match(ready.calls[0].id)
+        target.append(ready.calls[0].id)
+    assert first_ids[0] != second_ids[0]
+
+
+async def test_duplicate_server_call_ids_are_deduped():
+    body = ndjson(
+        {
+            "message": {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "dup", "function": {"name": "a", "arguments": {"n": 1}}},
+                    {"id": "dup", "function": {"name": "b", "arguments": {"n": 2}}},
+                ],
+            },
+            "done": True,
+        },
+    )
+    events, error = await drain(make_transport(body))
+    assert error is None
+    ready = next(event for event in events if isinstance(event, ToolCallsReady))
+    assert [call.id for call in ready.calls] == ["dup", "dup_1"]
+
+
+# --- regression #20: bounded streams ---------------------------------------
+
+
+def make_capped(body: bytes, **kwargs: object) -> OllamaTransport:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    return OllamaTransport(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)), **kwargs)
+
+
+async def test_total_stream_bytes_capped():
+    body = ndjson({"message": {"role": "assistant", "content": "x" * 400}, "done": True})
+    events, error = await drain(make_capped(body, max_stream_bytes=100))
+    assert isinstance(error, TransportError)
+    assert "bytes for one turn" in str(error)
+    assert not any(isinstance(event, ToolCallsReady) for event in events)
+
+
+async def test_line_bytes_capped():
+    body = b"x" * 200
+    events, error = await drain(make_capped(body, max_line_bytes=100))
+    assert isinstance(error, TransportError)
+    assert "exceeded 100 bytes" in str(error)
+
+
+async def test_default_caps_are_8_mib_and_1_mib():
+    transport = make_transport(b"")
+    assert transport.max_stream_bytes == 8 * 1024 * 1024
+    assert transport.max_line_bytes == 1024 * 1024

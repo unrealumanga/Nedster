@@ -25,6 +25,13 @@ from ironclad.contracts import (
     TurnFinished,
     Usage,
 )
+from ironclad.transport._common import (
+    DEFAULT_MAX_LINE_BYTES,
+    DEFAULT_MAX_STREAM_BYTES,
+    ensure_unique_call_ids,
+    iter_stream_lines,
+    new_call_id,
+)
 
 DEFAULT_BASE_URL = "http://127.0.0.1:11434"
 _NS_PER_MS = 1_000_000.0
@@ -145,10 +152,10 @@ def _parse_arguments(raw: str) -> Mapping[str, Any]:
 
 def _finalize_calls(partials: list[_PartialCall]) -> tuple[ToolCall, ...]:
     calls: list[ToolCall] = []
-    for index, partial in enumerate(partials):
+    for partial in partials:
         arguments = partial.dict_args if partial.dict_args is not None else _parse_arguments(partial.raw_args)
-        calls.append(ToolCall(id=partial.id or f"call_{index}", name=partial.name, arguments=arguments))
-    return tuple(calls)
+        calls.append(ToolCall(id=partial.id or new_call_id(), name=partial.name, arguments=arguments))
+    return ensure_unique_call_ids(calls)
 
 
 class OllamaTransport:
@@ -159,10 +166,14 @@ class OllamaTransport:
         base_url: str = DEFAULT_BASE_URL,
         *,
         timeout: float = 600,
+        max_stream_bytes: int = DEFAULT_MAX_STREAM_BYTES,
+        max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.max_stream_bytes = max_stream_bytes
+        self.max_line_bytes = max_line_bytes
         self._client = client
         self._owns_client = client is None
 
@@ -235,7 +246,12 @@ class OllamaTransport:
         try:
             async with self._http().stream("POST", url, json=payload) as response:
                 response.raise_for_status()
-                async for line in response.aiter_lines():
+                lines = iter_stream_lines(
+                    response,
+                    max_line_bytes=self.max_line_bytes,
+                    max_total_bytes=self.max_stream_bytes,
+                )
+                async for line in lines:
                     stripped = line.strip()
                     if not stripped:
                         continue

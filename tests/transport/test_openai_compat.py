@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import httpx
 
@@ -14,6 +15,8 @@ from ironclad.contracts import (
     TurnFinished,
 )
 from ironclad.transport.openai_compat import OpenAICompatTransport
+
+CALL_ID_RE = re.compile(r"^call_[0-9a-f]{12}$")
 
 
 def sse(*chunks: dict) -> bytes:
@@ -168,3 +171,82 @@ async def test_truncated_stream_never_emits_tool_calls():
     events, error = await drain(make_transport(body))
     assert isinstance(error, TransportError)
     assert not any(isinstance(event, ToolCallsReady) for event in events)
+
+
+# --- regression #13: unique call ids ---------------------------------------
+
+
+def _id_less_call_body() -> bytes:
+    return sse(
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": "read", "arguments": '{"p":1}'}}]}}]},
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+    )
+
+
+async def test_fallback_call_ids_are_unique_across_turns():
+    transport = make_transport(_id_less_call_body())
+    ids = []
+    for _ in range(2):
+        events, error = await drain(transport)
+        assert error is None
+        ready = next(event for event in events if isinstance(event, ToolCallsReady))
+        assert CALL_ID_RE.match(ready.calls[0].id)
+        ids.append(ready.calls[0].id)
+    assert ids[0] != ids[1]
+
+
+async def test_duplicate_server_call_ids_are_deduped():
+    body = sse(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "id": "dup", "function": {"name": "a", "arguments": "{}"}},
+                            {"index": 1, "id": "dup", "function": {"name": "b", "arguments": "{}"}},
+                        ]
+                    }
+                }
+            ]
+        },
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+    )
+    events, error = await drain(make_transport(body))
+    assert error is None
+    ready = next(event for event in events if isinstance(event, ToolCallsReady))
+    assert [call.id for call in ready.calls] == ["dup", "dup_1"]
+
+
+# --- regression #20: bounded streams ---------------------------------------
+
+
+def make_capped(body: bytes, **kwargs: object) -> OpenAICompatTransport:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    return OpenAICompatTransport(
+        "http://localhost:8080/v1",
+        "secret",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        **kwargs,
+    )
+
+
+async def test_total_stream_bytes_capped():
+    body = sse({"choices": [{"delta": {"content": "x" * 400}}]})
+    events, error = await drain(make_capped(body, max_stream_bytes=100))
+    assert isinstance(error, TransportError)
+    assert "bytes for one turn" in str(error)
+    assert not any(isinstance(event, ToolCallsReady) for event in events)
+
+
+async def test_line_bytes_capped():
+    events, error = await drain(make_capped(b"data: " + b"x" * 300, max_line_bytes=100))
+    assert isinstance(error, TransportError)
+    assert "exceeded 100 bytes" in str(error)
+
+
+async def test_default_caps_are_8_mib_and_1_mib():
+    transport = make_transport(b"")
+    assert transport.max_stream_bytes == 8 * 1024 * 1024
+    assert transport.max_line_bytes == 1024 * 1024
