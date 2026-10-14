@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 import ast
+from pathlib import Path
 
 from evals.companion import helpers
 
@@ -28,10 +28,10 @@ def check(root: Path, answer: str) -> tuple[bool, str]:
     old_lines, new_lines = old.split(b"\r\n"), new.split(b"\r\n")
     if len(old_lines) != len(new_lines):
         return False, f"line count changed from {len(old_lines)} to {len(new_lines)}"
-    differing = [i for i, (a, b) in enumerate(zip(old_lines, new_lines)) if a != b]
+    differing = [i for i, (a, b) in enumerate(zip(old_lines, new_lines, strict=True)) if a != b]
     if len(differing) != 1:
         return False, f"{len(differing)} lines differ from the original (expected exactly the German bye line)"
-    if differing[0] != next(i for i, l in enumerate(old_lines) if b"Auf Wiedersehen" in l):
+    if differing[0] != next(i for i, line in enumerate(old_lines) if b"Auf Wiedersehen" in line):
         return False, "the wrong line was changed"
     expected = old.decode('utf-8').replace('Auf Wiedersehen und danke für Ihren Besuch.', 'Tschüss!', 1)
     if ast.dump(ast.parse(new.decode('utf-8'))) != ast.dump(ast.parse(expected)):

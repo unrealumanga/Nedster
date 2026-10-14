@@ -15,5 +15,5 @@ class Task:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Task":
+    def from_dict(cls, data: dict) -> Task:
         return cls(id=int(data["id"]), title=str(data["title"]), done=bool(data.get("done", False)))

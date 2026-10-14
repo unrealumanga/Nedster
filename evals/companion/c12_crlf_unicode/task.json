@@ -3,7 +3,11 @@
   "kind": "change",
   "check": "check.py",
   "forbidden_changes": [],
-  "may_change": ["messages.py"],
+  "may_change": [
+    "messages.py",
+    "test_*.py",
+    "tests/**"
+  ],
   "requires": [],
   "forbidden_commands": []
 }

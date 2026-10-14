@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
+import re
 import shutil
 import tempfile
-import re
+from pathlib import Path
 
 from evals.companion import helpers
 
@@ -62,15 +62,15 @@ def check(root: Path, answer: str) -> tuple[bool, str]:
         return False, f"tests must run and pass: {detail}"
     # Runtime wrappers avoid depending on the candidate's implementation spelling.
     mutants = {
-        'duplicate quantity': "const add = Cart.prototype.addItem; Cart.prototype.addItem = function(s,p,q=1) { const existed = this.lines.some(x=>x.sku===s); add.call(this,s,p,q); if(existed) this.lines.find(x=>x.sku===s).qty=q; };",
-        'removeItem': "Cart.prototype.removeItem = function() { return false; };",
+        'duplicate quantity': "const add = this.addItem; this.addItem = function(s,p,q=1) { const existed = this.lines.some(x=>x.sku===s); add.call(this,s,p,q); if(existed) this.lines.find(x=>x.sku===s).qty=q; };",
+        'removeItem': "this.removeItem = function() { return false; };",
     }
     for name, mutation in mutants.items():
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp) / 'repo'
             shutil.copytree(root, work, ignore=shutil.ignore_patterns('node_modules', '.git'))
             with (work / 'src/cart.js').open('a', encoding='utf-8') as f:
-                f.write('\n;(() => { const Cart = module.exports.Cart; ' + mutation + ' })();\n')
+                f.write('\n;module.exports.Cart = class extends module.exports.Cart { constructor(...args) { super(...args); ' + mutation + ' } };\n')
             ok, detail = helpers.run_argv(work, ['node', '--test', '--test-reporter=tap'])
         if ok or not re.search(r'# fail [1-9]\d*', detail):
             return False, f"tests did not catch broken {name}: {detail}"

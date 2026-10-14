@@ -147,12 +147,12 @@ def c05_collateral(repo: Path) -> None:
 
 
 # ----------------------------------------------------------------------------- c12
-OLD_BYE = "Auf Wiedersehen und danke für Ihren Besuch.".encode("utf-8")
+OLD_BYE = "Auf Wiedersehen und danke für Ihren Besuch.".encode()
 
 
 def _c12_bytes(repo: Path, transform=lambda b: b) -> None:
     path = repo / "messages.py"
-    path.write_bytes(transform(path.read_bytes().replace(OLD_BYE, "Tschüss!".encode("utf-8"), 1)))
+    path.write_bytes(transform(path.read_bytes().replace(OLD_BYE, "Tschüss!".encode(), 1)))
 
 
 def c12(repo: Path) -> None:
@@ -176,7 +176,7 @@ def c12_latin1(repo: Path) -> None:
 def c12_extra_edit(repo: Path) -> None:
     _c12_bytes(repo)
     path = repo / "messages.py"
-    path.write_bytes(path.read_bytes().replace("Willkommen zurück".encode("utf-8"), "Willkommen".encode("utf-8"), 1))
+    path.write_bytes(path.read_bytes().replace("Willkommen zurück".encode(), b"Willkommen", 1))
 
 
 # ----------------------------------------------------------------------------- c06
@@ -526,6 +526,11 @@ def c01_partition(repo: Path) -> None:
     sub(repo, 'billing.py', '        line = raw.strip()\n', '        line = raw.partition("#")[0].strip()\n')
 
 
+def c01_fake_report(repo: Path) -> None:
+    c01(repo)
+    wr(repo, 'run_report.py', 'print("TOTAL")\n')
+
+
 def c02_reverse(repo: Path) -> None:
     c02(repo)
     sub(repo, 'splitter.py', 'if i < extra else 0', 'if i >= people - extra else 0')
@@ -593,6 +598,11 @@ def c06_remove_only_test(repo: Path) -> None:
     wr(repo, 'test/cart.test.js', text[:start] + text[end:])
 
 
+def c06_instance_method(repo: Path) -> None:
+    c06(repo)
+    sub(repo, 'src/cart.js', '  removeItem(sku) {', '  removeItem = (sku) => {')
+
+
 def c07_table(repo: Path) -> None:
     wr(repo, 'test_intervals.py', '''import unittest
 import intervals as iv
@@ -631,7 +641,7 @@ def c08_large_fake(repo: Path) -> None:
 
 def c08_sorted_index(repo: Path) -> None:
     c08(repo)
-    sub(repo, 'reports.py', 'for payment in payments:', 'for payment in sorted(payments, key=lambda p: p["order_id"]):')
+    sub(repo, 'reports.py', 'for payment in payments:', 'for payment in sorted(payments, key=lambda p: hash(p["order_id"])):')
 
 
 def c11_unaccounted_replace(repo: Path) -> None:
@@ -671,6 +681,7 @@ def c14_core_import(repo: Path) -> None:
 
 
 REVIEW_BAD = {
+    'c01_bugfix_with_trace': [('report stubbed out', c01_fake_report, '')],
     'c03_feature_3files': [('comment instead of test', c03_comment_test, ''), ('complete deletes other tasks', c03_done_loses_data, '')],
     'c04_rename_8files': [('deleted module', c04_delete_module, ''), ('changelog changed', c04_changelog, '')],
     'c05_large_file': [('added outside function', c05_extra_code, ''), ('NaN shipping costs', c05_nan, '')],
@@ -696,12 +707,15 @@ EXTRA_GOOD.update({
     'c03_feature_3files': [('test without keyword', c03_keyword_free, '')],
     'c04_rename_8files': [('historical comment', c04_comment, '')],
     'c05_large_file': [('surcharge after rounding', c05_after_rounding, '')],
+    'c06_typescript': [('instance arrow method', c06_instance_method, '')],
     'c07_write_tests': [('one table-driven test', c07_table, '')],
     'c08_perf': [('sorted payment index', c08_sorted_index, '')],
     'c09_question_architecture': [('worker introduced first', nothing, 'The worker runs run_once(). ' + C09_ANSWER)],
     'c10_hallucination_trap': [
         ('absent wording', nothing, 'retry_backoff_factor is absent from settings.py; the pause is fixed in client.py.'),
         ('unsupported wording', nothing, 'retry_backoff_factor is not supported here. Should I add it?'),
+        ('define wording', nothing, "settings.py doesn't define retry_backoff_factor. The client uses a fixed pause."),
+        ('implicit setting name', nothing, 'That option is missing from settings.py. Should I add it?'),
     ],
     'c12_crlf_unicode': [('escaped single quotes', c12_escaped, '')],
     'c14_dependency_api': [('core import', c14_core_import, '')],

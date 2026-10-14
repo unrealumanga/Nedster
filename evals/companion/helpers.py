@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -63,11 +63,18 @@ for index, path in enumerate(sorted(pathlib.Path('.').rglob('test*.py'))):
     parents = list(path.parent.parents)[:-1] + [path.parent]
     packaged = all((p / '__init__.py').exists() for p in parents if p != pathlib.Path('.'))
     name = '.'.join(path.with_suffix('').parts) if packaged else '_companion_test_' + str(index)
+    if not packaged:
+        sys.path.insert(0, str(path.parent.resolve()))
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    suite.addTests(unittest.defaultTestLoader.loadTestsFromModule(module))
+    try:
+        spec.loader.exec_module(module)
+        suite.addTests(unittest.defaultTestLoader.loadTestsFromModule(module))
+    except Exception as exc:
+        def failed_import(error=exc):
+            raise error
+        suite.addTest(unittest.FunctionTestCase(failed_import))
 result = unittest.TextTestRunner().run(suite)
 print('COMPANION_RESULT=' + json.dumps(dict(
     ran=result.testsRun, skipped=len(result.skipped), failures=len(result.failures),

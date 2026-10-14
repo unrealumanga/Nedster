@@ -26,6 +26,11 @@ for trial in range(60):
 assert reports.join_orders([], []) == []
 assert reports.join_orders([{"id": 1}], []) == []
 assert isinstance(reports.join_orders([{"id": 1}], [{"order_id": 1, "amount": 1}])[0], tuple)
+orders = [{'id': key} for key in ('007', 7, 'alpha', '007', -2)]
+payments = [{'order_id': key, 'amount': i} for i, key in enumerate((7, '007', 'unknown', -2, '007'))]
+got, want = reports.join_orders(orders, payments), brute(orders, payments)
+assert isinstance(got, list) and len(got) == len(want)
+assert all(g[0] is w[0] and g[1] is w[1] for g, w in zip(got, want))
 
 N = 200_000
 orders = [{"id": i} for i in range(N)]

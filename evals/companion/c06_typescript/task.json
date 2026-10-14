@@ -3,7 +3,16 @@
   "kind": "change",
   "check": "check.py",
   "forbidden_changes": [],
-  "may_change": ["src/cart.js", "test/*.js", "test/**", "*.test.js"],
-  "requires": ["node"],
+  "may_change": [
+    "src/cart.js",
+    "test/*.js",
+    "test/**",
+    "*.test.js",
+    "tests/**",
+    "test*.js"
+  ],
+  "requires": [
+    "node"
+  ],
   "forbidden_commands": []
 }
