@@ -13,7 +13,7 @@ import json
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -134,6 +134,7 @@ class Engine:
         self._running: set[JobHandle] = set()
         self._task: asyncio.Task[Stop] | None = None
         self._augmented: set[str] = set()
+        self._validating: set[str] = set()
 
     # ------------------------------------------------------------------ public API
 
@@ -195,11 +196,12 @@ class Engine:
                     "type": "boolean",
                     "description": "true when this command validates your change (tests, build, lint)",
                 }
-                spec = ToolSpec(spec.name, spec.description, {**spec.parameters, "properties": props}, spec.risk, spec.mutates)
+                spec = replace(spec, parameters={**spec.parameters, "properties": props})
                 self._augmented.add(spec.name)
             specs.append(spec)
         if all(s.name != SHOW_OUTPUT for s in specs):
             specs.append(SHOW_OUTPUT_SPEC)
+        self._validating = {s.name for s in specs if s.validates}
         return specs
 
     # ------------------------------------------------------------------ the loop
@@ -343,7 +345,9 @@ class Engine:
         return ChatMessage(role="tool", content=f"[{status}] {text}", tool_call_id=call.id, name=call.name)
 
     async def _exec_one(self, session: _Session, run: _Run, call: ToolCall, mutating: bool) -> ToolRecord:
-        validation = call.name in self._augmented and call.arguments.get(VALIDATION_ARG) is True
+        validation = call.name in self._validating or (
+            call.name in self._augmented and call.arguments.get(VALIDATION_ARG) is True
+        )
         self._event("tool.started", session, run, {"call_id": call.id, "tool": call.name, "arguments": dict(call.arguments)})
         before = self.tools.revision()
         if call.name == SHOW_OUTPUT:
@@ -463,7 +467,7 @@ class Engine:
             },
         )
         self._event("turn.finished", session, run, {"answer": self.last_answer, "outcome": result.outcome.value})
-        return result
+        return replace(result, answer=self.last_answer)
 
     def _event(self, kind: EventKind, session: _Session, run: _Run, data: Mapping[str, Any]) -> None:
         self._emit(EngineEvent(kind, session.session_id, run.run_id, dict(data), time.time_ns()))

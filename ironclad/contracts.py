@@ -48,6 +48,7 @@ class ToolSpec:
     parameters: Mapping[str, Any]
     risk: int  # ironclad.types.RiskLevel value
     mutates: bool = False
+    validates: bool = False  # a successful run is validation evidence (e.g. run_tests)
 
 
 @dataclass(slots=True, frozen=True)
@@ -125,7 +126,9 @@ class ToolResult:
     tool: str
     status: ToolStatus
     output: str  # bounded, model-facing text
-    data: Mapping[str, Any] = field(default_factory=dict)  # structured extras (exit_code, tests_run, ...)
+    # Structured extras. Standard keys: exit_code, tests_run (int | None: None = unknown), tests_failed,
+    # sha256 (new content hash after write/edit), backend, isolation, duration_ms.
+    data: Mapping[str, Any] = field(default_factory=dict)
     mutated_paths: tuple[str, ...] = ()  # project-relative POSIX paths actually changed
     elapsed_ms: float = 0.0
 
@@ -189,6 +192,7 @@ class AcceptanceResult:
     reasons: tuple[str, ...] = ()
     changed_paths: tuple[str, ...] = ()
     validated_at: WorkspaceRevision | None = None
+    answer: str = ""  # model prose followed by the code-generated summary of changes and validation
 
     @property
     def passed(self) -> bool:
@@ -205,6 +209,7 @@ EventKind = Literal[
     "model.usage",  # data: Usage fields
     "tool.started",  # data: {"call_id", "tool", "arguments"}
     "tool.finished",  # data: {"call_id", "tool", "status", "summary", "mutated_paths", "elapsed_ms"}
+    "context.compacted",  # data: {"elided", "handles", "tokens_before", "tokens_after"}
     "acceptance",  # data: AcceptanceResult fields
     "turn.finished",  # data: {"answer", "outcome"}
     "error",  # data: {"message", "remedy"}
@@ -233,3 +238,9 @@ class SessionStore(Protocol):
     def set_state(self, session_id: str, key: str, value: Any) -> None: ...
 
     def get_state(self, session_id: str, key: str, default: Any = None) -> Any: ...
+
+    def put_output(self, session_id: str, tool: str, call_id: str, text: str) -> int: ...
+
+    def get_output(self, session_id: str, handle: int) -> str: ...
+
+    def replace_messages(self, session_id: str, messages: list[ChatMessage]) -> None: ...
