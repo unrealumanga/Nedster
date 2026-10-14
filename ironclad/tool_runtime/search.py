@@ -16,7 +16,7 @@ from pathlib import Path
 
 from ..contracts import ToolCall, ToolResult, ToolSpec, ToolStatus
 from ..types import RiskLevel
-from .files import ToolError, inventory, locate
+from .files import Inventory, ToolError, locate, walk_inventory
 from .schema import validate
 
 SEARCH_TEXT = "search_text"
@@ -45,8 +45,9 @@ SEARCH_SCHEMA = {
 class SearchTools:
     """Sync ToolRuntime exposing one read-only tool: ``search_text``."""
 
-    def __init__(self, project_root: str | Path):
+    def __init__(self, project_root: str | Path, *, inventory: Inventory | None = None):
         self.project_root = Path(project_root).resolve()
+        self._inventory = inventory or walk_inventory
 
     def specs(self) -> list[ToolSpec]:
         return [
@@ -184,7 +185,7 @@ class SearchTools:
         context: int,
     ) -> ToolResult:
         matcher = re.compile(pattern) if regex else None
-        entries, _ = inventory(base)
+        entries = sorted(set(self._inventory(base)))
         if path.is_file():
             entries = [rel] if rel in entries else []
         elif rel != ".":

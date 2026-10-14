@@ -14,11 +14,10 @@ import difflib
 import fnmatch
 import hashlib
 import os
-import shutil
+import re
 import stat
-import subprocess
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -48,7 +47,10 @@ WALK_SKIP_DIRS = frozenset(
         ".ruff_cache",
     }
 )
-GIT_LS_FILES = ("ls-files", "--cached", "--others", "--exclude-standard")
+MAX_FILE_BYTES = 10 * 1024 * 1024
+READ_CHUNK = 64 * 1024
+SHORT_NAME = re.compile(r"^(?P<stem>[^~]*)~\d+(?:\..*)?$")
+Inventory = Callable[[Path], list[str]]
 
 
 class ToolError(Exception):
@@ -70,6 +72,32 @@ def hash_matches(expected: str, digest: str) -> bool:
     if value.startswith("sha256:"):
         value = value[len("sha256:") :]
     return value == digest or value == digest[:16]
+
+
+def _fold(name: str) -> str:
+    return name.rstrip(" .").casefold()
+
+
+def is_protected(parts: Sequence[str], protected: Sequence[str]) -> bool:
+    """True when any path component names (or aliases) a protected directory.
+
+    Case-insensitive on every OS, ignores trailing dots/spaces (Windows), rejects NTFS
+    alternate data stream syntax (``:``) and 8.3 short names such as ``NEDSTE~1``.
+    """
+    names = {_fold(item) for item in protected}
+    stems = {name.lstrip(".") for name in names}
+    for part in parts:
+        folded = _fold(part)
+        if folded in names:
+            return True
+        if ":" in part and (os.name == "nt" or _fold(part.split(":", 1)[0]) in names):
+            return True
+        short = SHORT_NAME.match(folded)
+        if short:
+            stem = short.group("stem").lstrip(".")
+            if stem and any(name.startswith(stem) for name in stems):
+                return True
+    return False
 
 
 def locate(
@@ -95,10 +123,35 @@ def locate(
             rel = resolved.relative_to(base)
         except ValueError:
             continue
-        if for_write and any(part in protected for part in rel.parts):
+        if for_write and is_protected(rel.parts, protected):
             raise ToolError(f"path is inside a protected directory: {rel.as_posix()}")
         return Located(resolved, rel.as_posix(), base)
     raise ToolError(f"path escapes the project root: {raw}")
+
+
+def read_regular(path: Path, rel: str, limit: int) -> tuple[bytes, str]:
+    """Read a regular file of at most ``limit`` bytes; returns (data, sha256) hashed while streaming."""
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ToolError(f"not a regular file: {rel}")
+    if info.st_size > limit:
+        raise ToolError(f"file too large ({info.st_size} > {limit} bytes): {rel}")
+    digest = hashlib.sha256()
+    chunks: list[bytes] = []
+    total = 0
+    with open(path, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ToolError(f"not a regular file: {rel}")
+        while True:
+            chunk = handle.read(min(READ_CHUNK, limit + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise ToolError(f"file too large (> {limit} bytes): {rel}")
+            digest.update(chunk)
+            chunks.append(chunk)
+    return b"".join(chunks), digest.hexdigest()
 
 
 def detect_newline(data: bytes) -> str | None:
@@ -113,32 +166,8 @@ def apply_newline(text: str, newline: str | None) -> str:
     return text.replace("\r\n", "\n").replace("\n", newline)
 
 
-def inventory(base: Path) -> tuple[list[str], bool]:
-    """Sorted POSIX file paths under ``base``, relative to ``base``. Returns (paths, used_git)."""
-    git = shutil.which("git")
-    if git:
-        env = dict(os.environ)
-        env["GIT_OPTIONAL_LOCKS"] = "0"
-        try:
-            proc = subprocess.run(
-                [git, *GIT_LS_FILES],
-                cwd=base,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-                shell=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            proc = None
-        if proc is not None and proc.returncode == 0:
-            entries = sorted({line.strip() for line in proc.stdout.splitlines() if line.strip()})
-            return entries, True
-    return _walk_inventory(base), False
-
-
-def _walk_inventory(base: Path) -> list[str]:
+def walk_inventory(base: Path) -> list[str]:
+    """Sorted POSIX file paths under ``base`` (skips VCS/build dirs). The default inventory."""
     entries: set[str] = set()
     for dirpath, dirnames, filenames in os.walk(base):
         dirnames[:] = sorted(name for name in dirnames if name not in WALK_SKIP_DIRS)
@@ -231,11 +260,16 @@ class FileTools:
         extra_read_roots: Sequence[str | Path] = (),
         protected: Sequence[str] = DEFAULT_PROTECTED,
         max_read_bytes: int = 200_000,
+        max_file_bytes: int = MAX_FILE_BYTES,
+        inventory: Inventory | None = None,
     ):
         self.project_root = Path(project_root).resolve()
         self.extra_read_roots = tuple(Path(item).resolve() for item in extra_read_roots)
         self.protected = tuple(protected)
         self.max_read_bytes = int(max_read_bytes)
+        self.max_file_bytes = int(max_file_bytes)
+        self._inventory = inventory or walk_inventory
+        self._backend = "inventory" if inventory else "walk"
         self.read_hashes: dict[str, str] = {}
         self._schemas: dict[str, Mapping[str, Any]] = {
             READ_FILE: READ_SCHEMA,
@@ -277,7 +311,7 @@ class FileTools:
         )
         listing = ToolSpec(
             LIST_FILES,
-            "List project files under a directory, optionally filtered by a glob. Git-aware.",
+            "List project files under a directory, optionally filtered by a glob.",
             LIST_SCHEMA,
             int(RiskLevel.READ),
         )
@@ -324,8 +358,7 @@ class FileTools:
     def _read_file(self, call: ToolCall) -> ToolResult:
         args = call.arguments
         located = self._locate(str(args["path"]), for_write=False)
-        data = located.path.read_bytes()
-        digest = sha256_hex(data)
+        data, digest = read_regular(located.path, located.rel, self.max_file_bytes)
         text = self._decode(data, located.rel)
         lines = text.splitlines()
         total = len(lines)
@@ -363,8 +396,7 @@ class FileTools:
         if target.exists():
             if target.is_dir():
                 raise ToolError(f"is a directory: {located.rel}")
-            current = target.read_bytes()
-            digest = sha256_hex(current)
+            current, digest = read_regular(target, located.rel, self.max_file_bytes)
             if not expected or not hash_matches(str(expected), digest):
                 raise ToolError("file changed since read / read it first")
             payload = apply_newline(content, detect_newline(current)).encode("utf-8")
@@ -400,8 +432,7 @@ class FileTools:
         count = int(args.get("count", 1))
         if not old:
             raise ToolError("old must not be empty")
-        current = located.path.read_bytes()
-        digest = sha256_hex(current)
+        current, digest = read_regular(located.path, located.rel, self.max_file_bytes)
         if not hash_matches(str(args["expected_sha"]), digest):
             raise ToolError("file changed since read / read it first")
         text = self._decode(current, located.rel)
@@ -440,7 +471,7 @@ class FileTools:
             raise ToolError(f"no such directory: {located.rel}")
         if not located.path.is_dir():
             raise ToolError(f"not a directory: {located.rel}")
-        entries, used_git = inventory(located.root)
+        entries = sorted(set(self._inventory(located.root)))
         if located.rel != ".":
             prefix = located.rel + "/"
             entries = [entry for entry in entries if entry.startswith(prefix)]
@@ -456,9 +487,9 @@ class FileTools:
             "count": len(shown),
             "total": total,
             "truncated": total > len(shown),
-            "backend": "git" if used_git else "walk",
+            "backend": self._backend,
         }
         return ToolResult(call.id, call.name, ToolStatus.OK, output, data_field)
 
 
-__all__ = ["TOOLS", "FileTools", "ToolError", "locate", "inventory", "sha256_hex", "hash_matches"]
+__all__ = ["TOOLS", "FileTools", "ToolError", "locate", "walk_inventory", "is_protected", "sha256_hex", "hash_matches"]

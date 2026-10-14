@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -238,8 +237,7 @@ def test_extra_read_roots_allow_reads_but_not_writes(tmp_path: Path):
     assert write.status is ToolStatus.INVALID
 
 
-def test_list_files_without_git(monkeypatch: pytest.MonkeyPatch, tools: FileTools, root: Path):
-    monkeypatch.setattr("ironclad.tool_runtime.files.shutil.which", lambda program: None)
+def test_list_files_default_walk_inventory(tools: FileTools, root: Path):
     (root / "__pycache__").mkdir()
     (root / "__pycache__" / "junk.pyc").write_bytes(b"x")
     result = tools.run(call("list_files"))
@@ -249,17 +247,26 @@ def test_list_files_without_git(monkeypatch: pytest.MonkeyPatch, tools: FileTool
     assert "__pycache__/junk.pyc" not in result.output
 
 
-@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
-def test_list_files_with_git(root: Path):
-    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}
-    subprocess.run(["git", "init", "-q"], cwd=root, env=env, check=True, capture_output=True)
-    subprocess.run(["git", "add", "a.txt"], cwd=root, env=env, check=True, capture_output=True)
-    (root / "untracked.txt").write_text("x", encoding="utf-8")
-    tools = FileTools(root)
-    result = tools.run(call("list_files"))
-    assert result.status is ToolStatus.OK
-    assert result.data["backend"] == "git"
-    assert "a.txt" in result.output and "untracked.txt" in result.output and "sub/b.py" in result.output
+def test_list_files_never_spawns_git(tools: FileTools, monkeypatch: pytest.MonkeyPatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("files.py must not spawn processes")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    monkeypatch.setattr(subprocess, "Popen", boom)
+    assert tools.run(call("list_files")).status is ToolStatus.OK
+
+
+def test_list_files_uses_injected_inventory(root: Path):
+    seen: list[Path] = []
+
+    def fake(base: Path) -> list[str]:
+        seen.append(base)
+        return ["z.txt", "a.txt", "a.txt", "sub/b.py"]
+
+    result = FileTools(root, inventory=fake).run(call("list_files"))
+    assert seen == [root.resolve()]
+    assert result.data["backend"] == "inventory"
+    assert result.output.splitlines() == ["a.txt", "sub/b.py", "z.txt"]
 
 
 def test_list_files_filters_by_path_and_glob(tools: FileTools, root: Path):
@@ -272,8 +279,7 @@ def test_list_files_filters_by_path_and_glob(tools: FileTools, root: Path):
     assert not_a_dir.status is ToolStatus.INVALID
 
 
-def test_list_files_caps_entries(tools: FileTools, root: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr("ironclad.tool_runtime.files.shutil.which", lambda program: None)
+def test_list_files_caps_entries(tools: FileTools, root: Path):
     for index in range(2005):
         (root / f"f{index}.txt").write_text("x", encoding="utf-8")
     result = tools.run(call("list_files"))
@@ -299,3 +305,58 @@ def test_write_preserves_mode(tools: FileTools, root: Path):
     result = tools.run(call("write_file", path="script.sh", content="new\n", expected_sha=digest))
     assert result.status is ToolStatus.OK
     assert oct(target.stat().st_mode & 0o777) == "0o755"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [".GIT/hooks/pre-commit", ".Git/config", ".NEDSTER/config.toml", ".nedster./x", "sub/.NedSter/x",
+     "NEDSTE~1/config.toml", "GIT~1/config", ".nedster:stream", ".git::$INDEX_ALLOCATION/x"],  # fmt: skip
+)
+def test_protected_dirs_casefold_aliases_and_streams(tools: FileTools, root: Path, raw: str):
+    result = tools.run(call("write_file", path=raw, content="x"))
+    assert result.status is ToolStatus.INVALID and "protected" in result.output
+    assert not (root / ".NEDSTER").exists() and not (root / ".nedster").exists()
+
+
+def test_protection_does_not_block_lookalikes(tools: FileTools, root: Path):
+    for raw in ("gitignore.txt", "my~1.txt", ".github/ci.yml", "notes.git"):
+        assert tools.run(call("write_file", path=raw, content="x")).status is ToolStatus.OK
+
+
+def test_read_refuses_oversize_without_reading(root: Path):
+    big = root / "big.log"
+    big.write_bytes(b"a\n" * 100)
+    tools = FileTools(root, max_file_bytes=50)
+    result = tools.run(call("read_file", path="big.log"))
+    assert result.status is ToolStatus.INVALID and "too large" in result.output
+    edit = tools.run(call("edit_file", path="big.log", old="a", new="b", expected_sha="0" * 16))
+    assert edit.status is ToolStatus.INVALID and "too large" in edit.output
+    write = tools.run(call("write_file", path="big.log", content="x", expected_sha="0" * 16))
+    assert write.status is ToolStatus.INVALID and "too large" in write.output
+
+
+def test_read_never_reads_more_than_cap_plus_one(root: Path, monkeypatch: pytest.MonkeyPatch):
+    from ironclad.tool_runtime import files as files_module
+
+    target = root / "grow.txt"
+    target.write_bytes(b"x" * 10)
+    monkeypatch.setattr(files_module.Path, "stat", lambda self, **kw: type("S", (), {"st_mode": 0o100644, "st_size": 1})())
+    with pytest.raises(files_module.ToolError, match="too large"):
+        files_module.read_regular(target, "grow.txt", 5)  # size lied; streaming cap still holds
+
+
+def test_read_directory_and_special_files_are_invalid(tools: FileTools, root: Path):
+    assert tools.run(call("read_file", path="sub")).status is ToolStatus.INVALID
+    fifo = getattr(os, "mkfifo", None)
+    if fifo is None:
+        pytest.skip("no mkfifo on this platform")
+    fifo(root / "pipe")
+    result = tools.run(call("read_file", path="pipe"))
+    assert result.status is ToolStatus.INVALID and "not a regular file" in result.output
+
+
+def test_read_hash_is_whole_file_sha(tools: FileTools, root: Path):
+    data = b"line\n" * 50_000
+    (root / "many.txt").write_bytes(data)
+    result = tools.run(call("read_file", path="many.txt"))
+    assert result.data["sha256"] == hashlib.sha256(data).hexdigest()

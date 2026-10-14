@@ -141,3 +141,18 @@ def test_no_matches_is_ok(tools: SearchTools, monkeypatch: pytest.MonkeyPatch):
 def test_ripgrep_no_matches_is_ok(tools: SearchTools):
     result = tools.run(call(pattern="zzz-absent"))
     assert result.status is ToolStatus.OK and result.data["count"] == 0
+
+
+def test_python_search_uses_injected_inventory(root: Path, monkeypatch: pytest.MonkeyPatch):
+    force_python(monkeypatch)
+    (root / "hidden.txt").write_text("needle\n", encoding="utf-8")
+    (root / "shown.txt").write_text("needle\n", encoding="utf-8")
+    seen: list[Path] = []
+
+    def fake(base: Path) -> list[str]:
+        seen.append(base)
+        return ["shown.txt"]
+
+    result = SearchTools(root, inventory=fake).run(call(pattern="needle"))
+    assert result.status is ToolStatus.OK and seen
+    assert "shown.txt:1" in result.output and "hidden.txt" not in result.output
