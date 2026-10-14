@@ -105,7 +105,7 @@ def test_write_new_file_including_empty_content(tools: FileTools, root: Path):
     assert result.mutated_paths == ("new.txt",)
     assert result.data["sha256"] == sha(b"")
     again = tools.run(call("write_file", path="new.txt", content="x"))
-    assert again.status is ToolStatus.INVALID and "read it first" in again.output
+    assert again.status is ToolStatus.INVALID and "your own edit" in again.output and sha(b"")[:16] in again.output
 
 
 def test_write_existing_requires_matching_hash(tools: FileTools, root: Path):
@@ -117,7 +117,7 @@ def test_write_existing_requires_matching_hash(tools: FileTools, root: Path):
     assert ok.status is ToolStatus.OK and ok.data["sha256"] == sha(b"new\n")
     assert (root / "a.txt").read_bytes() == b"new\n"
     again = tools.run(call("write_file", path="a.txt", content="other\n", expected_sha=digest))
-    assert again.status is ToolStatus.INVALID and "read it first" in again.output
+    assert again.status is ToolStatus.INVALID and "your own edit" in again.output and sha(b"new\n")[:16] in again.output
 
 
 def test_write_accepts_sha_prefix_from_read_header(tools: FileTools, root: Path):

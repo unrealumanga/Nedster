@@ -18,6 +18,7 @@ import re
 import stat
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
@@ -32,6 +33,7 @@ DEFAULT_PROTECTED = (".git", ".nedster")
 MAX_LIST_ENTRIES = 2000
 MAX_DIFF_LINES = 200
 MAX_REPORTED_MATCH_LINES = 3
+MAX_EDITS = 50
 NEWLINE_CRLF = "\r\n"
 WALK_SKIP_DIRS = frozenset(
     {
@@ -247,11 +249,21 @@ WRITE_SCHEMA = {
     "required": ["path", "content"],
     "additionalProperties": False,
 }
+_EDIT_ITEM = {
+    "type": "object",
+    "properties": {"old": {"type": "string"}, "new": {"type": "string"}},
+    "required": ["old", "new"],
+    "additionalProperties": False,
+}
+# Either {old, new[, count]} or edits[1..MAX_EDITS]. The bundled validator ignores oneOf/minItems/maxItems, so
+# _edit_list enforces the exclusivity and the bounds itself; the keywords document the contract for the model.
 EDIT_SCHEMA = {
     "type": "object",
     "properties": {"path": _PATH_PROP, "old": {"type": "string"}, "new": {"type": "string"},
-                   "expected_sha": {"type": "string"}, "count": {"type": "integer", "minimum": 1}},  # fmt: skip
-    "required": ["path", "old", "new", "expected_sha"],
+                   "expected_sha": {"type": "string"}, "count": {"type": "integer", "minimum": 1},
+                   "edits": {"type": "array", "items": _EDIT_ITEM, "minItems": 1, "maxItems": MAX_EDITS}},  # fmt: skip
+    "required": ["path", "expected_sha"],
+    "oneOf": [{"required": ["old", "new"]}, {"required": ["edits"]}],
     "additionalProperties": False,
 }
 LIST_SCHEMA = {
@@ -283,6 +295,7 @@ class FileTools:
         self._inventory = inventory or walk_inventory
         self._backend = "inventory" if inventory else "walk"
         self.read_hashes: dict[str, str] = {}
+        self._own_writes: dict[str, tuple[str, str]] = {}  # rel -> (sha256 we wrote, HH:MM:SS)
         self.journal = journal
         self.mutation_lock: Any = journal.mutation_lock if journal is not None else threading.RLock()
         self._schemas: dict[str, Mapping[str, Any]] = {
@@ -317,8 +330,10 @@ class FileTools:
         )
         edit = ToolSpec(
             EDIT_FILE,
-            "Replace an exact substring count times. Requires expected_sha from a prior read_file (read first). "
-            "Returns a unified diff.",
+            "Replace an exact substring (old/new, count times) or apply edits=[{old,new},...] (1..50, in order, one "
+            "atomic write; each old must match exactly once; any failure writes nothing). Requires expected_sha "
+            "from a prior read_file or from the sha a previous write/edit returned. Returns a unified diff and the "
+            "new sha256.",
             EDIT_SCHEMA,
             int(RiskLevel.WRITE),
             mutates=True,
@@ -376,10 +391,26 @@ class FileTools:
         with self.mutation_lock:
             if paths is None:
                 self.read_hashes.clear()
+                self._own_writes.clear()
                 return
             drop = {os.path.normcase(path) for path in paths}
             for rel in [rel for rel in self.read_hashes if os.path.normcase(rel) in drop]:
                 del self.read_hashes[rel]
+            for rel in [rel for rel in self._own_writes if os.path.normcase(rel) in drop]:
+                del self._own_writes[rel]
+
+    def _stale_error(self, rel: str, digest: str) -> ToolError:
+        """Stale/missing expected_sha. Reveals the current sha only when this instance wrote those exact bytes."""
+        own = self._own_writes.get(rel)
+        if own is not None and own[0] == digest:
+            return ToolError(
+                f"file changed since your read - by your own edit at {own[1]}; current sha256:{digest[:16]}"
+            )
+        return ToolError("file changed since read / read it first")
+
+    def _record_write(self, rel: str, digest: str) -> None:
+        self.read_hashes[rel] = digest
+        self._own_writes[rel] = (digest, time.strftime("%H:%M:%S"))
 
     # -- tools -------------------------------------------------------------------------
 
@@ -430,7 +461,7 @@ class FileTools:
                 raise ToolError(f"is a directory: {located.rel}")
             current, digest = read_regular(target, located.rel, self.max_file_bytes)
             if not expected or not hash_matches(str(expected), digest):
-                raise ToolError("file changed since read / read it first")
+                raise self._stale_error(located.rel, digest)
             payload = apply_newline(content, detect_newline(current)).encode("utf-8")
             self._journal_before(located)
             atomic_replace(target, payload, stat.S_IMODE(target.stat().st_mode))
@@ -447,14 +478,14 @@ class FileTools:
                 raise ToolError("file changed since read / read it first") from exc
             created = True
         new_digest = sha256_hex(payload)
-        self.read_hashes[located.rel] = new_digest
+        self._record_write(located.rel, new_digest)
         verb = "created" if created else "updated"
         return ToolResult(
             call.id,
             call.name,
             ToolStatus.OK,
-            f"{verb} {located.rel} ({len(payload)} bytes)",
-            {"sha256": new_digest, "created": created},
+            f"{verb} {located.rel} ({len(payload)} bytes), new sha256:{new_digest[:16]}",
+            {"sha256": new_digest, "sha": new_digest[:16], "created": created},
             (located.rel,),
         )
 
@@ -462,43 +493,65 @@ class FileTools:
         with self.mutation_lock:
             return self._edit_locked(call)
 
+    @staticmethod
+    def _edit_list(args: Mapping[str, Any]) -> tuple[list[tuple[str, str]], int, bool]:
+        """Normalise the two accepted forms to ([(old, new)], count, is_multi); raises ToolError on misuse."""
+        multi = "edits" in args
+        if multi and ("old" in args or "new" in args or "count" in args):
+            raise ToolError("give either old/new[/count] or edits, not both")
+        if not multi:
+            if "old" not in args or "new" not in args:
+                raise ToolError("edit_file needs 'old' and 'new', or 'edits'")
+            return [(str(args["old"]), str(args["new"]))], int(args.get("count", 1)), False
+        raw = args["edits"]
+        if not 1 <= len(raw) <= MAX_EDITS:
+            raise ToolError(f"edits must contain 1..{MAX_EDITS} items, got {len(raw)}")
+        return [(str(item["old"]), str(item["new"])) for item in raw], 1, True
+
+    @staticmethod
+    def _apply_edits(text: str, pairs: Sequence[tuple[str, str]], count: int, multi: bool) -> str:
+        prefix_tail = "; nothing was written" if multi else ""
+        for index, (old, new) in enumerate(pairs):
+            prefix = f"edits[{index}]: " if multi else ""
+            if not old:
+                raise ToolError(f"{prefix}old must not be empty{prefix_tail}")
+            actual = text.count(old)
+            if actual != count:
+                hits = line_numbers(text, old)[:MAX_REPORTED_MATCH_LINES]
+                where = f" at line(s) {', '.join(str(number) for number in hits)}" if hits else ""
+                raise ToolError(f"{prefix}'old' occurs {actual} time(s), expected {count}{where}{prefix_tail}")
+            text = text.replace(old, new)
+        return text
+
     def _edit_locked(self, call: ToolCall) -> ToolResult:
         args = call.arguments
         located = self._locate(str(args["path"]), for_write=True)
-        old = str(args["old"])
-        new = str(args["new"])
-        count = int(args.get("count", 1))
-        if not old:
-            raise ToolError("old must not be empty")
+        pairs, count, multi = self._edit_list(args)
         current, digest = read_regular(located.path, located.rel, self.max_file_bytes)
         if not hash_matches(str(args["expected_sha"]), digest):
-            raise ToolError("file changed since read / read it first")
+            raise self._stale_error(located.rel, digest)
         text = self._decode(current, located.rel)
-        actual = text.count(old)
-        if actual != count:
-            hits = line_numbers(text, old)[:MAX_REPORTED_MATCH_LINES]
-            where = f" at line(s) {', '.join(str(number) for number in hits)}" if hits else ""
-            raise ToolError(f"'old' occurs {actual} time(s), expected {count}{where}")
-        edited = apply_newline(text.replace(old, new), detect_newline(current))
+        edited = apply_newline(self._apply_edits(text, pairs, count, multi), detect_newline(current))
         payload = edited.encode("utf-8")
         if payload == current:
             return ToolResult(
                 call.id,
                 call.name,
                 ToolStatus.OK,
-                "no change: replacement produced identical content",
-                {"sha256": digest},
+                f"no change: replacement produced identical content, sha256:{digest[:16]}",
+                {"sha256": digest, "sha": digest[:16]},
             )
         self._journal_before(located)
         atomic_replace(located.path, payload, stat.S_IMODE(located.path.stat().st_mode))
         new_digest = sha256_hex(payload)
-        self.read_hashes[located.rel] = new_digest
+        self._record_write(located.rel, new_digest)
+        output = unified_diff(text, edited, located.rel) + f"\nnew sha256:{new_digest[:16]}"
         return ToolResult(
             call.id,
             call.name,
             ToolStatus.OK,
-            unified_diff(text, edited, located.rel),
-            {"sha256": new_digest},
+            output,
+            {"sha256": new_digest, "sha": new_digest[:16], "edits": len(pairs)},
             (located.rel,),
         )
 
