@@ -16,6 +16,7 @@ from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.css.query import NoMatches
 from textual.events import Resize
 from textual.widgets import Footer, OptionList, RichLog, Static
 
@@ -298,7 +299,11 @@ class NedsterApp(App[None]):
     def _tick(self) -> None:
         self._heartbeat_lock()
         if self.busy:
-            self.status_bar.refresh()
+            try:
+                status = self.status_bar
+            except NoMatches:  # the timer can fire while the app is shutting down and widgets are gone
+                return
+            status.refresh()
             for row in self.tool_rows.values():
                 if row.finished is None:
                     row.refresh()
