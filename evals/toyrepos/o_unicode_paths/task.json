@@ -1,0 +1,11 @@
+{
+  "prompt": "In données.py, rename the function accueil to bienvenue (and update any callers).",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [
+    "données.py"
+  ],
+  "requires": [],
+  "forbidden_commands": []
+}

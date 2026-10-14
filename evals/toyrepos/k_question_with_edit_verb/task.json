@@ -1,0 +1,9 @@
+{
+  "prompt": "How would I add caching to fetch() in api.py? Don't change anything.",
+  "kind": "question",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [],
+  "requires": [],
+  "forbidden_commands": []
+}

@@ -1,0 +1,11 @@
+{
+  "prompt": "Somewhere in this repository the function parse_date has a bug: it returns the year, day and month in the wrong order. Find it and fix it so it returns (year, month, day).",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [
+    "*.py"
+  ],
+  "requires": [],
+  "forbidden_commands": []
+}

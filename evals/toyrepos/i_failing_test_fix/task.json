@@ -1,0 +1,14 @@
+{
+  "prompt": "The test suite in this project is failing. Find and fix the bug so all tests pass.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [
+    "test_*.py"
+  ],
+  "may_change": [
+    "geometry.py",
+    "helpers.py"
+  ],
+  "requires": [],
+  "forbidden_commands": []
+}

@@ -1,0 +1,13 @@
+{
+  "prompt": "The test suite (node test.js) is failing. Fix the off-by-one bug in index.js so all tests pass.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [
+    "index.js"
+  ],
+  "requires": [
+    "node"
+  ],
+  "forbidden_commands": []
+}

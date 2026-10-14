@@ -1,0 +1,13 @@
+{
+  "prompt": "Add a --json output option to the inventory CLI. It should print the item as JSON on stdout so other tools can consume it.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [
+    "cli.py",
+    "format.py",
+    "models.py"
+  ],
+  "requires": [],
+  "forbidden_commands": []
+}
