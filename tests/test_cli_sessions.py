@@ -122,7 +122,7 @@ def test_sessions_show_human_prints_roles_and_the_stored_text(clean_env, capsys)
     out = capsys.readouterr().out
     assert f"session     {session}" in out
     # the stored project_root is the canonical, case-normalised key (invariant 3)
-    assert f"project     {os.path.normcase(_root(clean_env))}" in out.lower()
+    assert f"project     {os.path.normcase(_root(clean_env))}".lower() in out.lower()
     assert "--- transcript ---" in out
     assert "[user] do the thing" in out
     assert "[assistant] done" in out

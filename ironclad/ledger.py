@@ -21,11 +21,16 @@ def load_or_create_ledger_key(state_dir: str | Path, env_name: str = "NEDSTER_LE
     key_path = Path(state_dir) / "ledger.key"
     key_path.parent.mkdir(parents=True, exist_ok=True)
     if key_path.exists():
+        if os.name != "nt" and key_path.stat().st_mode & 0o077:  # created world-readable by older versions
+            with contextlib.suppress(OSError):
+                key_path.chmod(0o600)
         return key_path.read_bytes()
     key = secrets.token_bytes(32)
     temp_path = key_path.with_name(f"{key_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
-        with open(temp_path, "wb") as handle:
+        # 0o600 at creation (not chmod afterwards): the key must never be readable by other users, even briefly.
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+        with os.fdopen(fd, "wb") as handle:
             handle.write(key)
             handle.flush()
             os.fsync(handle.fileno())

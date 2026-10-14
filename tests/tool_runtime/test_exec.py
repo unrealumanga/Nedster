@@ -249,8 +249,14 @@ def test_bounded_output_small_and_large():
     assert big.total == 100 and big.truncated
 
 
-def test_run_tests_resolves_runner_before_execution(tmp_path: Path):
+def test_run_tests_resolves_runner_before_execution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     ex = Executor(tmp_path, SandboxConfig())
+    # Pin "pytest is not installed for the host interpreter" (CI's Python has it; a bare dev Python may not).
+    import ironclad.tool_runtime.exec as exec_module
+
+    real_find = exec_module.find_program
+    monkeypatch.setattr(exec_module, "_site_has", lambda python, package: False)
+    monkeypatch.setattr(exec_module, "find_program", lambda name, *a: None if name == "pytest" else real_find(name, *a))
     try:
         with pytest.raises(ArgumentError):
             ex.resolve_argv(ToolCall("c", "run_tests", {}))

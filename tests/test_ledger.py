@@ -147,6 +147,15 @@ class LedgerConcurrencyTests(unittest.TestCase):
             mode = (Path(directory) / "ledger.key").stat().st_mode & 0o777
             self.assertEqual(mode, 0o600)
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX file mode semantics")
+    def test_existing_world_readable_key_is_tightened(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "ledger.key"
+            key_path.write_bytes(b"k" * 32)
+            key_path.chmod(0o644)
+            self.assertEqual(load_or_create_ledger_key(directory), b"k" * 32)
+            self.assertEqual(key_path.stat().st_mode & 0o777, 0o600)
+
     def test_env_key_override_wins(self):
         with tempfile.TemporaryDirectory() as directory:
             with mock.patch.dict("os.environ", {"NEDSTER_LEDGER_KEY": "secret"}):
