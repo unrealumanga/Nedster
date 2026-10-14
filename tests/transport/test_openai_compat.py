@@ -158,3 +158,13 @@ async def test_request_body_and_stable_bytes():
     assert request["messages"][3] == {"role": "tool", "tool_call_id": "call_0", "content": "contents"}
     assert request["tools"][0]["type"] == "function"
     assert request["tools"][0]["function"]["parameters"] == {"type": "object"}
+
+
+async def test_truncated_stream_never_emits_tool_calls():
+    chunk = {"choices": [{"index": 0, "delta": {"tool_calls": [
+        {"index": 0, "id": "c1", "function": {"name": "write_file", "arguments": "{\"path\": "}}
+    ]}, "finish_reason": None}]}
+    body = f"data: {json.dumps(chunk)}\n\n".encode()
+    events, error = await drain(make_transport(body))
+    assert isinstance(error, TransportError)
+    assert not any(isinstance(event, ToolCallsReady) for event in events)

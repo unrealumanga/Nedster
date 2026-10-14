@@ -260,6 +260,9 @@ class OpenAICompatTransport:
         except httpx.HTTPError as exc:
             raise TransportError(f"OpenAI-compatible request failed: {exc}") from exc
 
+        if not finish_reason:
+            # A truncated stream may hold half-assembled tool calls; never execute them.
+            raise TransportError("stream ended before a finish_reason was received")
         calls = _finalize(builders)
         if calls:
             yield ToolCallsReady(calls=calls)
