@@ -96,7 +96,10 @@ class CompositeToolRuntime:
         job_tools: Iterable[JobTools] = (),
         policy: Any = None,
         resolve_argv: Any = None,
+        journal: Any = None,
     ):
+        self._journal = journal
+        self._sync_groups = tuple(sync_tools := tuple(sync_tools))
         self._policy = policy
         self._resolve_argv = resolve_argv
         self._owners: dict[str, tuple[str, Any]] = {}
@@ -120,6 +123,16 @@ class CompositeToolRuntime:
     def revision(self) -> WorkspaceRevision:
         return self._revision
 
+    def invalidate_after_undo(self, paths: Iterable[str] = ()) -> None:
+        """Call after a successful undo (CheckpointStore.on_undone): forgets read-before-edit hashes and bumps
+        the workspace revision so earlier validation evidence is no longer fresh."""
+        touched = tuple(paths)
+        for tools in self._sync_groups:
+            invalidate = getattr(tools, "invalidate_read_hashes", None)
+            if invalidate is not None:
+                invalidate(touched or None)
+        self._bump(touched)
+
     def start(self, call: ToolCall) -> JobHandle:
         owner = self._owners.get(call.name)
         if owner is None:
@@ -134,6 +147,8 @@ class CompositeToolRuntime:
         kind, tools = owner
         if kind == "sync":
             return _Threaded(self, tools, call)
+        if self._journal is not None and (call.name in EXECUTION_TOOLS or self._specs[call.name].mutates):
+            self._journal.note_command()  # side effects of commands are outside undo coverage
         job = tools.start(call)
         if call.name in EXECUTION_TOOLS:
             return _Tracked(self, job)

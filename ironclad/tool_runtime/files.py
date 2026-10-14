@@ -17,9 +17,10 @@ import os
 import re
 import stat
 import tempfile
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Protocol
 
 from ..contracts import ToolCall, ToolResult, ToolSpec, ToolStatus
 from ..types import RiskLevel
@@ -51,6 +52,16 @@ MAX_FILE_BYTES = 10 * 1024 * 1024
 READ_CHUNK = 64 * 1024
 SHORT_NAME = re.compile(r"^(?P<stem>[^~]*)~\d+(?:\..*)?$")
 Inventory = Callable[[Path], list[str]]
+
+
+class MutationJournal(Protocol):
+    """Receives each path's pre-image before its first mutation in a turn (see session_store.checkpoints).
+    ``record_pre_image`` raises OSError when it cannot journal; the mutation is then refused."""
+
+    @property
+    def mutation_lock(self) -> Any: ...
+
+    def record_pre_image(self, rel: str, path: Path) -> None: ...
 
 
 class ToolError(Exception):
@@ -262,6 +273,7 @@ class FileTools:
         max_read_bytes: int = 200_000,
         max_file_bytes: int = MAX_FILE_BYTES,
         inventory: Inventory | None = None,
+        journal: MutationJournal | None = None,
     ):
         self.project_root = Path(project_root).resolve()
         self.extra_read_roots = tuple(Path(item).resolve() for item in extra_read_roots)
@@ -271,6 +283,8 @@ class FileTools:
         self._inventory = inventory or walk_inventory
         self._backend = "inventory" if inventory else "walk"
         self.read_hashes: dict[str, str] = {}
+        self.journal = journal
+        self.mutation_lock: Any = journal.mutation_lock if journal is not None else threading.RLock()
         self._schemas: dict[str, Mapping[str, Any]] = {
             READ_FILE: READ_SCHEMA,
             WRITE_FILE: WRITE_SCHEMA,
@@ -353,6 +367,20 @@ class FileTools:
         except UnicodeDecodeError as exc:
             raise ToolError(f"binary file (not valid UTF-8): {rel}") from exc
 
+    def _journal_before(self, located: Located) -> None:
+        if self.journal is not None:
+            self.journal.record_pre_image(located.rel, located.path)
+
+    def invalidate_read_hashes(self, paths: Sequence[str] | None = None) -> None:
+        """Forget read-before-edit hashes (all, or the given relative paths) so stale reads cannot authorize edits."""
+        with self.mutation_lock:
+            if paths is None:
+                self.read_hashes.clear()
+                return
+            drop = {os.path.normcase(path) for path in paths}
+            for rel in [rel for rel in self.read_hashes if os.path.normcase(rel) in drop]:
+                del self.read_hashes[rel]
+
     # -- tools -------------------------------------------------------------------------
 
     def _read_file(self, call: ToolCall) -> ToolResult:
@@ -387,6 +415,10 @@ class FileTools:
         return ToolResult(call.id, call.name, ToolStatus.OK, output, data_field)
 
     def _write_file(self, call: ToolCall) -> ToolResult:
+        with self.mutation_lock:
+            return self._write_locked(call)
+
+    def _write_locked(self, call: ToolCall) -> ToolResult:
         args = call.arguments
         located = self._locate(str(args["path"]), for_write=True)
         content = str(args["content"])
@@ -400,11 +432,13 @@ class FileTools:
             if not expected or not hash_matches(str(expected), digest):
                 raise ToolError("file changed since read / read it first")
             payload = apply_newline(content, detect_newline(current)).encode("utf-8")
+            self._journal_before(located)
             atomic_replace(target, payload, stat.S_IMODE(target.stat().st_mode))
         else:
             if expected:
                 raise ToolError("file changed since read / read it first")
             payload = content.encode("utf-8")
+            self._journal_before(located)
             target.parent.mkdir(parents=True, exist_ok=True)
             try:
                 with open(target, "xb") as handle:
@@ -425,6 +459,10 @@ class FileTools:
         )
 
     def _edit_file(self, call: ToolCall) -> ToolResult:
+        with self.mutation_lock:
+            return self._edit_locked(call)
+
+    def _edit_locked(self, call: ToolCall) -> ToolResult:
         args = call.arguments
         located = self._locate(str(args["path"]), for_write=True)
         old = str(args["old"])
@@ -451,6 +489,7 @@ class FileTools:
                 "no change: replacement produced identical content",
                 {"sha256": digest},
             )
+        self._journal_before(located)
         atomic_replace(located.path, payload, stat.S_IMODE(located.path.stat().st_mode))
         new_digest = sha256_hex(payload)
         self.read_hashes[located.rel] = new_digest
@@ -492,4 +531,5 @@ class FileTools:
         return ToolResult(call.id, call.name, ToolStatus.OK, output, data_field)
 
 
-__all__ = ["TOOLS", "FileTools", "ToolError", "locate", "walk_inventory", "is_protected", "sha256_hex", "hash_matches"]
+__all__ = ["TOOLS", "FileTools", "ToolError", "locate", "walk_inventory", "is_protected", "sha256_hex", "hash_matches",
+           "atomic_replace", "MutationJournal"]  # fmt: skip
