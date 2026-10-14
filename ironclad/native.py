@@ -18,31 +18,40 @@ def worker_model(config: Any, override: str | None = None) -> str:
     return coder if coder and coder != "auto" else DEFAULT_WORKER
 
 
+def git_inventory(git: Any) -> Callable[[Path], list[str]]:
+    """Inventory via hardened ``git ls-files`` (respects .gitignore); falls back to a directory walk."""
+    import subprocess
+
+    from .tool_runtime.files import walk_inventory
+
+    def inventory(base: Path) -> list[str]:
+        try:
+            argv = [*git.base_argv(), "ls-files", "--cached", "--others", "--exclude-standard", "-z"]
+            done = subprocess.run(argv, cwd=base, env=git.env(), capture_output=True, timeout=15, check=False)
+        except Exception:
+            return walk_inventory(base)
+        if done.returncode != 0:
+            return walk_inventory(base)
+        names = done.stdout.decode("utf-8", "replace").split("\0")
+        return sorted(name for name in names if name)
+
+    return inventory
+
+
 def build_tools(project_root: Path, config: Any) -> tuple[Any, Any]:
-    """Return (CompositeToolRuntime, Executor). File/search tools are optional until package B1 lands."""
+    """Return (CompositeToolRuntime, Executor) for ``project_root``."""
     from .tool_runtime.composite import CompositeToolRuntime
     from .tool_runtime.exec import Executor
+    from .tool_runtime.files import FileTools
     from .tool_runtime.git import SafeGit
+    from .tool_runtime.search import SearchTools
 
     executor = Executor(project_root, config)
-    sync_tools: list[Any] = []
-    try:
-        from .tool_runtime.files import FileTools
-
-        sync_tools.append(FileTools(project_root))
-    except ImportError:
-        pass
-    try:
-        from .tool_runtime import search
-
-        provider = getattr(search, "SearchTools", None)
-        if provider is not None:
-            sync_tools.append(provider(project_root))
-    except ImportError:
-        pass
+    git = SafeGit(project_root, executor)
+    inventory = git_inventory(git)
     runtime = CompositeToolRuntime(
-        sync_tools=sync_tools,
-        job_tools=[executor, SafeGit(project_root, executor)],
+        sync_tools=[FileTools(project_root, inventory=inventory), SearchTools(project_root, inventory=inventory)],
+        job_tools=[executor, git],
         policy=config.policy,
         resolve_argv=executor.resolve_argv,
     )

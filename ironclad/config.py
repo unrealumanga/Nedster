@@ -41,6 +41,8 @@ class SandboxConfig:
     allow_unsafe_fallback: bool = False
     allow_host_execution: bool = False
     docker_image: str = "python:3.13-slim"
+    docker_memory: str = "4g"
+    docker_cpus: str = "2"
     firecracker_wrapper: str = ""
 
 

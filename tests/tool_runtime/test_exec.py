@@ -384,8 +384,8 @@ def test_venv_interpreter_must_be_structurally_real(tmp_path: Path):
     assert venv_python(tmp_path / "missing") is None
 
 
-def test_verified_venv_only_for_run_tests(tmp_path: Path):
-    """The project venv is used for run_tests' python/pytest only; run_command may not run it."""
+def test_verified_venv_for_python_but_other_project_programs_denied(tmp_path: Path):
+    """The verified project venv backs bare python/pytest in run_tests and run_command; nothing else in the project runs."""
     native = b"MZ" if IS_WINDOWS else b"\x7fELF"
     interpreter = _structural_venv(tmp_path, home=_base_python_dir(), magic=native)
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
@@ -397,8 +397,13 @@ def test_verified_venv_only_for_run_tests(tmp_path: Path):
         assert ex.resolve_argv(ToolCall("t", "run_tests", {"argv": [str(interpreter), "-m", "pytest"]}))[0] == str(
             interpreter
         )
+        assert ex.resolve_argv(call(["python", "-V"]))[0] == str(interpreter)
+        assert ex.resolve_argv(call([str(interpreter), "-V"]))[0] == str(interpreter)
+        tool = tmp_path / "tools" / ("python.bat" if IS_WINDOWS else "python")
+        tool.parent.mkdir()
+        tool.write_text("echo pwned", encoding="utf-8")
         with pytest.raises(ResolutionDenied):
-            ex.resolve_argv(call([str(interpreter), "-V"]))
+            ex.resolve_argv(call([str(tool)]))
     finally:
         ex.close()
 

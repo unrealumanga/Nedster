@@ -850,7 +850,7 @@ class Executor:
         return backend is not None and not backend.host_paths
 
     def _prefer_venv(self, argv: list[str]) -> list[str]:
-        """run_tests only: bare python/pytest use the project's verified venv interpreter."""
+        """Bare python/pytest use the project's verified venv interpreter (run_tests and run_command)."""
         venv = self.venv_python()
         if venv is None or self._container() or is_path_qualified(argv[0]):
             return argv
@@ -901,7 +901,9 @@ class Executor:
         """The resolved argv that ``start(call)`` will run; raises ArgumentError/ResolutionDenied."""
         args = call.arguments or {}
         if call.name == RUN_COMMAND:
-            argv = self.resolve_program_argv(_argv_argument(args.get("argv")))
+            # Bare python/pytest use the verified project venv (same interpreter run_tests uses), so project
+            # scripts see the project's dependencies; any other program inside the project stays denied.
+            argv = self.resolve_program_argv(self._prefer_venv(_argv_argument(args.get("argv"))), allow_venv=True)
         elif call.name == RUN_TESTS:
             raw = args.get("argv")
             requested = _argv_argument(raw) if raw is not None else self.detect_test_argv()
