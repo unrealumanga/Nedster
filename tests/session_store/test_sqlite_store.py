@@ -43,7 +43,10 @@ def test_output_handles_increase_per_session(tmp_path: Path):
         assert store.put_output(other, "bash", "c3", "other") == 1
         assert store.get_output(session, 1) == "first"
         assert store.get_output(session, 2) == "second"
-        assert store.get_output(session, 99) == ""
+        with pytest.raises(KeyError):  # review #16: a missing handle is an error, never ""
+            store.get_output(session, 99)
+        with pytest.raises(KeyError):  # handles are per session
+            store.get_output(other, 2)
 
 
 def test_list_sessions_filters_by_normalized_root(tmp_path: Path):

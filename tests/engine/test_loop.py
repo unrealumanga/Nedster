@@ -301,7 +301,9 @@ async def test_truncated_model_turn_is_incomplete() -> None:
 
 
 async def test_validation_flag_on_run_command() -> None:
-    runtime = FakeRuntime({"edit_file": edit, "run_command": lambda c: ok(c, "built", exit_code=0)})
+    runtime = FakeRuntime(
+        {"edit_file": edit, "run_command": lambda c: ok(c, "3 passed", exit_code=0, runner="make", tests_run=3)}
+    )
     script = [
         Turn(calls=[call("edit_file", "1", path="a.py")]),
         Turn(calls=[call("run_command", "2", argv=["make", "check"], validation=True)]),

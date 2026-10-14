@@ -88,9 +88,23 @@ def test_command_with_unreported_mutation_invalidates_validation() -> None:
     assert evaluate(records).outcome is Outcome.UNVALIDATED
 
 
-def test_flagged_run_command_counts_as_validation() -> None:
-    records = [rec("edit_file", paths=("a.py",)), rec("run_command", validation=True, exit_code=0)]
+def test_flagged_run_command_with_known_runner_counts_as_validation() -> None:
+    records = [rec("edit_file", paths=("a.py",)), rec("run_command", validation=True, exit_code=0, runner="pytest", tests_run=3)]
     assert evaluate(records).outcome is Outcome.COMPLETED
+
+
+def test_review7_flagged_run_command_exit_zero_alone_never_passes() -> None:
+    # run_command(["python", "-c", "pass"], validation=true): no runner reported by the executor -> inconclusive.
+    records = [rec("edit_file", paths=("a.py",)), rec("run_command", validation=True, exit_code=0)]
+    result = evaluate(records)
+    assert result.outcome is Outcome.UNVALIDATED
+    assert validation_verdict(records[1]) == "inconclusive"
+    assert any("not a known test runner" in r for r in result.reasons)
+
+
+def test_review7_runner_without_test_count_is_inconclusive() -> None:
+    records = [rec("edit_file", paths=("a.py",)), rec("run_command", validation=True, exit_code=0, runner="pytest")]
+    assert evaluate(records).outcome is Outcome.UNVALIDATED
 
 
 def test_unflagged_run_command_is_not_validation() -> None:

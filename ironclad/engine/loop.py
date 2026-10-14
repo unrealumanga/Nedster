@@ -54,7 +54,8 @@ REPEAT_LIMIT = 3
 VALIDATION_ARG = "validation"
 EVENT_OUTPUT_CHARS = 4_000  # bounded tool output carried on tool.finished for UIs
 EVENT_DATA_KEYS = ("exit_code", "tests_run", "tests_failed", "diff", "backend", "isolation")
-VALIDATABLE_TOOLS = frozenset({"run_command"})
+VALIDATABLE_TOOLS = acceptance.FLAGGABLE_TOOLS
+TRUNCATED = ("length", "error")  # done reasons whose tool calls may be cut off: never executed
 COMPACTED: EventKind = cast(EventKind, "context.compacted")  # proposed addition to contracts.EventKind
 JOB_STOP_TIMEOUT_S = 10.0
 
@@ -104,6 +105,37 @@ def _groups(calls: Sequence[ToolCall], mutating: Callable[[ToolCall], bool]) -> 
             batch.append(call)
     if batch:
         yield batch
+
+
+INTERRUPTED = "[cancelled] not completed: session was interrupted"
+
+
+def repair_history(history: Sequence[ChatMessage]) -> list[ChatMessage]:
+    """Answer every assistant tool call that has no tool message (e.g. the process was killed mid-run).
+
+    Placeholders go right after the call's block, before the next non-tool message, so pairing holds.
+    """
+    repaired: list[ChatMessage] = []
+    pending: list[ToolCall] = []
+
+    def flush() -> None:
+        repaired.extend(
+            ChatMessage(role="tool", content=INTERRUPTED, tool_call_id=c.id, name=c.name) for c in pending
+        )
+        pending.clear()
+
+    for message in history:
+        if message.role == "tool":
+            match = next((c for c in pending if c.id == message.tool_call_id), None)
+            if match is not None:
+                pending.remove(match)
+        else:
+            flush()
+            if message.role == "assistant":
+                pending.extend(message.tool_calls)
+        repaired.append(message)
+    flush()
+    return repaired
 
 
 class Engine:
@@ -171,7 +203,7 @@ class Engine:
         if session_id in self._sessions:
             return self._sessions[session_id]
         store = self.store
-        history = store.messages(session_id) if store else []
+        history = self._load_history(session_id)
         state = TaskState.from_dict(store.get_state(session_id, "task_state") if store else None)
         facts = store.get_state(session_id, "project_facts") if store else None
         if not facts:
@@ -188,6 +220,23 @@ class Engine:
         session = _Session(session_id, messages, state, vault, context)
         self._sessions[session_id] = session
         return session
+
+    def _load_history(self, session_id: str) -> list[ChatMessage]:
+        store = self.store
+        if store is None:
+            return []
+        history = store.messages(session_id)
+        repaired = repair_history(history)
+        if len(repaired) == len(history):
+            return history
+        if repaired[: len(history)] == history:
+            for message in repaired[len(history) :]:
+                store.append_message(session_id, message)
+        else:
+            replace_messages = getattr(store, "replace_messages", None)
+            if callable(replace_messages):
+                replace_messages(session_id, repaired)
+        return repaired
 
     def _specs(self) -> list[ToolSpec]:
         specs: list[ToolSpec] = []
@@ -236,11 +285,19 @@ class Engine:
             message, done_reason = await self._model_turn(session, run, specs)
             run.steps += 1
             self._append(session, message)
+            if message.tool_calls and done_reason in (*TRUNCATED, "cancelled"):
+                why = "run was stopped" if done_reason == "cancelled" else f"model output was truncated ({done_reason})"
+                for call in message.tool_calls:
+                    self._append(session, self._placeholder(call, "cancelled", f"not executed: {why}"))
+                run.prose = message.content
+                if done_reason == "cancelled":
+                    return "cancelled", ""
+                return "model_error", f"model stopped early ({done_reason}); its tool calls were not executed"
             if not message.tool_calls:
                 run.prose = message.content
                 if done_reason == "cancelled":
                     return "cancelled", ""
-                if done_reason in ("length", "error"):
+                if done_reason in TRUNCATED:
                     return "model_error", f"model stopped early ({done_reason})"
                 return "final", ""
             stop = await self._run_calls(session, run, message.tool_calls, by_name)
@@ -306,22 +363,34 @@ class Engine:
             spec = by_name.get(call.name)
             return spec.mutates if spec is not None else call.name != SHOW_OUTPUT
 
-        answered: set[str] = set()
+        answered: set[int] = set()  # indexes into calls (ids are not guaranteed unique)
+        tasks: list[asyncio.Task[ToolRecord]] = []
+
+        def answer(index: int, record: ToolRecord) -> None:
+            run.tool_calls += 1
+            answered.add(index)
+            self._append(session, self._tool_message(session, run, record))
+
+        offset = 0
         try:
             for group in _groups(runnable, mutating):
                 if len(group) == 1:
-                    records = [await self._exec_one(session, run, group[0], mutating(group[0]))]
+                    answer(offset, await self._exec_one(session, run, group[0], mutating(group[0])))
                 else:
+                    tasks = []
                     async with asyncio.TaskGroup() as tg:
                         tasks = [tg.create_task(self._exec_one(session, run, c, False)) for c in group]
-                    records = [task.result() for task in tasks]
-                for record in records:
-                    run.tool_calls += 1
-                    answered.add(record.call.id)
-                    self._append(session, self._tool_message(session, run, record))
+                    for i, task in enumerate(tasks):
+                        answer(offset + i, task.result())
+                    tasks = []
+                offset += len(group)
         except asyncio.CancelledError:
-            for call in calls:
-                if call.id not in answered:
+            # Calls of the interrupted concurrent group that did finish keep their real results.
+            for i, task in enumerate(tasks):
+                if task.done() and not task.cancelled() and task.exception() is None:
+                    answer(offset + i, task.result())
+            for index, call in enumerate(calls):
+                if index not in answered:
                     self._append(session, self._placeholder(call, "cancelled", "not completed: run was stopped"))
             raise
         for call in skipped:

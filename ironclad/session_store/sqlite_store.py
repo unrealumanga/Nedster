@@ -307,12 +307,15 @@ class SqliteSessionStore:
         return handle
 
     def get_output(self, session_id: str, handle: int) -> str:
+        """Full text stored under ``handle``; ``KeyError`` when there is none (never a silent empty string)."""
         with self._lock:
             row = self._connection.execute(
                 "SELECT full_text FROM outputs WHERE session_id = ? AND handle = ?",
                 (session_id, handle),
             ).fetchone()
-        return str(row[0]) if row else ""
+        if row is None:
+            raise KeyError(f"no output {handle} in session {session_id}")
+        return str(row[0])
 
     # -- state --------------------------------------------------------------
 
