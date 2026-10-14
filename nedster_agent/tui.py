@@ -1,18 +1,102 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
+import subprocess
+import threading
+import time
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
-from rich.markdown import Markdown
-from rich.markup import escape
+from rich.syntax import Syntax
+from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
-from textual.events import Key, Resize
-from textual.widgets import Footer, Input, RichLog, Static
+from textual.binding import Binding
+from textual.events import Resize
+from textual.widgets import Footer, OptionList, RichLog, Static
 
 from ironclad.config import NedsterConfig
+from ironclad.contracts import EngineEvent
 from ironclad.orchestrator import NedsterRuntime
+
+from .widgets.composer import Composer, History, project_files
+from .widgets.glyphs import Glyphs
+from .widgets.session import (
+    EngineSession,
+    EventCallback,
+    LegacySession,
+    SessionEvent,
+    SessionNote,
+    failure_reason,
+)
+from .widgets.status import StatusBar, isolation_label
+from .widgets.transcript import AssistantMessage, Line, OutcomeBadge, ToolRow, Transcript, bounded
+
+COMMANDS: dict[str, str] = {
+    "/help": "show commands and keys",
+    "/new": "start a new conversation",
+    "/clear": "clear the display (conversation is kept)",
+    "/sessions": "list saved sessions for this project",
+    "/resume": "resume a session: /resume [id]",
+    "/model": "show or switch the model: /model [name]",
+    "/status": "model, context, sandbox, session",
+    "/diff": "diff of files changed in this session",
+    "/undo": "undo the last edit (when the engine supports it)",
+    "/doctor": "readiness check (inference / read-only / execution)",
+    "/models": "list the active model fleet",
+    "/permissions": "show the autonomy policy",
+    "/quit": "exit Nedster",
+}
+# Commands that change engine/session state wait for the running turn (the text is kept).
+IDLE_ONLY = {"/new", "/resume", "/model", "/undo", "/sessions"}
+
+DoctorProvider = Callable[[NedsterConfig], Mapping[str, Mapping[str, Any]]]
+SessionFactoryFor = Callable[[NedsterConfig, EventCallback], EngineSession]
+
+
+def _default_doctor(config: NedsterConfig) -> Mapping[str, Mapping[str, Any]]:
+    from .model_manager import readiness
+
+    return readiness(config)
+
+
+def session_diff(root: Path, paths: Sequence[str]) -> str:
+    """Unified diff of ``paths`` against HEAD; untracked/new files are shown as additions."""
+    paths = list(dict.fromkeys(paths))
+    if not paths:
+        return ""
+    chunks: list[str] = []
+    covered: set[str] = set()
+    for base in (["HEAD"], []):
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--no-color", "--no-ext-diff", *base, "--", *paths],
+                cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=10, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            break
+        if result.returncode == 0:
+            chunks.append(result.stdout)
+            covered = {p for p in paths if f"+++ b/{p}" in result.stdout or f"--- a/{p}" in result.stdout}
+            break
+    for path in paths:
+        if path in covered:
+            continue
+        file = root / path
+        if not file.is_file():
+            continue
+        try:
+            lines = file.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        except OSError:
+            continue
+        diff = difflib.unified_diff([], lines, "/dev/null", f"b/{path}")
+        chunks.append("".join(diff))
+    return "".join(chunks).strip("\n")
 
 
 class NedsterApp(App[None]):
@@ -22,246 +106,119 @@ class NedsterApp(App[None]):
 
     CSS = """
     Screen { background: #0b0d10; color: #e6edf3; layout: vertical; }
-    #identity { height: 3; padding: 1 2; background: #0b0d10; color: #f0f6fc; text-style: bold; border-bottom: solid #252a33; }
-    #work, #details { height: 1fr; padding: 1 3; background: #0b0d10; color: #e6edf3; scrollbar-color: #394150; scrollbar-color-hover: #596579; }
-    #details { display: none; }
-    #prompt { height: 3; margin: 0 2; padding: 0 1; background: #11151b; color: #f0f6fc; border: round #394150; }
-    #prompt:focus { background: #11151b; color: #f0f6fc; border: round #7aa2f7; text-style: none; }
-    #prompt > .input--cursor { background: #7aa2f7; color: #0b0d10; text-style: none; }
-    #prompt > .input--placeholder, #prompt > .input--suggestion { color: #788290; text-style: none; }
-    #message { height: 1; padding: 0 3; background: #0b0d10; color: #8b949e; }
+    #identity { height: 1; padding: 0 2; background: #0b0d10; color: #f0f6fc; text-style: bold; }
+    #work { height: 1fr; padding: 0 2; background: #0b0d10; color: #e6edf3; scrollbar-color: #394150; scrollbar-color-hover: #596579; scrollbar-size-vertical: 1; }
+    #details { height: 1fr; padding: 0 2; display: none; background: #0b0d10; color: #e6edf3; }
+    #completions { height: auto; max-height: 8; margin: 0 2; display: none; background: #11151b; border: round #394150; }
+    #prompt { height: auto; min-height: 3; max-height: 8; margin: 0 2; background: #11151b; color: #f0f6fc; border: round #394150; }
+    #prompt:focus { border: round #7aa2f7; }
+    #status { height: 1; padding: 0 2; background: #0b0d10; color: #c9d1d9; }
+    #message { height: 1; padding: 0 2; background: #0b0d10; color: #8b949e; }
     Footer { background: #0b0d10; color: #8b949e; }
     #too-small { display: none; height: 1fr; content-align: center middle; text-align: center; }
-    .no-color #identity, .no-color #work, .no-color #details, .no-color #message, .no-color Footer { color: ansi_default; background: ansi_default; }
-    .no-color #prompt { color: ansi_default; background: ansi_default; border: round ansi_default; }
-    .no-color #prompt:focus { border: round ansi_default; text-style: none; }
-    .ascii #identity { border-bottom: none; }
-    .ascii #prompt { border: round ansi_blue; }
-    .ascii #prompt:focus { border: round ansi_bright_blue; text-style: none; }
+    .queued { color: #d29922; }
+    .no-color, .no-color #identity, .no-color #work, .no-color #details, .no-color #message, .no-color #status,
+    .no-color Footer, .no-color #prompt, .no-color #completions { color: ansi_default; background: ansi_default; }
+    .no-color #prompt, .no-color #completions { border: round ansi_default; }
+    .no-color #prompt:focus { border: round ansi_default; }
+    .no-color .queued { color: ansi_default; text-style: italic; }
+    .ascii #prompt, .ascii #prompt:focus, .ascii #completions { border: ascii; }
+    .ascii #work { scrollbar-size-vertical: 0; }
     """
 
     BINDINGS = [
-        ("question_mark", "help", "Help"),
-        ("f2", "details", "Details"),
-        ("ctrl+l", "clear", "Clear"),
-        ("escape", "cancel", "Cancel / Exit"),
+        Binding("escape", "escape", "Stop", priority=True),
+        Binding("ctrl+c", "interrupt", "Quit (x2)", priority=True),
+        Binding("f2", "details", "Events"),
+        Binding("ctrl+l", "clear", "Clear"),
     ]
 
-    def __init__(self, config: NedsterConfig, *, ascii_only: bool = False, no_color: bool = False):
+    def __init__(
+        self,
+        config: NedsterConfig,
+        *,
+        ascii_only: bool = False,
+        no_color: bool = False,
+        session_factory: SessionFactoryFor | None = None,
+        doctor: DoctorProvider | None = None,
+        files: Callable[[], Sequence[str]] | None = None,
+    ):
         super().__init__()
         self.config = config
         self.ascii_only = ascii_only
         self.no_color_mode = no_color
-        self.runtime: NedsterRuntime | None = None
+        self.glyphs = Glyphs(ascii_only=ascii_only, no_color=no_color)
+        self.session_factory = session_factory
+        self.doctor = doctor or _default_doctor
+        root = Path(config.runtime.project_root)
+        self.files_source = files or (lambda: project_files(root))
+        self.history = History.for_project(Path(config.runtime.state_dir), root)
+        self.session: EngineSession | None = None
         self.busy = False
-        self.last_event = "starting"
+        self.cancelling = False
+        self.queue: list[str] = []
+        self.queued_lines: list[Line] = []
         self.details_visible = False
         self.event_buffer: list[str] = []
-        self.step_titles: dict[str, str] = {}
+        self.tool_rows: dict[str, ToolRow] = {}
+        self.changed_paths: list[str] = []
+        self.current_reply: AssistantMessage | None = None
+        self.turn_replies: list[AssistantMessage] = []
+        self.pending_badge: OutcomeBadge | None = None
+        self.turn_closed = True
+        self.last_interrupt = 0.0
+        self._loop_thread = threading.get_ident()
+
+    # ------------------------------------------------------------------ layout
 
     def compose(self) -> ComposeResult:
+        g = self.glyphs
         yield Static("terminal too small - need at least 80x24", id="too-small")
-        yield Static("Nedster  /  project                         LOCAL  ·  starting", id="identity")
-        yield RichLog(id="work", markup=True, wrap=True, auto_scroll=True)
-        yield RichLog(id="details", markup=True, wrap=False, auto_scroll=True)
-        yield Input(
-            placeholder="Ask Nedster to build, inspect, or explain…  / for commands",
+        yield Static(g.text(f"Nedster / {self._project_name()}{g.sep}starting"), id="identity")
+        yield Transcript(id="work")
+        yield RichLog(id="details", markup=False, wrap=False, auto_scroll=True)
+        yield OptionList(id="completions")
+        yield Composer(
             id="prompt",
-            select_on_focus=False,
+            history=self.history,
+            commands=list(COMMANDS),
+            files=self.files_source,
+            menu=lambda: self.query_one("#completions", OptionList),
         )
-        yield Static("● Starting local runtime…", id="message")
+        yield StatusBar(g, id="status")
+        yield Static("", id="message")
         yield Footer(show_command_palette=False)
 
+    def _project_name(self) -> str:
+        return Path(self.config.runtime.project_root).name or str(self.config.runtime.project_root)
+
     async def on_mount(self) -> None:
+        self._loop_thread = threading.get_ident()
         if self.no_color_mode:
             self.screen.add_class("no-color")
         if self.ascii_only:
             self.screen.add_class("ascii")
         self._apply_size(self.size.width, self.size.height)
-        self.query_one("#prompt", Input).cursor_blink = False
-        root = self.config.runtime.project_root
-        self.query_one("#work", RichLog).write(
-            "[bold #f0f6fc]Nedster[/]  [#8b949e]local coding agent[/]\n"
-            f"[#8b949e]{escape(str(root))}[/]\n\n"
-            "Ask a question, or describe the outcome you want. Work and tool activity will appear here."
-        )
+        prompt = self.query_one("#prompt", Composer)
+        prompt.cursor_blink = False
+        prompt.focus()
+        g = self.glyphs
+        self.transcript.add(Line(g.text("Nedster  local coding agent"), g.style("strong")))
+        self.transcript.add(Line(g.text(str(self.config.runtime.project_root)), g.style("muted")))
+        self.transcript.add(Line(g.text(
+            "Ask a question or describe the outcome you want. Enter sends, Shift+Enter or Ctrl+J adds a line, "
+            "@ mentions a file, / lists commands, Esc stops a running turn."
+        ), g.style("muted")))
+        self.set_interval(0.5, self._tick)
         self.run_worker(self._initialize(), group="startup", exclusive=True)
-        self.query_one("#prompt", Input).focus()
 
-    async def _initialize(self) -> None:
-        try:
-            self.runtime = NedsterRuntime(self.config, on_event=self._event)
-            fleet = await self.runtime.initialize()
-            worker = fleet.for_role(__import__("ironclad.types", fromlist=["ModelRole"]).ModelRole.CODER).name
-            self.query_one("#identity", Static).update(
-                f"Nedster  /  {self.config.runtime.project_root.name}"
-                f"                         LOCAL  ·  {worker}"
-            )
-            self._status("● Ready")
-        except Exception as exc:
-            self.query_one("#identity", Static).update(
-                f"Nedster  /  {self.config.runtime.project_root.name}"
-                "                         SETUP NEEDED"
-            )
-            error_style = "bold red" if not self.no_color_mode else "bold"
-            self.query_one("#work", RichLog).write(
-                f"\n[{error_style}][FAIL] Could not start the local runtime:[/] {escape(str(exc))}\n"
-                "Run [bold]nedster setup[/] to install Ollama and matched models, then reopen Nedster."
-            )
-            self._status("● Setup needed · /doctor for details")
+    @property
+    def transcript(self) -> Transcript:
+        return self.query_one("#work", Transcript)
 
-    @staticmethod
-    def _tool_label(tool: str) -> str:
-        return tool.replace("_", " ").strip().title() or "Tool"
-
-    @staticmethod
-    def _result_summary(result: Any) -> str:
-        if not isinstance(result, dict):
-            return "complete"
-        if "tracked_count" in result or "untracked_count" in result:
-            return (
-                f"{result.get('tracked_count', 0)} tracked, "
-                f"{result.get('untracked_count', 0)} untracked"
-            )
-        for key, noun in (("tests_run", "tests"), ("total_matches", "matches"), ("count", "items")):
-            if key in result:
-                return f"{result[key]} {noun}"
-        if result.get("path"):
-            changed = " · changed" if result.get("changed") else ""
-            return f"{result['path']}{changed}"
-        if "returncode" in result:
-            return f"exit {result['returncode']}"
-        return "complete"
-
-    def _work_line(self, value: str) -> None:
-        self.query_one("#work", RichLog).write(self._text(value))
-
-    def _progress_event(self, event: dict[str, Any]) -> None:
-        kind = str(event.get("kind") or "")
-        if kind == "response.started":
-            self._work_line("[#8b949e]◇ Thinking[/]")
-        elif kind == "response.escalated":
-            reason = escape(str(event.get("reason") or "verification required"))
-            self._work_line(f"[#d2a8ff]◇ Switching to tools[/]  [#8b949e]{reason}[/]")
-        elif kind == "plan.created":
-            plan = event.get("plan") or {}
-            steps = list(plan.get("steps") or []) if isinstance(plan, dict) else []
-            self.step_titles.update(
-                {
-                    str(step.get("id") or ""): str(step.get("title") or "Work")
-                    for step in steps
-                    if isinstance(step, dict)
-                }
-            )
-            self._work_line(f"\n[bold #d2a8ff]Plan[/]  [#8b949e]{len(steps)} steps[/]")
-            for index, step in enumerate(steps, 1):
-                title = escape(str(step.get("title") or step.get("objective") or "Work"))
-                self._work_line(f"  [#6e7681]{index:>2}[/]  {title}")
-        elif kind == "planner.fallback":
-            self._work_line("[#d29922]◇ Using a simplified plan[/]")
-        elif kind == "swarm.parallel":
-            count = len(event.get("step_ids") or [])
-            self._work_line(f"[#7aa2f7]◇ Running {count} read-only steps in parallel[/]")
-        elif kind == "step.started":
-            step = event.get("step") or {}
-            step_id = str(step.get("id") or "")
-            title = str(step.get("title") or step.get("objective") or "Working")
-            self.step_titles[step_id] = title
-            role = escape(str(step.get("role") or event.get("actor") or "worker"))
-            self._work_line(f"\n[bold #f0f6fc]◆ {escape(title)}[/]  [#6e7681]{role}[/]")
-        elif kind == "worker.turn":
-            turn = event.get("turn")
-            suffix = f" · turn {turn}" if turn else ""
-            self._work_line(f"  [#8b949e]◇ Reasoning{suffix}[/]")
-        elif kind == "worker.stalled":
-            reason = escape(str(event.get("reason") or "retrying with more evidence"))
-            self._work_line(f"  [#d29922]↻ Retrying[/]  [#8b949e]{reason}[/]")
-        elif kind == "step.restarted":
-            title = self.step_titles.get(str(event.get("step_id") or ""), "Step")
-            self._work_line(f"  [#d29922]↻ {escape(title)} · alternate approach[/]")
-        elif kind == "tool.authorized":
-            tool = self._tool_label(str(event.get("tool") or "tool"))
-            self._work_line(f"  [#7aa2f7]→[/] {escape(tool)}")
-        elif kind == "tool.completed":
-            tool = self._tool_label(str(event.get("actor") or "tool"))
-            summary = escape(self._result_summary(event.get("result")))
-            self._work_line(f"  [#3fb950]✓[/] {escape(tool)}  [#8b949e]{summary}[/]")
-        elif kind in {"tool.failed", "tool.denied"}:
-            tool = self._tool_label(str(event.get("tool") or event.get("actor") or "tool"))
-            reason = escape(str(event.get("error") or event.get("reason") or "failed"))
-            self._work_line(f"  [#f85149]✕[/] {escape(tool)}  [#8b949e]{reason}[/]")
-        elif kind == "step.finished":
-            step = event.get("step") or {}
-            verdict = event.get("verdict") or {}
-            title = str(step.get("title") or self.step_titles.get(str(step.get("id") or ""), "Step"))
-            passed = bool(verdict.get("passed"))
-            symbol, color, state = ("✓", "#3fb950", "verified") if passed else ("!", "#d29922", "needs review")
-            self._work_line(f"  [{color}]{symbol} {escape(title)}[/]  [#8b949e]{state}[/]")
-        elif kind == "run.blocked":
-            reason = escape(str(event.get("reason") or "blocked"))
-            self._work_line(f"[#f85149]✕ Run blocked[/]  [#8b949e]{reason}[/]")
-        elif kind == "run.finished":
-            summary = event.get("summary") or {}
-            passed = bool(summary.get("passed"))
-            completed = summary.get("completed_steps", 0)
-            total = summary.get("total_steps", 0)
-            symbol, color, state = ("✓", "#3fb950", "Work complete") if passed else ("!", "#d29922", "Partial result")
-            self._work_line(f"\n[{color}]{symbol} {state}[/]  [#8b949e]{completed}/{total} steps[/]")
-
-    def _event(self, event: dict[str, Any]) -> None:
-        self.last_event = str(event.get("kind", "working"))
-        detail = event.get("message") or event.get("reason") or event.get("tool") or ""
-        failed = self.last_event.endswith(("failed", "denied"))
-        symbol = "[FAIL]" if failed else ">"
-        event_line = f"[dim]{symbol} {escape(self.last_event)}[/] {escape(str(detail))}"
-        self.event_buffer.append(event_line)
-        if len(self.event_buffer) > 500:
-            del self.event_buffer[:100]
-        if self.details_visible:
-            self.query_one("#details", RichLog).write(event_line)
-        self._progress_event(event)
-        statuses = {
-            "runtime.ready": "● Ready",
-            "response.started": "● Thinking… · Esc cancels",
-            "response.finished": "● Ready",
-            "response.escalated": "● Gathering evidence… · Esc cancels",
-            "objective.received": "● Thinking… · Esc cancels",
-            "planner.fallback": "● Using a simple plan… · Esc cancels",
-            "plan.created": "● Plan ready · working… · Esc cancels",
-            "step.started": "● Working… · Esc cancels",
-            "worker.turn": "● Reasoning… · Esc cancels",
-            "tool.authorized": f"● Using {event.get('tool', 'tool')}… · Esc cancels",
-            "tool.completed": f"● Used {event.get('actor', 'tool')} · working… · Esc cancels",
-            "step.finished": "● Verifying… · Esc cancels",
-            "run.finished": "● Ready",
-        }
-        if failed:
-            self._status("● A tool step failed · continuing… · Esc cancels")
-        else:
-            self._status(statuses.get(self.last_event, "● Working… · Esc cancels"))
-
-    def _status(self, message: str) -> None:
-        self.query_one("#message", Static).update(self._text(message))
-
-    def _text(self, value: str) -> str:
-        if not self.ascii_only:
-            return value
-        replacements = {
-            "…": "...",
-            "·": "|",
-            "—": "-",
-            "●": "*",
-            "◇": ">",
-            "◆": ">",
-            "→": "->",
-            "✓": "OK",
-            "✕": "X",
-            "↻": "~",
-            "›": ">",
-        }
-        for symbol, fallback in replacements.items():
-            value = value.replace(symbol, fallback)
-        return value
+    @property
+    def status_bar(self) -> StatusBar:
+        return self.query_one("#status", StatusBar)
 
     def _apply_size(self, width: int, height: int) -> None:
         too_small = width < 80 or height < 24
@@ -269,116 +226,537 @@ class NedsterApp(App[None]):
         self.query_one("#identity").display = not too_small
         self.query_one("#work").display = not too_small and not self.details_visible
         self.query_one("#details").display = not too_small and self.details_visible
-        for selector in ("#prompt", "#message", "Footer"):
+        if too_small:
+            self.query_one("#completions").display = False
+        for selector in ("#prompt", "#status", "#message", "Footer"):
             self.query_one(selector).display = not too_small
 
     def on_resize(self, event: Resize) -> None:
         self._apply_size(event.size.width, event.size.height)
 
-    def on_key(self, event: Key) -> None:
-        if event.key == "question_mark" and isinstance(self.focused, Input) and not self.focused.value:
-            event.prevent_default()
-            event.stop()
-            self._command("/help")
+    def _tick(self) -> None:
+        if self.busy:
+            self.status_bar.refresh()
+            for row in self.tool_rows.values():
+                if row.finished is None:
+                    row.refresh()
 
-    @on(Input.Submitted, "#prompt")
-    async def submit(self, event: Input.Submitted) -> None:
+    # ------------------------------------------------------------------ startup
+
+    def _make_session(self) -> EngineSession:
+        if self.session_factory is not None:
+            return self.session_factory(self.config, self.handle_event)
+        if self.config.engine == "native":
+            raise RuntimeError(
+                "the native engine is not wired into the TUI on this build; "
+                'set engine = "legacy" (or NEDSTER_ENGINE=legacy)'
+            )
+        return LegacySession(self.config, self.handle_event, runtime_class=NedsterRuntime)
+
+    async def _initialize(self) -> None:
+        g = self.glyphs
+        try:
+            self.session = self._make_session()
+            start = getattr(self.session, "start", None)
+            if start is not None:
+                await start()
+        except Exception as exc:  # noqa: BLE001 - shown as a setup remedy, never a crash
+            self.session = None
+            self.query_one("#identity", Static).update(
+                g.text(f"Nedster / {self._project_name()}{g.sep}SETUP NEEDED"))
+            self._line(f"{g.icon('fail')} Could not start the runtime: {exc}", "fail")
+            self._line("Run `nedster setup` to install Ollama and matched models, then reopen Nedster. /doctor shows details.")
+            self.status_bar.set_state("setup needed")
+            return
+        self._refresh_info()
+        self._set_state("idle")
+        self._message("Ready")
+
+    def _refresh_info(self) -> None:
+        if self.session is None:
+            return
+        info = self.session.info()
+        self.status_bar.set_info(info)
+        g = self.glyphs
+        provider = str(info.get("provider") or "LOCAL")
+        oracle = str(info.get("cloud_oracle") or "")
+        where = f"{provider} + CLOUD oracle ({oracle})" if oracle else provider
+        self.query_one("#identity", Static).update(
+            g.text(f"Nedster / {self._project_name()}{g.sep}{where}{g.sep}{info.get('model') or 'no model'}")
+        )
+
+    # ------------------------------------------------------------------ helpers
+
+    def _text(self, value: str) -> str:
+        return self.glyphs.text(value)
+
+    def _line(self, text: str, style: str = "muted") -> Line:
+        line = Line(self._text(text), self.glyphs.style(style))
+        self.transcript.add(line)
+        return line
+
+    def _message(self, text: str) -> None:
+        self.query_one("#message", Static).update(Text(self._text(text)))
+
+    def _set_state(self, state: str, detail: str = "", *, force: bool = False) -> None:
+        if self.cancelling and not force:
+            return  # "cancelling…" persists until the engine confirms
+        self.status_bar.set_state(state, detail)
+
+    # ------------------------------------------------------------------ events
+
+    def handle_event(self, event: SessionEvent) -> None:
+        """Session callback; safe to call from any thread."""
+        if threading.get_ident() != self._loop_thread:
+            self.call_from_thread(self._dispatch, event)
+        else:
+            self._dispatch(event)
+
+    def _dispatch(self, event: SessionEvent) -> None:
+        if isinstance(event, SessionNote):
+            if event.level == "raw":
+                self._record(event.text)
+                return
+            self._record(f"note {event.text}")
+            self._line(event.text, event.level)
+            return
+        self._record(f"{event.kind} {dict(event.data)}")
+        handler = getattr(self, "_on_" + event.kind.replace(".", "_"), None)
+        if handler is not None:
+            handler(event)
+
+    def _record(self, line: str) -> None:
+        line = self._text(line)
+        self.event_buffer.append(line)
+        if len(self.event_buffer) > 500:
+            del self.event_buffer[:100]
+        if self.details_visible:
+            self.query_one("#details", RichLog).write(line)
+
+    def _on_turn_started(self, event: EngineEvent) -> None:
+        self.turn_closed = False
+        self._set_state("thinking")
+
+    def _on_model_delta(self, event: EngineEvent) -> None:
+        if self.current_reply is None:
+            self.current_reply = AssistantMessage(self.glyphs)
+            self.turn_replies.append(self.current_reply)
+            self.transcript.add(self.current_reply)
+        self.current_reply.append(str(event.data.get("text") or ""), str(event.data.get("kind") or "content"))
+        self.transcript.call_after_refresh(self.transcript.scroll_end, animate=False)
+        self._set_state("thinking")
+
+    def _on_model_usage(self, event: EngineEvent) -> None:
+        used = int(event.data.get("prompt_tokens") or 0) + int(event.data.get("completion_tokens") or 0)
+        info = dict(self.status_bar.info)
+        info["context_used"] = used
+        self.status_bar.set_info(info)
+
+    def _on_tool_started(self, event: EngineEvent) -> None:
+        self.current_reply = None
+        call_id = str(event.data.get("call_id") or f"call-{len(self.tool_rows)}")
+        tool = str(event.data.get("tool") or "tool")
+        row = ToolRow(self.glyphs, call_id, tool, dict(event.data.get("arguments") or {}), diff_loader=self._diff_loader)
+        self.tool_rows[call_id] = row
+        self.transcript.add(row)
+        self._set_state("running tool", tool)
+
+    def _on_tool_finished(self, event: EngineEvent) -> None:
+        data = dict(event.data)
+        call_id = str(data.get("call_id") or "")
+        row = self.tool_rows.get(call_id)
+        if row is None:
+            row = ToolRow(self.glyphs, call_id, str(data.get("tool") or "tool"), {}, diff_loader=self._diff_loader)
+            self.tool_rows[call_id or f"call-{len(self.tool_rows)}"] = row
+            self.transcript.add(row)
+        row.finish(data)
+        if failure_reason(str(data.get("status") or ""), data) is None:
+            self._note_changes(data.get("mutated_paths") or [])
+        running = [r for r in self.tool_rows.values() if r.finished is None]
+        if running:
+            self._set_state("running tool", running[-1].tool)
+        else:
+            self._set_state("thinking")
+
+    def _on_acceptance(self, event: EngineEvent) -> None:
+        data = event.data
+        changed = [str(p) for p in data.get("changed_paths") or []]
+        self._note_changes(changed)
+        self.pending_badge = OutcomeBadge(
+            self.glyphs, str(data.get("outcome") or ""), [str(r) for r in data.get("reasons") or []], changed
+        )
+
+    def _on_turn_finished(self, event: EngineEvent) -> None:
+        answer = str(event.data.get("answer") or "").strip()
+        self._show_answer(answer)
+        if self.pending_badge is None and event.data.get("outcome"):
+            self.pending_badge = OutcomeBadge(self.glyphs, str(event.data["outcome"]))
+        self._close_turn()
+        if self.cancelling:
+            self.cancelling = False
+            self._message("Cancelled")
+        self._set_state("idle")
+
+    def _on_error(self, event: EngineEvent) -> None:
+        message = str(event.data.get("message") or "error")
+        remedy = str(event.data.get("remedy") or "")
+        g = self.glyphs
+        self._line(f"{g.icon('fail')} {message}" + (f" {g.icon('dash')} {remedy}" if remedy else ""), "fail")
+
+    def _show_answer(self, answer: str) -> None:
+        streamed = "".join(r.content for r in self.turn_replies).strip()
+        for reply in self.turn_replies:
+            reply.finalize()
+        if not answer:
+            return
+        last = self.turn_replies[-1] if self.turn_replies else None
+        if last is not None and last.content.strip() and answer.startswith(last.content.strip()):
+            last.finalize(answer)
+        elif not streamed or answer != streamed:
+            self.transcript.add(AssistantMessage(self.glyphs, answer, final=True))
+
+    def _close_turn(self) -> None:
+        if self.turn_closed:
+            return
+        self.turn_closed = True
+        for row in self.tool_rows.values():
+            if row.finished is None:
+                row.finish({"status": "cancelled", "summary": "not completed"})
+        if self.pending_badge is not None:
+            self.transcript.add(self.pending_badge)
+            self.pending_badge = None
+        self.current_reply = None
+        self.turn_replies = []
+
+    def _note_changes(self, paths: Sequence[Any]) -> None:
+        for path in paths:
+            if str(path) not in self.changed_paths:
+                self.changed_paths.append(str(path))
+
+    def _diff_loader(self, paths: Sequence[str]) -> str:
+        return session_diff(Path(self.config.runtime.project_root), paths)
+
+    # ------------------------------------------------------------------ input
+
+    @on(Composer.Submitted, "#prompt")
+    def on_submit(self, event: Composer.Submitted) -> None:
         value = event.value.strip()
-        event.input.value = ""
         if not value:
             return
+        composer = event.composer
         if value.startswith("/"):
+            command = value.split()[0].lower()
+            if self.busy and command in IDLE_ONLY:
+                self._message(f"{command} waits for the running turn {self.glyphs.sep} Esc stops it")
+                return  # text stays in the composer
+            composer.prompt_history.add(value)
+            composer.set_text("")
             self._command(value)
             return
+        composer.prompt_history.add(value)
+        composer.set_text("")
+        self.submit_text(value)
+
+    def submit_text(self, value: str) -> None:
         if self.busy:
-            self._status("A task is running · Esc cancels")
+            self.queue.append(value)
+            g = self.glyphs
+            self.queued_lines.append(self._line(f"{g.icon('queued')} queued: {value}", "warn"))
+            self.queued_lines[-1].add_class("queued")
+            self.status_bar.queued = len(self.queue)
+            self.status_bar.refresh()
+            self._message(f"Queued {g.sep} sent after the current turn")
             return
-        if not self.runtime:
-            self._status("Runtime unavailable · run nedster setup")
+        if self.session is None:
+            self.query_one("#prompt", Composer).set_text(value)
+            self._message("Runtime unavailable · run nedster setup (your text was kept)")
             return
-        self.run_worker(self._execute(value), group="task", exclusive=True)
+        self._start_turn(value)
 
-    async def _execute(self, objective: str) -> None:
-        assert self.runtime is not None
+    def _start_turn(self, value: str) -> None:
         self.busy = True
-        log = self.query_one("#work", RichLog)
-        self.step_titles.clear()
-        log.write(f"\n[bold #f0f6fc]›[/]  [bold #f0f6fc]{escape(objective)}[/]")
-        self._status("● Working… · Esc cancels")
-        try:
-            result = await self.runtime.respond(objective)
-            answer = str(result.get("answer") or "I could not produce an answer.").strip()
-            log.write("\n[bold #7aa2f7]Nedster[/]")
-            log.write(Markdown(answer, code_theme="monokai"))
-            grounded = bool(result.get("grounded"))
-            passed = bool(result.get("passed"))
-            completed = int(result.get("completed_steps") or 0)
-            total = int(result.get("total_steps") or 0)
-            state = "verified" if passed and grounded else ("complete" if passed else "needs review")
-            scope = f" · {completed}/{total} steps" if total else ""
-            log.write(f"[#6e7681]{state}{scope}[/]")
-        except asyncio.CancelledError:
-            log.write("[bold][CANCELLED][/] Task cancelled.")
-            raise
-        except Exception as exc:
-            error_style = "bold red" if not self.no_color_mode else "bold"
-            log.write(f"[{error_style}][FAIL] Task failed:[/] {escape(str(exc))}")
-        finally:
-            self.busy = False
-            self._status("● Ready")
+        self.turn_closed = False
+        self.status_bar.start_turn()
+        self._set_state("thinking")
+        self.run_worker(self._run_turn(value), group="turn")
 
-    def _command(self, value: str) -> None:
-        command = value.lower().split()[0]
-        log = self.query_one("#work", RichLog)
-        if command in {"/quit", "/exit"}:
+    async def _run_turn(self, value: str) -> None:
+        assert self.session is not None
+        g = self.glyphs
+        self._line(f"{g.icon('user')} {value}", "user")
+        try:
+            await self.session.submit(value)
+        except asyncio.CancelledError:
+            self.busy = False  # app shutdown: widgets are going away, nothing to render
+            raise
+        except Exception as exc:  # noqa: BLE001 - shown in the transcript
+            self._line(f"{g.icon('fail')} Turn failed: {exc}", "fail")
+        self._close_turn()
+        self.busy = False
+        if self.cancelling:
+            self.cancelling = False
+            self._message("Cancelled")
+        self.status_bar.end_turn()
+        self._set_state("idle")
+        self._refresh_info()
+        self._dequeue()
+
+    def _dequeue(self) -> None:
+        if self.busy or not self.queue or self.session is None:
+            return
+        value = self.queue.pop(0)
+        line = self.queued_lines.pop(0)
+        line.remove()
+        self.status_bar.queued = len(self.queue)
+        self._message("")
+        self._start_turn(value)
+
+    # ------------------------------------------------------------------ actions
+
+    def action_escape(self) -> None:
+        composer = self.query_one("#prompt", Composer)
+        if composer.completion is not None:
+            composer.close_completion()
+            return
+        if self.busy:
+            self.cancel_turn()
+        # idle: Esc does nothing (Ctrl+C twice or /quit exits)
+
+    def cancel_turn(self) -> None:
+        if not self.busy or self.cancelling or self.session is None:
+            return
+        self.cancelling = True
+        self._set_state("cancelling…", force=True)
+        self._message("Cancelling… waiting for the engine to stop")
+        if self.queue:
+            composer = self.query_one("#prompt", Composer)
+            restored = "\n".join([*self.queue, composer.text] if composer.text.strip() else self.queue)
+            composer.set_text(restored)
+            for line in self.queued_lines:
+                line.remove()
+            self.queue.clear()
+            self.queued_lines.clear()
+            self.status_bar.queued = 0
+            self._line("Queued input was returned to the composer.")
+        self.run_worker(self.session.cancel(), group="cancel")
+
+    def action_interrupt(self) -> None:
+        now = time.monotonic()
+        if now - self.last_interrupt < 2.0:
             self.exit()
-        elif command == "/clear":
-            log.clear()
-        elif command == "/help":
-            log.write("[bold #d2a8ff]Commands[/]  /models  /doctor  /permissions  /clear  /quit")
-            log.write("[#8b949e]Keys[/]  ? help  F2 raw events  Ctrl+L clear  Esc cancel/exit")
-        elif command == "/models":
-            rows = self.runtime.fleet.as_rows() if self.runtime and self.runtime.fleet else []
-            log.write(
-                "\n".join(f"{role}: {model} ({backend})" for role, model, backend in rows)
-                or "No model fleet is active. Run `nedster setup`."
-            )
-        elif command == "/doctor":
-            log.write("Run `nedster doctor` outside the TUI for a complete machine-readable check.")
-        elif command == "/permissions":
-            policy = self.config.policy
-            log.write(f"Autonomous: {policy.autonomous} · automatic risk ceiling: {policy.max_auto_risk}")
-        else:
-            log.write("Unknown command. Use /help.")
+            return
+        self.last_interrupt = now
+        if self.busy:
+            self.cancel_turn()
+        self._message("Press Ctrl+C again to exit")
 
     def action_help(self) -> None:
         self._command("/help")
 
     def action_details(self) -> None:
         self.details_visible = not self.details_visible
-        self.query_one("#work", RichLog).display = not self.details_visible
+        self.query_one("#work").display = not self.details_visible
         details = self.query_one("#details", RichLog)
         details.display = self.details_visible
         if self.details_visible:
             details.clear()
             for line in self.event_buffer:
                 details.write(line)
-        self._status("● Raw events · F2 returns to conversation" if self.details_visible else "● Ready")
+        self._message("Raw events · F2 returns to conversation" if self.details_visible else "")
 
     def action_clear(self) -> None:
-        self.query_one("#work", RichLog).clear()
+        self.transcript.remove_children()
+        self.tool_rows = {k: v for k, v in self.tool_rows.items() if v.finished is None}
 
-    def action_cancel(self) -> None:
-        if self.busy:
-            self.workers.cancel_group(self, "task")
-        else:
-            self.exit()
+    # ------------------------------------------------------------------ commands
+
+    def _command(self, value: str) -> None:
+        parts = value.split()
+        command, args = parts[0].lower(), parts[1:]
+        handlers: dict[str, Callable[[list[str]], Any]] = {
+            "/quit": lambda _a: self.exit(),
+            "/exit": lambda _a: self.exit(),
+            "/help": self._cmd_help,
+            "/clear": lambda _a: self.action_clear(),
+            "/new": self._cmd_new,
+            "/sessions": self._cmd_sessions,
+            "/resume": self._cmd_resume,
+            "/model": self._cmd_model,
+            "/models": self._cmd_models,
+            "/status": self._cmd_status,
+            "/diff": lambda _a: self.run_worker(self._cmd_diff(), group="command"),
+            "/undo": lambda _a: self.run_worker(self._cmd_undo(), group="command"),
+            "/doctor": lambda _a: self.run_worker(self._cmd_doctor(), group="command"),
+            "/permissions": self._cmd_permissions,
+        }
+        handler = handlers.get(command)
+        if handler is None:
+            self._line(f"Unknown command {command}. /help lists commands.", "warn")
+            return
+        handler(args)
+
+    def _cmd_help(self, _args: list[str]) -> None:
+        self._line("Commands", "accent")
+        for name, text in COMMANDS.items():
+            self._line(f"  {name:<13}{text}")
+        self._line("Keys", "accent")
+        self._line("  Enter send · Shift+Enter/Ctrl+J newline · Up/Down history · @ file · / command")
+        self._line("  Esc stop the running turn · Ctrl+C twice exit · F2 raw events · Ctrl+L clear")
+        self._line("  Tool rows: focus with Tab/click, Enter expands argv, output and diff")
+
+    def _cmd_new(self, _args: list[str]) -> None:
+        new = getattr(self.session, "new", None)
+        if new is None:
+            self._line("This engine cannot start a new conversation; restart Nedster.", "warn")
+            return
+        session_id = new()
+        self.action_clear()
+        self.changed_paths.clear()
+        self._line(f"New conversation {str(session_id)[:12]}", "accent")
+        self._refresh_info()
+
+    def _cmd_sessions(self, _args: list[str]) -> None:
+        lister = getattr(self.session, "list_sessions", None)
+        if lister is None:
+            self._line('Saved sessions need the native engine (engine = "native").', "warn")
+            return
+        sessions = list(lister())
+        if not sessions:
+            self._line("No saved sessions for this project.")
+            return
+        current = self.status_bar.info.get("session_id")
+        self._line("Sessions (newest first) · /resume <id>", "accent")
+        for item in sessions:
+            sid = str(item.get("id", ""))
+            updated = item.get("updated_ns")
+            when = datetime.fromtimestamp(int(updated) / 1e9).strftime("%Y-%m-%d %H:%M") if updated else ""
+            marker = "*" if sid == current else " "
+            self._line(f" {marker} {sid[:12]}  {when}  {item.get('title') or ''}")
+
+    def _cmd_resume(self, args: list[str]) -> None:
+        resume = getattr(self.session, "resume", None)
+        if resume is None:
+            self._line('Resuming needs the native engine (engine = "native").', "warn")
+            return
+        try:
+            session_id = resume(args[0] if args else None)
+        except LookupError as exc:
+            self._line(str(exc), "warn")
+            return
+        self.changed_paths.clear()
+        self._line(f"Resumed session {str(session_id)[:12]}", "accent")
+        self._refresh_info()
+
+    def _cmd_model(self, args: list[str]) -> None:
+        info = self.session.info() if self.session else {}
+        if not args:
+            self._line(f"Model: {info.get('model') or 'none'} ({info.get('provider') or 'LOCAL'})")
+            return
+        setter = getattr(self.session, "set_model", None)
+        if setter is None:
+            self._line("This engine picks models from the fleet; change models.coder in config.toml.", "warn")
+            return
+        setter(args[0])
+        self._line(f"Model set to {args[0]}", "accent")
+        self._refresh_info()
+
+    def _cmd_models(self, _args: list[str]) -> None:
+        rows = getattr(self.session, "models", lambda: [])()
+        if not rows:
+            self._line("No model fleet is active. Run `nedster setup`.")
+        for role, model, backend in rows:
+            self._line(f"{role}: {model} ({backend})")
+
+    def _cmd_status(self, _args: list[str]) -> None:
+        if self.session is None:
+            self._line("Runtime not started. Run /doctor.", "warn")
+            return
+        info = self.session.info()
+
+        label, danger = isolation_label(str(info.get("sandbox") or ""), str(info.get("isolation") or ""))
+        rows = [
+            ("engine", info.get("engine", "")),
+            ("model", f"{info.get('model', '')} ({info.get('provider', 'LOCAL')})"),
+            ("context", f"{info.get('context_used', 0)}/{info.get('context_max', 0) or 'n/a'} tokens"),
+            ("sandbox", label),
+            ("session", info.get("session_id", "")),
+            ("changed", f"{len(self.changed_paths)} file(s)"),
+            ("queued", str(len(self.queue))),
+            ("state", self.status_bar.state),
+        ]
+        for name, value in rows:
+            self._line(f"  {name:<9}{value}", "fail" if name == "sandbox" and danger else "muted")
+
+    async def _cmd_diff(self) -> None:
+        if not self.changed_paths:
+            self._line("No files changed in this session.")
+            return
+        root = Path(self.config.runtime.project_root)
+        diff = await asyncio.to_thread(session_diff, root, list(self.changed_paths))
+        self._line(f"Changed in this session: {', '.join(self.changed_paths)}", "accent")
+        if not diff:
+            self._line("(no textual diff available)")
+            return
+        text = self._text(bounded(diff, 400, 80_000))
+        renderable = Text(text) if self.no_color_mode else Syntax(text, "diff", theme="monokai", background_color="default")
+        self.transcript.add(Static(renderable))
+
+    async def _cmd_undo(self) -> None:
+        undo = getattr(self.session, "undo_last", None)
+        if undo is None:
+            self._line(
+                "Undo is not available with this engine: it keeps no edit checkpoints. "
+                "Review with /diff and revert with git (git checkout -- <file>).",
+                "warn",
+            )
+            return
+        try:
+            result = undo()
+            if asyncio.iscoroutine(result):
+                result = await result
+        except NotImplementedError as exc:
+            self._line(f"Undo unavailable: {exc}", "warn")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._line(f"Undo failed: {exc}", "fail")
+            return
+        self._line(f"Undo: {result}", "accent")
+
+    async def _cmd_doctor(self) -> None:
+        self._line("Doctor · checking readiness…", "accent")
+        try:
+            tiers = await asyncio.to_thread(self.doctor, self.config)
+        except Exception as exc:  # noqa: BLE001
+            self._line(f"Doctor failed: {exc}", "fail")
+            return
+        g = self.glyphs
+        labels = {"inference": "inference-ready", "read_only": "read-only-ready", "execution": "execution-ready"}
+        for key, label in labels.items():
+            tier = tiers.get(key) or {}
+            ok = bool(tier.get("ready"))
+            mark = f"{g.icon('ok')} ready" if ok else f"{g.icon('fail')} NOT READY"
+            self._line(f"  {label:<16}{mark} {g.sep} {tier.get('detail', '')}", "ok" if ok else "fail")
+            if not ok and tier.get("remedy"):
+                self._line(f"      {g.icon('arrow')} {tier['remedy']}", "warn")
+
+    def _cmd_permissions(self, _args: list[str]) -> None:
+        policy = self.config.policy
+        self._line(f"Autonomous: {policy.autonomous} · automatic risk ceiling: {policy.max_auto_risk}")
 
     async def on_unmount(self) -> None:
-        if self.runtime:
+        close = getattr(self.session, "close", None)
+        if close is not None:
             with suppress(Exception):
-                self.runtime.close()
+                result = close()
+                if asyncio.iscoroutine(result):
+                    await result
 
 
-def run_tui(config: NedsterConfig, *, ascii_only: bool = False, no_color: bool = False) -> None:
-    NedsterApp(config, ascii_only=ascii_only, no_color=no_color).run()
+def run_tui(
+    config: NedsterConfig,
+    *,
+    ascii_only: bool = False,
+    no_color: bool = False,
+    session_factory: SessionFactoryFor | None = None,
+) -> None:
+    NedsterApp(config, ascii_only=ascii_only, no_color=no_color, session_factory=session_factory).run()
