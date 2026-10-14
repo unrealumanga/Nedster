@@ -22,6 +22,7 @@ from textual.widgets import Footer, OptionList, RichLog, Static
 from ironclad.config import NedsterConfig
 from ironclad.contracts import EngineEvent
 from ironclad.orchestrator import NedsterRuntime
+from ironclad.session_store.sqlite_store import make_owner
 
 from .widgets.composer import Composer, History, project_files
 from .widgets.glyphs import Glyphs
@@ -35,7 +36,17 @@ from .widgets.session import (
     failure_reason,
 )
 from .widgets.status import StatusBar, isolation_label
-from .widgets.transcript import AssistantMessage, Line, OutcomeBadge, ToolRow, Transcript, bounded
+from .widgets.transcript import (
+    RESUME_BANNER,
+    AssistantMessage,
+    Banner,
+    Line,
+    OutcomeBadge,
+    ToolRow,
+    Transcript,
+    bounded,
+    replay_widgets,
+)
 
 COMMANDS: dict[str, str] = {
     "/help": "show commands and keys",
@@ -54,6 +65,11 @@ COMMANDS: dict[str, str] = {
 }
 # Commands that change engine/session state wait for the running turn (the text is kept).
 IDLE_ONLY = {"/new", "/resume", "/model", "/undo", "/sessions"}
+
+#: How much stored history /resume replays into the view (display only, never re-executed).
+RESUME_REPLAY_LIMIT = 200
+#: Activity-lock heartbeat period; well below the store's 60 s lock TTL.
+LOCK_REFRESH_S = 5.0
 
 DoctorProvider = Callable[[NedsterConfig], Mapping[str, Mapping[str, Any]]]
 SessionFactoryFor = Callable[[NedsterConfig, EventCallback], EngineSession]
@@ -199,6 +215,9 @@ class NedsterApp(App[None]):
         self.turn_closed = True
         self.last_interrupt = 0.0
         self._loop_thread = threading.get_ident()
+        self._lock_owner = make_owner("tui")
+        self._locked: tuple[Any, str] | None = None  # (store, session_id) held by this window
+        self._last_lock_refresh = 0.0
 
     # ------------------------------------------------------------------ layout
 
@@ -266,6 +285,7 @@ class NedsterApp(App[None]):
         self._apply_size(event.size.width, event.size.height)
 
     def _tick(self) -> None:
+        self._heartbeat_lock()
         if self.busy:
             self.status_bar.refresh()
             for row in self.tool_rows.values():
@@ -297,6 +317,7 @@ class NedsterApp(App[None]):
             self.status_bar.set_state("setup needed")
             return
         self._refresh_info()
+        self._acquire_lock(str(getattr(self.session, "session_id", "")))
         self._set_state("idle")
         self._message("Ready")
 
@@ -330,6 +351,113 @@ class NedsterApp(App[None]):
         if self.cancelling and not force:
             return  # "cancelling…" persists until the engine confirms
         self.status_bar.set_state(state, detail)
+
+    # ------------------------------------------------------------------ session locks + resume
+
+    def _session_store(self) -> Any:
+        return getattr(self.session, "store", None) if self.session is not None else None
+
+    def _acquire_lock(self, session_id: str, *, warn: bool = True) -> bool:
+        """Mark this window as the holder of ``session_id``; False when another live Nedster has it."""
+        store = self._session_store()
+        acquire = getattr(store, "acquire_lock", None)
+        if not callable(acquire):
+            return True
+        try:
+            acquired = bool(acquire(session_id, self._lock_owner))
+        except Exception as exc:  # noqa: BLE001 - shown, never fatal
+            if warn:
+                self._line(f"Could not lock session: {exc}", "warn")
+            return False
+        if acquired:
+            self._locked = (store, session_id)
+            self._last_lock_refresh = time.monotonic()
+        elif warn:
+            self._line("That session is active in another Nedster window; close it there first.", "warn")
+        return acquired
+
+    def _release_lock(self) -> None:
+        if self._locked is None:
+            return
+        store, session_id = self._locked
+        self._locked = None
+        release = getattr(store, "release_lock", None)
+        if callable(release):
+            with suppress(Exception):
+                release(session_id, self._lock_owner)
+
+    def _heartbeat_lock(self) -> None:
+        """Keep the lock of the session this window is holding alive (see LOCK_REFRESH_S)."""
+        if self._locked is None:
+            return
+        now = time.monotonic()
+        if now - self._last_lock_refresh < LOCK_REFRESH_S:
+            return
+        self._last_lock_refresh = now
+        store, session_id = self._locked
+        refresh = getattr(store, "refresh_lock", None)
+        if not callable(refresh):
+            return
+        try:
+            renewed = bool(refresh(session_id, self._lock_owner))
+        except Exception:  # noqa: BLE001 - a failed heartbeat must not crash the UI
+            return
+        if renewed:
+            return
+        acquire = getattr(store, "acquire_lock", None)
+        try:
+            recovered = bool(acquire(session_id, self._lock_owner)) if callable(acquire) else False
+        except Exception:  # noqa: BLE001
+            recovered = False
+        self._message("" if recovered else "Session lock lost - another Nedster may have taken over")
+
+    def _resolve_session_id(self, wanted: str | None) -> str:
+        """Mirror of ``NativeSession.resume`` resolution, so the lock is taken *before* switching."""
+        lister = getattr(self.session, "list_sessions", None)
+        if lister is not None:
+            sessions = list(lister())
+        else:
+            store = self._session_store()
+            store_lister = getattr(store, "list_sessions", None)
+            sessions = list(store_lister(str(self.config.runtime.project_root))) if callable(store_lister) else []
+        if not sessions:
+            raise LookupError("no saved sessions for this project")
+        if wanted is None:
+            return str(sessions[0]["id"])
+        matches = [item for item in sessions if str(item.get("id", "")).startswith(wanted)]
+        if len(matches) != 1:
+            raise LookupError(f"no unique session matches {wanted!r}")
+        return str(matches[0]["id"])
+
+    def _replay_session(self, session_id: str) -> None:
+        """Rebuild the view from the stored display transcript, then warn that it is history."""
+        store = self._session_store()
+        self.action_clear()
+        self.changed_paths.clear()
+        entries: list[Mapping[str, Any]] = []
+        if store is not None:
+            repair = getattr(store, "repair_interrupted", None)
+            if callable(repair):
+                try:
+                    added = int(repair(session_id))
+                except Exception as exc:  # noqa: BLE001 - replay must survive a damaged history
+                    self._line(f"Could not repair interrupted calls: {exc}", "warn")
+                else:
+                    if added:
+                        self._line(f"Repaired {added} interrupted tool call(s) from the last run.", "warn")
+            read = getattr(store, "transcript", None)
+            if callable(read):
+                try:
+                    entries = list(read(session_id, RESUME_REPLAY_LIMIT))
+                except Exception as exc:  # noqa: BLE001
+                    self._line(f"Could not read the transcript: {exc}", "warn")
+        self._line(f"Resumed session {session_id[:12]}", "accent")
+        for widget in replay_widgets(self.glyphs, entries):
+            self.transcript.add(widget)
+        if not entries:
+            self._line("No saved transcript for this session.", "muted")
+        self.transcript.add(Banner(self.glyphs, RESUME_BANNER))
+        self._refresh_info()
 
     # ------------------------------------------------------------------ events
 
@@ -638,6 +766,8 @@ class NedsterApp(App[None]):
             self._line("This engine cannot start a new conversation; restart Nedster.", "warn")
             return
         session_id = new()
+        self._release_lock()
+        self._acquire_lock(str(session_id))
         self.action_clear()
         self.changed_paths.clear()
         self._line(f"New conversation {str(session_id)[:12]}", "accent")
@@ -666,14 +796,29 @@ class NedsterApp(App[None]):
         if resume is None:
             self._line('Resuming needs the native engine (engine = "native").', "warn")
             return
+        wanted = args[0] if args else None
+        store = self._session_store()
+        target: str | None = None
+        if callable(getattr(store, "transcript", None)):
+            try:
+                target = self._resolve_session_id(wanted)
+            except LookupError as exc:
+                self._line(str(exc), "warn")
+                return
+            if not self._acquire_lock(target):  # active elsewhere: keep the current conversation
+                return
         try:
-            session_id = resume(args[0] if args else None)
+            session_id = str(resume(wanted if target is None else target))
         except LookupError as exc:
             self._line(str(exc), "warn")
             return
-        self.changed_paths.clear()
-        self._line(f"Resumed session {str(session_id)[:12]}", "accent")
-        self._refresh_info()
+        except Exception as exc:  # noqa: BLE001 - shown in the transcript, never fatal
+            self._line(f"Resume failed: {exc}", "fail")
+            return
+        if target is not None and session_id != target:
+            self._release_lock()
+            self._acquire_lock(session_id, warn=False)
+        self._replay_session(session_id)
 
     def _cmd_model(self, args: list[str]) -> None:
         info = self.session.info() if self.session else {}
@@ -772,6 +917,7 @@ class NedsterApp(App[None]):
         self._line(f"Autonomous: {policy.autonomous} · automatic risk ceiling: {policy.max_auto_risk}")
 
     async def on_unmount(self) -> None:
+        self._release_lock()
         close = getattr(self.session, "close", None)
         if close is not None:
             with suppress(Exception):

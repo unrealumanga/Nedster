@@ -308,3 +308,190 @@ async def test_native_engine_is_wired_and_uses_the_session_store(tmp_path):
         assert app.session.session_id == app.session.core.session_id
         assert "SETUP NEEDED" not in str(app.query_one("#identity").render())
     assert (tmp_path / "state" / "sessions.sqlite3").exists()
+
+
+# --- /resume replay, activity locks, interrupted-call repair (W2-RESUME) ---------------------
+
+from pathlib import Path  # noqa: E402
+
+from ironclad.contracts import ToolCall  # noqa: E402
+from ironclad.session_store.sqlite_store import (  # noqa: E402
+    INTERRUPTED_TEXT,
+    SqliteSessionStore,
+    make_owner,
+)
+from nedster_agent.widgets.transcript import RESUME_BANNER  # noqa: E402
+
+
+class _FakeNativeSession:
+    """Duck-typed NativeSession double on a real SqliteSessionStore: no model, no engine."""
+
+    def __init__(self, config, _emit, *, session_id: str = "") -> None:
+        self.model = "nedster-worker"
+        state_dir = Path(config.runtime.state_dir)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        self.store = SqliteSessionStore(state_dir / "sessions.sqlite3")
+        self.project_root = str(Path(config.runtime.project_root).resolve())
+        self.session_id = session_id or self.store.create(self.project_root)
+
+    async def submit(self, text: str) -> None:  # pragma: no cover - /resume is idle-only
+        raise AssertionError(f"replay must never re-run a turn (got {text!r})")
+
+    async def cancel(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        self.store.close()
+
+    def info(self):
+        return {
+            "model": self.model,
+            "provider": "LOCAL",
+            "sandbox": "docker",
+            "isolation": "full",
+            "context_used": 0,
+            "context_max": 32_768,
+            "session_id": self.session_id,
+            "engine": "native",
+        }
+
+    def new(self) -> str:
+        self.session_id = self.store.create(self.project_root)
+        return self.session_id
+
+    def list_sessions(self):
+        return list(self.store.list_sessions(self.project_root))
+
+    def resume(self, session_id=None) -> str:
+        sessions = self.list_sessions()
+        if not sessions:
+            raise LookupError("no saved sessions for this project")
+        if session_id is None:
+            chosen = sessions[0]
+        else:
+            matches = [s for s in sessions if str(s["id"]).startswith(session_id)]
+            if len(matches) != 1:
+                raise LookupError(f"no unique session matches {session_id!r}")
+            chosen = matches[0]
+        self.session_id = str(chosen["id"])
+        return self.session_id
+
+    def set_model(self, name: str) -> None:
+        self.model = name
+
+
+def _resume_app(tmp_path):
+    config = NedsterConfig()
+    config.runtime.project_root = tmp_path
+    config.runtime.state_dir = tmp_path / "state"
+    config.engine = "native"
+    return NedsterApp(config, session_factory=lambda cfg, emit: _FakeNativeSession(cfg, emit))
+
+
+def _seed_session(app, *, title: str) -> str:
+    """A stored session with a display transcript, created before this window opened."""
+    session = app.session.store.create(str(Path(app.session.project_root)), title)
+    app.session.store.append_transcript(session, "user", "inspect the widget")
+    app.session.store.append_transcript(session, "assistant", "the widget is fine")
+    app.session.store.append_transcript(session, "tool", "pytest -q", {"tool": "run_tests", "status": "ok"})
+    return session
+
+
+@pytest.mark.asyncio
+async def test_resume_replays_the_stored_transcript_and_warns_it_is_stale(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        older = _seed_session(app, title="older work")
+        app._command(f"/resume {older[:8]}")
+        await _settle(pilot)
+
+        text = _transcript(app)
+        assert f"Resumed session {older[:8]}" in text
+        assert "inspect the widget" in text and "the widget is fine" in text
+        # a tool row is shown as history, never replayed with its stored output text
+        assert "earlier tool result - not replayed" in text
+        assert "pytest -q" not in text
+        assert RESUME_BANNER in text
+        # the replay is the stored transcript, not a re-execution
+        assert "Turn failed" not in text
+        assert app.session.session_id == older
+        assert app.status_bar.state == "idle"
+
+
+@pytest.mark.asyncio
+async def test_resume_takes_the_activity_lock_and_delete_refuses(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        older = _seed_session(app, title="locked by this window")
+        assert app.session.store.is_active(older) is False
+
+        app._command(f"/resume {older[:8]}")
+        await _settle(pilot)
+
+        store = app.session.store
+        assert store.is_active(older) is True
+        assert store.lock_info(older)["pid"] == __import__("os").getpid()
+        assert store.delete_session(older) is False  # refused: this window is using it
+
+
+@pytest.mark.asyncio
+async def test_resume_keeps_the_current_session_when_another_window_holds_the_lock(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        older = _seed_session(app, title="used elsewhere")
+        foreign = app.session.store.acquire_lock(older, make_owner("tui"))
+        assert foreign is True  # a live holder from another window (same host, live pid)
+
+        current = app.session.session_id
+        app._command(f"/resume {older[:8]}")
+        await _settle(pilot)
+
+        text = _transcript(app)
+        assert "active in another Nedster window" in text
+        assert app.session.session_id == current
+        assert f"Resumed session {older[:8]}" not in text
+        assert app.session.store.is_active(older) is True
+
+
+@pytest.mark.asyncio
+async def test_resume_unknown_id_warns_and_stays_put(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        _seed_session(app, title="the only one")
+        current = app.session.session_id
+
+        app._command("/resume deadbeef")
+        await _settle(pilot)
+
+        assert "no unique session matches" in _transcript(app)
+        assert app.session.session_id == current
+
+
+@pytest.mark.asyncio
+async def test_resume_repairs_interrupted_tool_calls_before_replaying(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        store = app.session.store
+        broken = store.create(app.session.project_root, "cut off mid-tool")
+        store.append_transcript(broken, "user", "run the tests")
+        from ironclad.contracts import ChatMessage
+
+        store.append_message(broken, ChatMessage(role="user", content="run the tests"))
+        store.append_message(
+            broken,
+            ChatMessage(role="assistant", content="", tool_calls=[ToolCall(id="c1", name="run_tests", arguments={})]),
+        )
+
+        app._command(f"/resume {broken[:8]}")
+        await _settle(pilot)
+
+        assert "Repaired 1 interrupted tool call(s)" in _transcript(app)
+        repaired = store.messages(broken)
+        assert [message.role for message in repaired] == ["user", "assistant", "tool"]
+        assert repaired[2].content == INTERRUPTED_TEXT
+        assert repaired[2].tool_call_id == "c1"

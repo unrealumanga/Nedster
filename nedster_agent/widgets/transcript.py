@@ -304,6 +304,76 @@ class OutcomeBadge(Widget):
         return Group(*rows)
 
 
+class Banner(Widget):
+    """One high-visibility notice line (the resume banner, retention warnings, …)."""
+
+    DEFAULT_CSS = """
+    Banner { height: auto; margin: 1 0; padding: 0 1; background: #3b2f00; color: #e3b341; text-style: bold; }
+    .no-color Banner { background: ansi_default; color: ansi_default; }
+    """
+
+    def __init__(self, glyphs: Glyphs, text: str) -> None:
+        super().__init__()
+        self.glyphs = glyphs
+        self.text = text
+
+    def render(self) -> RenderableType:
+        return Text(self.glyphs.text(f"{self.glyphs.icon('warn')} {self.text}"))
+
+
+#: Shown after every /resume: replayed history is context, not fresh evidence.
+RESUME_BANNER = "resumed - earlier validation results are not current evidence"
+REPLAY_MAX_LINES = 400
+REPLAY_MAX_CHARS = 40_000
+TOOL_REPLAY_NOTE = "earlier tool result - not replayed"
+
+
+def replay_widgets(glyphs: Glyphs, entries: Sequence[Mapping[str, Any]]) -> list[Widget]:
+    """Display-only reconstruction of a stored transcript for ``/resume``.
+
+    Nothing is ever re-executed: tool entries become a muted marker and their stored output text
+    is dropped on purpose, so an old tool result can never be mistaken for current evidence.
+    """
+    widgets: list[Widget] = []
+    for entry in entries:
+        role = str(entry.get("role") or "")
+        meta = entry.get("meta") if isinstance(entry.get("meta"), Mapping) else {}
+        text = bounded(str(entry.get("text") or ""), REPLAY_MAX_LINES, REPLAY_MAX_CHARS)
+        if role == "tool":
+            tool = str(meta.get("tool") or meta.get("name") or "tool")
+            status = str(meta.get("status") or "")
+            label = f"{tool} {status}".strip()
+            widgets.append(
+                Line(
+                    glyphs.text(f"{glyphs.icon('dash')} {label}{glyphs.sep}{TOOL_REPLAY_NOTE}"),
+                    glyphs.style("muted"),
+                )
+            )
+            continue
+        if not text.strip():
+            calls = [call for call in (meta.get("tool_calls") or []) if isinstance(call, Mapping)]
+            for call in calls:
+                arguments = call.get("arguments") if isinstance(call.get("arguments"), Mapping) else {}
+                label = str(call.get("name") or "tool")
+                args = short_args(arguments)
+                widgets.append(
+                    Line(
+                        glyphs.text(f"{glyphs.icon('dash')} {label} {args}".rstrip()),
+                        glyphs.style("muted"),
+                    )
+                )
+            continue
+        if role == "user":
+            widgets.append(Line(glyphs.text(f"{glyphs.icon('user')} {text}"), glyphs.style("user")))
+        elif role == "assistant":
+            message = AssistantMessage(glyphs, text, final=True)
+            message.thinking = bounded(str(meta.get("thinking") or ""), REPLAY_MAX_LINES, REPLAY_MAX_CHARS)
+            widgets.append(message)
+        else:  # system notices and unknown roles: context, never evidence
+            widgets.append(Line(glyphs.text(text), glyphs.style("muted")))
+    return widgets
+
+
 class Transcript(VerticalScroll):
     """The central conversation; focusable rows inside, keeps scrolled to the end."""
 
