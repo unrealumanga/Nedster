@@ -80,11 +80,16 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+SHORT_SHA = 16
+
+
 def hash_matches(expected: str, digest: str) -> bool:
     value = expected.strip().lower()
     if value.startswith("sha256:"):
         value = value[len("sha256:") :]
-    return value == digest or value == digest[:16]
+    # read_file shows the first 16 hex digits; models often "complete" them into an invented 64-digit value.
+    # 16 digits (64 bits) of the current hash are as good evidence of a read as the full hash.
+    return value == digest or (len(value) >= SHORT_SHA and value[:SHORT_SHA] == digest[:SHORT_SHA])
 
 
 def _fold(name: str) -> str:
@@ -405,6 +410,11 @@ class FileTools:
         if own is not None and own[0] == digest:
             return ToolError(
                 f"file changed since your read - by your own edit at {own[1]}; current sha256:{digest[:16]}"
+            )
+        if self.read_hashes.get(rel) == digest:  # the model read exactly these bytes; it only mis-copied the sha
+            return ToolError(
+                f"expected_sha does not match {rel}, which is unchanged since your read: "
+                f"pass expected_sha \"{digest[:SHORT_SHA]}\" (copy it from the read_file header)"
             )
         return ToolError("file changed since read / read it first")
 

@@ -136,8 +136,9 @@ def test_edits_items_are_strict(tools: FileTools, root: Path):
 def test_multi_edit_keeps_expected_sha_semantics(tools: FileTools, root: Path):
     read_sha(tools)
     result = tools.run(call("edit_file", path="a.txt", expected_sha="0" * 64, edits=[{"old": "one", "new": "1"}]))
-    assert result.status is ToolStatus.INVALID and "read it first" in result.output
-    assert sha(b"one\ntwo\nthree\n")[:16] not in result.output  # foreign/unknown change: no sha revealed
+    # unchanged since the model's own read: naming the sha it already saw reveals nothing new
+    assert result.status is ToolStatus.INVALID and "unchanged since your read" in result.output
+    assert sha(b"one\ntwo\nthree\n")[:16] in result.output
 
 
 def test_stale_after_own_edit_reveals_current_sha(tools: FileTools, root: Path):

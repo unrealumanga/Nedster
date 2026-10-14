@@ -153,7 +153,8 @@ def test_edit_requires_stale_hash_and_returns_diff(tools: FileTools, root: Path)
     read = tools.run(call("read_file", path="a.txt"))
     digest = read.data["sha256"]
     stale = tools.run(call("edit_file", path="a.txt", old="two", new="TWO", expected_sha="0" * 64))
-    assert stale.status is ToolStatus.INVALID and "read it first" in stale.output
+    # unchanged since the read: the error names the sha the model already saw
+    assert stale.status is ToolStatus.INVALID and "unchanged since your read" in stale.output and digest[:16] in stale.output
     result = tools.run(call("edit_file", path="a.txt", old="two", new="TWO", expected_sha=digest))
     assert result.status is ToolStatus.OK, result.output
     assert result.output.startswith("--- a/a.txt")
