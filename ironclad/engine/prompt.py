@@ -356,8 +356,11 @@ def build_system_prompt(
     facts: Mapping[str, str] | None = None,
     instructions: ProjectInstructions | None = None,
     soul: SoulText | None = None,
+    role_prompt: str = "",
 ) -> str:
     parts = [INSTRUCTIONS]
+    if role_prompt:  # role fragment: after the fixed instructions, before project facts/AGENTS.md/soul
+        parts.append(role_prompt)
     if facts:
         lines = [f"- {_clean(str(key))}: {_clean(str(value))}" for key, value in facts.items()]
         parts.append("Project facts:\n" + "\n".join(lines))

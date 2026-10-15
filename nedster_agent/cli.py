@@ -73,7 +73,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subcommands.add_parser("run", help="Run one objective and exit")
     accept_global_options(run)
+    run.add_argument("--role", choices=("code", "plan", "review", "explain"), default=None,
+                     help="Role preset for the run (default: use config runtime.role)")
     run.add_argument("objective", nargs="?", help="Objective (default: read from piped stdin)")
+    run.add_argument("--brief", default=None, help="Read the objective from a brief file")
     run.add_argument("--jsonl", action="store_true", help="Emit an event stream, one JSON object per line")
     run.add_argument(
         "--engine",
@@ -494,6 +497,23 @@ def _models(args: argparse.Namespace) -> int:
 
 def _read_objective(args: argparse.Namespace) -> str:
     objective = args.objective
+    brief_path = args.brief
+
+    # Validate mutual exclusivity: use either an objective or --brief, not both
+    if objective and brief_path is not None:
+        raise UsageError("Use either an objective or --brief, not both.")
+
+    if brief_path is not None:
+        path = Path(brief_path)
+        if not path.exists():
+            raise UsageError(f"brief file not found: {brief_path}")
+        data = path.read_text(encoding="utf-8")
+        if len(data) > 32768:
+            raise UsageError(f"brief file is too large ({len(data)} bytes, max 32768)")
+        objective = data.strip()
+        if not objective:
+            raise UsageError(f"brief file is empty: {brief_path}")
+
     if not objective and not sys.stdin.isatty():
         objective = sys.stdin.read()
     objective = (objective or "").strip()
@@ -504,7 +524,7 @@ def _read_objective(args: argparse.Namespace) -> str:
 
 async def _run_objective(args: argparse.Namespace, objective: str) -> int:
     config, _ = _resolve(args)
-    return await _run_native(args, config, objective)
+    return await _run_native(args, config, objective, args.brief)
 
 
 class _SessionHeartbeat:
@@ -558,8 +578,9 @@ def _lock_run_session(session: Any) -> _SessionHeartbeat | None:
     return _SessionHeartbeat(store, session_id, owner)
 
 
-async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> int:
+async def _run_native(args: argparse.Namespace, config: Any, objective: str, brief_path: str | None) -> int:
     from dataclasses import asdict
+    from hashlib import sha256
 
     from ironclad.native import NativeSession
 
@@ -571,8 +592,12 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> 
             _err(f"  {data.get('tool')} -> {data.get('status')} ({data.get('elapsed_ms', 0):.0f} ms)")
 
     session = NativeSession(
-        config, emit=emit, model=args.model, session_id=args.session, resume_latest=args.resume_latest
+        config, emit=emit, model=args.model, session_id=args.session, resume_latest=args.resume_latest, role=args.role
     )
+    if brief_path is not None:
+        path = Path(brief_path)
+        data = path.read_bytes()
+        session.note_brief(str(path), sha256(data).hexdigest())
     heartbeat = _lock_run_session(session)
     try:
         from ironclad.engine.intent import parse_expect

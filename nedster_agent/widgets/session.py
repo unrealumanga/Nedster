@@ -151,7 +151,20 @@ class NativeSession:
             "session_id": self.session_id,
             "engine": "native",
             "instructions": self.instructions,
+            "role": getattr(self.engine, "_role_name", "") or "",
+            "role_label": getattr(self.engine, "_role_label", "") or "",
         }
+
+    def set_role(self, name: str) -> None:
+        """Switch the engine to a named role preset."""
+        if hasattr(self.engine, "set_role"):
+            self.engine.set_role(name)
+        # Track role locally for info() in case the engine doesn't expose it
+        from ironclad.engine.roles import get_role
+
+        role = get_role(name)
+        self.engine._role_name = role.name
+        self.engine._role_label = role.status_label()
 
     def new(self) -> str:
         self.session_id = self._create()

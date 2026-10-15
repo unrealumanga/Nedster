@@ -73,6 +73,7 @@ class RuntimeConfig:
     max_steps: int = 40  # model calls per run; 0 = no limit
     max_tool_calls: int = 120  # tool calls per run; 0 = no limit
     soul: str = "off"  # opt-in personality: "off" (plain), "ui" (status lines only) or "full" (soul.md in the prompt)
+    role: str = "code"  # enforced workflow preset: code | plan | review | explain (read-only roles only remove tools)
 
 
 @dataclass(slots=True)
@@ -97,7 +98,7 @@ _RISK_ORDER = ("read", "write", "execute", "destructive", "external")
 # and may only tighten (never loosen) the security settings below.
 _PROJECT_SAFE_KEYS = frozenset({
     "models.router", "models.coder", "models.reasoner", "models.critic", "models.summarizer",
-    "runtime.context_tokens", "runtime.profile", "engine",
+    "runtime.context_tokens", "runtime.profile", "runtime.role", "engine",
 })
 _PROJECT_TIGHTEN_KEYS = frozenset({
     "sandbox.allow_host_execution", "policy.autonomous", "policy.max_auto_risk",
@@ -206,6 +207,16 @@ def _set(config: Config, key: str, value: Any) -> bool:
             if message not in config.warnings:
                 config.warnings.append(message)
             text = "off"
+        coerced = text
+    if key == "runtime.role":
+        from ironclad.engine.roles import DEFAULT_ROLE, role_names
+
+        text = str(coerced).strip().lower()
+        if text not in role_names():
+            message = f'unknown runtime.role {coerced!r}; using "{DEFAULT_ROLE}"'
+            if message not in config.warnings:
+                config.warnings.append(message)
+            text = DEFAULT_ROLE
         coerced = text
     setattr(target, name, coerced)
     return True

@@ -124,6 +124,7 @@ class NativeSession:
         session_id: str | None = None,
         resume_latest: bool = False,
         title: str = "",
+        role: str | None = None,
     ) -> None:
         from .engine.loop import Engine
         from .session_store.checkpoints import CheckpointStore
@@ -147,6 +148,7 @@ class NativeSession:
         self.checkpoints.on_undone.append(self.tools.invalidate_after_undo)
         self.transport = OllamaTransport(config.models.ollama_url)
         soul_mode = str(getattr(config.runtime, "soul", "off") or "off")
+        role_name = role or str(getattr(config.runtime, "role", "code") or "code")
         self.engine = Engine(
             self.transport,
             self.tools,
@@ -156,6 +158,7 @@ class NativeSession:
             emit=emit,
             project_root=self.project_root,
             soul=soul_mode,
+            role=role_name,
         )
         from .engine.prompt import session_instructions, session_soul
 
@@ -181,7 +184,19 @@ class NativeSession:
                 else None
             ),
             "soul": self.soul.mode,
+            "role": self.engine.role_name,
+            "role_label": self.engine.role_label,
         }
+
+    def set_role(self, name: str) -> None:
+        """Switch the active role (see ``engine.roles``); the tool gate and session prefix are updated in place."""
+        self.engine.set_role(name)
+
+    def note_brief(self, path: str, digest: str) -> None:
+        """Record a ``--brief`` file's provenance in the session transcript (display history, not model history)."""
+        append = getattr(self.store, "append_transcript", None)
+        if callable(append):
+            append(self.session_id, "user", f"brief: {path} (sha256 {digest[:12]})")
 
     async def run(self, text: str, *, intent: Any = None) -> AcceptanceResult:
         """``intent``: an ``engine.intent.Intent`` that overrides the classifier (``nedster run --expect``)."""

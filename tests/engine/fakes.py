@@ -164,6 +164,10 @@ class FakeRuntime:
         self.calls.append(c)
         if c.name not in self.handlers:
             return InstantJob(ToolResult(c.id, c.name, ToolStatus.INVALID, f"unknown tool {c.name}"))
+        if hasattr(self, "_role_name") and self._role_name is not None:
+            allowed = getattr(self, "_allowed_tools", None)
+            if allowed is not None and c.name not in allowed:
+                return InstantJob(ToolResult(c.id, c.name, ToolStatus.DENIED, f"{c.name} is not allowed in {self._role_name} mode"))
         check = self.validators.get(c.name)
         problem = check(c) if check else None
         if problem:
@@ -171,6 +175,11 @@ class FakeRuntime:
         job = FakeJob(self, c, self.delays.get(c.name, 0.0))
         self.jobs.append(job)
         return job
+
+    def set_role(self, name: str, allowed_tools) -> None:
+        """Restrict dispatch to ``allowed_tools`` for role ``name`` (``None`` = no restriction)."""
+        self._role_name = name
+        self._allowed_tools = frozenset(allowed_tools) if allowed_tools is not None else None
 
     def revision(self) -> WorkspaceRevision:
         return self.rev

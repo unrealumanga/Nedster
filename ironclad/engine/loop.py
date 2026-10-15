@@ -64,6 +64,7 @@ from ironclad.engine.prompt import (
     session_instructions,
     session_soul,
 )
+from ironclad.engine.roles import Role, get_role
 from ironclad.engine.state import Budget, TaskState, ToolRecord
 
 REPEAT_LIMIT = 3
@@ -91,6 +92,9 @@ class _Session:
     state: TaskState
     vault: OutputVault
     context: ContextManager
+    facts: dict[str, str] = field(default_factory=dict)  # kept so a role switch can re-render the prefix
+    instructions: ProjectInstructions = field(default_factory=ProjectInstructions)
+    soul: SoulText = field(default_factory=SoulText)
     records: list[ToolRecord] = field(default_factory=list)  # all runs, for task state
     compactions: int = 0  # every compaction (mask or whole-group), persisted so a restart keeps counting
 
@@ -192,6 +196,7 @@ class Engine:
         completion_reserve_tokens: int | None = None,
         auto_verify: int = 2,
         soul: str = "off",
+        role: str = "code",
     ) -> None:
         self.transport = transport
         self.tools = tools
@@ -206,6 +211,8 @@ class Engine:
         self.completion_reserve_tokens = completion_reserve_tokens
         self.auto_verify = max(0, auto_verify)  # max engine-run validations per run when the model skips them
         self.soul_mode = soul
+        self._role: Role = get_role(role)
+        self._apply_role()
         self.last_answer = ""
         self.instructions: ProjectInstructions = ProjectInstructions()
         self.soul: SoulText = SoulText()
@@ -226,10 +233,39 @@ class Engine:
         """Current active context (system, pinned state, history) of a session."""
         return list(self._session(session_id).messages)
 
+    @property
+    def role(self) -> Role:
+        return self._role
+
+    @property
+    def role_name(self) -> str:
+        return self._role.name
+
+    @property
+    def role_label(self) -> str:
+        return self._role.status_label()
+
+    def set_role(self, name: str) -> None:
+        """Switch the active role: re-gate the runtime (remove-only) and re-render each session's prefix.
+
+        The step budget and recorded history are never reset, so a switch cannot launder work already done.
+        """
+        self._role = get_role(name)
+        self._apply_role()
+        for session in self._sessions.values():
+            session.messages[0] = ChatMessage(
+                role="system",
+                content=build_system_prompt(
+                    session.facts, session.instructions, session.soul, self._role.prompt
+                ),
+            )
+
     async def run(self, session_id: str, user_text: str, *, intent: Intent | None = None) -> AcceptanceResult:
         """Run one user message. ``intent`` (e.g. from ``--expect``) overrides the deterministic classifier."""
         session = self._session(session_id)
         run = _Run(uuid.uuid4().hex[:12], time.monotonic(), intent=classify(user_text, intent))
+        if self._role.read_only:  # a read-only role can only inspect/answer; never a change request
+            run.intent = Intent.QUESTION
         session.state.intent = run.intent.value
         self._event("turn.started", session, run, {"user_text": user_text})
         self._task = asyncio.create_task(self._drive(session, run, user_text))
@@ -263,7 +299,7 @@ class Engine:
         self.soul = soul
         vault = OutputVault(session_id, store)
         messages = [
-            ChatMessage(role="system", content=build_system_prompt(facts, instructions, soul)),
+            ChatMessage(role="system", content=build_system_prompt(facts, instructions, soul, self._role.prompt)),
             ChatMessage(role="system", content=state.render()),
             *history,
         ]
@@ -273,7 +309,17 @@ class Engine:
         context = ContextManager(self.budget.context_tokens, vault, self.estimator, reserve_tokens=reserve)
         saved = (store.get_state(session_id, COMPACTION_STATE) if store else None) or {}
         context.summary = SummaryData.from_dict(saved.get("summary"))
-        session = _Session(session_id, messages, state, vault, context, compactions=int(saved.get("compactions", 0)))
+        session = _Session(
+            session_id,
+            messages,
+            state,
+            vault,
+            context,
+            facts=dict(facts),
+            instructions=instructions,
+            soul=soul,
+            compactions=int(saved.get("compactions", 0)),
+        )
         self._sessions[session_id] = session
         return session
 
@@ -294,9 +340,24 @@ class Engine:
                 replace_messages(session_id, repaired)
         return repaired
 
+    def _role_allows(self, name: str) -> bool:
+        return self._role.tools is None or name in self._role.tools
+
+    def _apply_role(self) -> None:
+        setter = getattr(self.tools, "set_role", None)
+        if callable(setter):
+            setter(self._role.name, self._role.tools)
+
+    def _effective_steps(self) -> int | None:
+        limits = [n for n in (self.budget.max_steps, self._role.step_budget) if n is not None]
+        return min(limits) if limits else None
+
     def _specs(self) -> list[ToolSpec]:
+        allowed = self._role.tools
         specs: list[ToolSpec] = []
         for spec in self.tools.specs():
+            if allowed is not None and spec.name not in allowed:
+                continue
             props = dict(spec.parameters.get("properties", {}))
             if spec.name in VALIDATABLE_TOOLS and VALIDATION_ARG not in props:
                 props[VALIDATION_ARG] = {
@@ -307,9 +368,9 @@ class Engine:
                 spec = replace(spec, parameters={**spec.parameters, "properties": props})
                 self._augmented.add(spec.name)
             specs.append(spec)
-        if all(s.name != SHOW_OUTPUT for s in specs):
+        if all(s.name != SHOW_OUTPUT for s in specs) and (allowed is None or SHOW_OUTPUT in allowed):
             specs.append(SHOW_OUTPUT_SPEC)
-        if all(s.name != DECLARE_NO_CHANGE for s in specs):
+        if all(s.name != DECLARE_NO_CHANGE for s in specs) and (allowed is None or DECLARE_NO_CHANGE in allowed):
             specs.append(DECLARE_NO_CHANGE_SPEC)
         self._validating = {s.name for s in specs if s.validates}
         return specs
@@ -335,9 +396,10 @@ class Engine:
     async def _loop(self, session: _Session, run: _Run, specs: list[ToolSpec]) -> Stop:
         by_name = {spec.name: spec for spec in specs}
         budget = self.budget
+        step_limit = self._effective_steps()
         while True:
-            if budget.max_steps is not None and run.steps >= budget.max_steps:
-                return "budget", f"step budget exhausted ({budget.max_steps} model calls)"
+            if step_limit is not None and run.steps >= step_limit:
+                return "budget", f"step budget exhausted ({step_limit} model calls)"
             if budget.max_tokens is not None and run.tokens >= budget.max_tokens:
                 return "budget", f"token budget exhausted ({run.tokens}/{budget.max_tokens})"
             self._maybe_compact(session, run, specs)
@@ -504,7 +566,12 @@ class Engine:
         )
         self._event("tool.started", session, run, {"call_id": call.id, "tool": call.name, "arguments": dict(call.arguments)})
         before = self.tools.revision()
-        if call.name == SHOW_OUTPUT:
+        if not self._role_allows(call.name):  # enforced here too, so a fake/loose runtime cannot bypass the role
+            result = ToolResult(
+                call.id, call.name, ToolStatus.DENIED, f"{call.name} is not allowed in {self._role.name} mode"
+            )
+            mutating, validation = False, False
+        elif call.name == SHOW_OUTPUT:
             result = run_show_output(session.vault, call, self.budget.max_output_chars)
         elif call.name == DECLARE_NO_CHANGE:
             result = declare_no_change_result(call.arguments, call.id)

@@ -63,10 +63,12 @@ COMMANDS: dict[str, str] = {
     "/models": "list the active model fleet",
     "/permissions": "show the autonomy policy",
     "/soul": "show or edit the opt-in personality (soul.md)",
+    "/role": "switch role: /role [name] | /role list roles",
+    "/act": "execute plan: switch to code mode and submit 'Execute the plan above.'",
     "/quit": "exit Nedster",
 }
 # Commands that change engine/session state wait for the running turn (the text is kept).
-IDLE_ONLY = {"/new", "/resume", "/model", "/undo", "/sessions", "/soul"}
+IDLE_ONLY = {"/new", "/resume", "/model", "/undo", "/sessions", "/soul", "/role"}
 
 #: How much stored history /resume replays into the view (display only, never re-executed).
 RESUME_REPLAY_LIMIT = 200
@@ -194,6 +196,7 @@ class NedsterApp(App[None]):
         Binding("ctrl+c", "interrupt", "Quit (x2)", priority=True),
         Binding("f2", "details", "Events"),
         Binding("ctrl+l", "clear", "Clear"),
+        Binding("shift+tab", "toggle_role", "Toggle role (plan/code)", priority=True),
     ]
 
     def __init__(
@@ -237,6 +240,7 @@ class NedsterApp(App[None]):
         self.soul_mode = str(getattr(config.runtime, "soul", "off") or "off")
         self.turn_number = 0
         self._pending_soul: tuple[str, Any] | None = None  # ("remember"|"reset", SoulEdit|None)
+        self._plan_hint_shown = False  # whether we've shown the "Plan ready" hint after a plan turn
 
     # ------------------------------------------------------------------ layout
 
@@ -607,6 +611,14 @@ class NedsterApp(App[None]):
         else:
             self._say_done(str(event.data.get("outcome") or ""))
         self._set_state("idle")
+        # Show plan-ready hint after a completed plan turn
+        if not self.busy and not self._plan_hint_shown:
+            info = self.session.info() if self.session else {}
+            role = str(info.get("role", "")).lower()
+            outcome = str(event.data.get("outcome") or "")
+            if role == "plan" and outcome in ("completed", "answered", "no_change_needed"):
+                self._line("Plan ready. /act to execute it in code mode.", "accent")
+                self._plan_hint_shown = True
 
     def _on_error(self, event: EngineEvent) -> None:
         message = str(event.data.get("message") or "error")
@@ -810,6 +822,8 @@ class NedsterApp(App[None]):
             "/doctor": lambda _a: self.run_worker(self._cmd_doctor(), group="command"),
             "/permissions": self._cmd_permissions,
             "/soul": self._cmd_soul,
+            "/role": self._cmd_role,
+            "/act": lambda _a: self._cmd_act(_a),
         }
         handler = handlers.get(command)
         if handler is None:
@@ -825,6 +839,7 @@ class NedsterApp(App[None]):
         self._line("  Enter send · Shift+Enter/Ctrl+J newline · Up/Down history · @ file · / command")
         self._line("  Esc stop the running turn · Ctrl+C twice exit · F2 raw events · Ctrl+L clear")
         self._line("  Tool rows: focus with Tab/click, Enter expands argv, output and diff")
+        self._line("  Shift+Tab toggle role between plan/code (idle only)")
 
     def _cmd_init(self, args: list[str]) -> None:
         from ironclad.scaffold import AGENTS_FILENAME, line_count, starter_agents_md, write_agents_md
@@ -1078,8 +1093,66 @@ class NedsterApp(App[None]):
         self._message("")
         self._line(message, "accent")
 
+    def _set_role(self, name: str) -> None:
+        """Switch to a named role and update the status bar."""
+        from ironclad.engine.roles import get_role
+
+        if self.busy:
+            self._line("Finish or stop the current turn first.", "warn")
+            return
+        role = get_role(name)
+        setter = getattr(self.session, "set_role", None) if self.session else None
+        if setter is not None:
+            setter(name)
+        info = self.session.info() if self.session else {}
+        self.status_bar.set_info(info)
+        self._line(f"Mode: {role.label} · read-only" if role.read_only else f"Mode: {role.label}", "accent")
+        self._plan_hint_shown = False
+
+    def _cmd_role(self, args: list[str]) -> None:
+        from ironclad.engine.roles import list_roles, role_names
+
+        if not args or args[0] == "list":
+            current = self.session.info().get("role", "") if self.session else ""
+            for role in list_roles():
+                marker = "*" if role.name == current else " "
+                label = f"{role.label} · read-only" if role.read_only else role.label
+                self._line(f"  {marker} /role {role.name:<8}{label} — {role.description}")
+            return
+        name = args[0].lower()
+        names = role_names()
+        if name not in set(n.lower() for n in names):
+            self._line(f"Unknown role '{name}'. Valid roles: {', '.join(names)}", "warn")
+            return
+        self._set_role(name)
+
+    def action_toggle_role(self) -> None:
+        """Shift+Tab: toggle between code and plan while idle."""
+        if self.busy:
+            self._line("Finish or stop the current turn first.", "warn")
+            return
+        if self.session is None:
+            self._line("Runtime unavailable.", "warn")
+            return
+        info = self.session.info()
+        current = str(info.get("role", "")).lower()
+        target = "plan" if current != "plan" else "code"
+        self._set_role(target)
+
+    def _cmd_act(self, _args: list[str]) -> None:
+        """Switch to code mode then submit 'Execute the plan above.'"""
+        if self.busy:
+            self._line("Finish or stop the current turn first.", "warn")
+            return
+
+        self._set_role("code")
+        # Switch to code mode, then submit the plan execution text
+        composer = self.query_one("#prompt", Composer)
+        composer.set_text("Execute the plan above.")
+        # Trigger submission programmatically
+        self.submit_text("Execute the plan above.")
+
     async def on_unmount(self) -> None:
-        self._release_lock()
         close = getattr(self.session, "close", None)
         if close is not None:
             with suppress(Exception):
