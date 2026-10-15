@@ -150,8 +150,8 @@ def test_sessions_delete_prefix_must_be_unique(clean_env, capsys):
     after.close()
 
     # a full id is unique, and a 7-char prefix of it resolves when nothing else matches
-    assert main(["sessions", "delete", first[:7], "--project", str(clean_env)]) == EXIT_OK
-    assert main(["sessions", "delete", second, "--project", str(clean_env)]) == EXIT_OK
+    assert main(["sessions", "delete", first[:7], "--yes", "--project", str(clean_env)]) == EXIT_OK
+    assert main(["sessions", "delete", second, "--yes", "--project", str(clean_env)]) == EXIT_OK
 
 
 def test_sessions_delete_refuses_a_live_lock_and_keeps_the_session(clean_env, capsys):
@@ -160,7 +160,7 @@ def test_sessions_delete_refuses_a_live_lock_and_keeps_the_session(clean_env, ca
     assert store.acquire_lock(session, owner)
     store.close()
 
-    assert main(["sessions", "delete", session, "--project", str(clean_env)]) == EXIT_RUNTIME
+    assert main(["sessions", "delete", session, "--yes", "--project", str(clean_env)]) == EXIT_RUNTIME
     assert "active" in capsys.readouterr().err
     after = _store(clean_env)
     assert after.get_session(session) is not None
@@ -177,7 +177,7 @@ def test_sessions_delete_removes_only_the_named_session(clean_env, capsys):
     store.append_transcript(gone, "user", "bye")
     store.close()
 
-    assert main(["sessions", "delete", gone, "--project", str(clean_env)]) == EXIT_OK
+    assert main(["sessions", "delete", gone, "--yes", "--project", str(clean_env)]) == EXIT_OK
     assert f"Deleted session {gone}." in capsys.readouterr().out
     after = _store(clean_env)
     assert after.get_session(gone) is None
@@ -314,7 +314,7 @@ def test_sessions_show_and_delete_accept_a_unique_prefix(clean_env, capsys):
 
     assert main(["sessions", "show", session[:6], "--project", str(clean_env)]) == EXIT_OK
     assert f"session     {session}" in capsys.readouterr().out
-    assert main(["sessions", "delete", session[:6], "--project", str(clean_env)]) == EXIT_OK
+    assert main(["sessions", "delete", session[:6], "--yes", "--project", str(clean_env)]) == EXIT_OK
     after = _store(clean_env)
     assert after.get_session(session) is None
     after.close()
@@ -327,7 +327,7 @@ def test_sessions_show_and_delete_accept_an_exact_title(clean_env, capsys):
 
     assert main(["sessions", "show", "fix the range bug", "--project", str(clean_env)]) == EXIT_OK
     assert f"session     {session}" in capsys.readouterr().out
-    assert main(["sessions", "delete", "Fix the range bug", "--project", str(clean_env)]) == EXIT_OK
+    assert main(["sessions", "delete", "Fix the range bug", "--yes", "--project", str(clean_env)]) == EXIT_OK
     assert f"Deleted session {session}." in capsys.readouterr().out
 
 
@@ -725,5 +725,166 @@ def test_run_continue_with_history_has_no_notice(clean_env, capsys):
     with patch("ironclad.native.NativeSession", _FakeSession):
         assert main(["run", "--continue", "--project", str(clean_env), "hi"]) == EXIT_OK
     assert "No previous conversation here" not in capsys.readouterr().err
+
+
+# --- BP1-S5: reviewed, complete session deletion ------------------------------------------------
+
+
+def _checkpoint(clean_env, session: str, *, rel: str = "file.txt") -> None:
+    """Journal one pre-image for ``session`` so the checkpoint tables have rows to remove."""
+    from ironclad.session_store.checkpoints import CheckpointStore
+
+    root = Path(clean_env)
+    target = root / rel
+    target.write_text("before", encoding="utf-8")
+    store = CheckpointStore(root / "data" / "sessions.sqlite3")
+    store.begin_turn(session, root)
+    store.record_pre_image(rel, target)
+    target.write_text("after", encoding="utf-8")
+    store.end_turn()
+    store.close()
+
+
+def _checkpoint_counts(clean_env) -> tuple[int, int]:
+    connection = sqlite3.connect(Path(clean_env) / "data" / "sessions.sqlite3")
+    try:
+        turns = connection.execute("SELECT COUNT(*) FROM ckpt_turns").fetchone()[0]
+        files = connection.execute("SELECT COUNT(*) FROM ckpt_files").fetchone()[0]
+    finally:
+        connection.close()
+    return int(turns), int(files)
+
+
+def test_checkpoint_store_delete_session_removes_rows_of_one_session_only(clean_env):
+    from ironclad.session_store.checkpoints import CheckpointStore
+
+    store = _store(clean_env)
+    keep = store.create(_root(clean_env), "keep")
+    gone = store.create(_root(clean_env), "gone")
+    store.close()
+    _checkpoint(clean_env, keep, rel="keep.txt")
+    _checkpoint(clean_env, gone, rel="gone.txt")
+
+    checkpoints = CheckpointStore(Path(clean_env) / "data" / "sessions.sqlite3")
+    assert checkpoints.checkpoint_count(gone) == 1
+    assert checkpoints.delete_session(gone) == 1
+    assert checkpoints.checkpoint_count(gone) == 0
+    assert checkpoints.checkpoint_count(keep) == 1  # untouched
+    checkpoints.close()
+    turns, files = _checkpoint_counts(clean_env)
+    assert (turns, files) == (1, 1)
+
+
+def test_sessions_delete_removes_the_sessions_checkpoints(clean_env, capsys):
+    store, session = _seed(clean_env, _root(clean_env), title="checkpointed")
+    store.append_transcript(session, "user", "hello")
+    store.close()
+    _checkpoint(clean_env, session)
+    assert _checkpoint_counts(clean_env) == (1, 1)
+
+    assert main(["sessions", "delete", session, "--yes", "--project", str(clean_env)]) == EXIT_OK
+    assert _checkpoint_counts(clean_env) == (0, 0)
+    after = _store(clean_env)
+    assert after.get_session(session) is None
+    after.close()
+
+
+def test_sessions_delete_dry_run_prints_preview_and_keeps_everything(clean_env, capsys):
+    store, session = _seed(clean_env, _root(clean_env), title="preview me")
+    store.append_message(session, ChatMessage(role="user", content="one"))
+    store.append_message(session, ChatMessage(role="assistant", content="two"))
+    store.close()
+    _checkpoint(clean_env, session)
+
+    assert main(["sessions", "delete", session, "--dry-run", "--project", str(clean_env)]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "preview me" in out and "messages" in out and "checkpoints" in out
+    assert "Dry run: nothing deleted." in out
+    before = _counts(clean_env)
+    assert before[0] == 1  # the session is still there
+    assert _checkpoint_counts(clean_env) == (1, 1)
+
+
+def test_sessions_delete_non_tty_refuses_without_yes(clean_env, capsys):
+    store, session = _seed(clean_env, _root(clean_env), title="safe")
+    store.close()
+
+    assert main(["sessions", "delete", session, "--project", str(clean_env)]) == EXIT_USAGE
+    err = capsys.readouterr().err
+    assert "Refusing to delete without confirmation in a non-interactive shell. Re-run with --yes." in err
+    after = _store(clean_env)
+    assert after.get_session(session) is not None
+    after.close()
+
+
+def test_sessions_delete_json_requires_yes(clean_env, capsys):
+    store, session = _seed(clean_env, _root(clean_env), title="machine")
+    store.close()
+
+    assert main(["sessions", "delete", session, "--json", "--project", str(clean_env)]) == EXIT_USAGE
+    assert "--json needs --yes" in capsys.readouterr().err
+    after = _store(clean_env)
+    assert after.get_session(session) is not None
+    after.close()
+
+    assert main(["sessions", "delete", session, "--json", "--yes", "--project", str(clean_env)]) == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"deleted": True, "id": session}
+
+
+def test_sessions_delete_dry_run_json_deletes_nothing(clean_env, capsys):
+    store, session = _seed(clean_env, _root(clean_env), title="preview")
+    store.close()
+
+    assert (
+        main(["sessions", "delete", session, "--dry-run", "--json", "--project", str(clean_env)]) == EXIT_OK
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True and payload["deleted"] is False
+    assert payload["session"]["title"] == "preview"
+    after = _store(clean_env)
+    assert after.get_session(session) is not None
+    after.close()
+
+
+def test_sessions_delete_prompts_on_a_tty_and_only_yes_deletes(clean_env, monkeypatch, capsys):
+    store, session = _seed(clean_env, _root(clean_env), title="ask me")
+    store.close()
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    prompts: list[str] = []
+    answers = iter(["n"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or next(answers))
+
+    assert main(["sessions", "delete", session, "--project", str(clean_env)]) == EXIT_OK
+    assert prompts[-1] == "Delete this conversation and its saved checkpoints? [y/N] "
+    out = capsys.readouterr().out
+    assert "ask me" in out and "messages" in out and "checkpoints  0" in out
+    after = _store(clean_env)
+    assert after.get_session(session) is not None  # 'n' cancels
+    after.close()
+
+    answers = iter(["yes"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or next(answers))
+    assert main(["sessions", "delete", session, "--project", str(clean_env)]) == EXIT_OK
+    after = _store(clean_env)
+    assert after.get_session(session) is None
+    after.close()
+
+
+def test_sessions_delete_lock_refusal_keeps_checkpoints(clean_env, capsys):
+    store, session = _seed(clean_env, _root(clean_env), title="busy")
+    owner = make_owner("tui")
+    assert store.acquire_lock(session, owner)
+    store.close()
+    _checkpoint(clean_env, session)
+
+    assert main(["sessions", "delete", session, "--yes", "--project", str(clean_env)]) == EXIT_RUNTIME
+    assert "active" in capsys.readouterr().err
+    assert _checkpoint_counts(clean_env) == (1, 1)  # refusal touched nothing
+    after = _store(clean_env)
+    assert after.get_session(session) is not None
+    after.release_lock(session, owner)
+    after.close()
+
 
 

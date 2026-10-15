@@ -22,9 +22,10 @@ from textual.widgets import Footer, OptionList, RichLog, Static
 from ironclad.config import NedsterConfig
 from ironclad.contracts import EngineEvent
 from ironclad.session_store.sqlite_store import SHORT_ID, make_owner
-from ironclad.session_store.titles import display_title, normalize_title
+from ironclad.session_store.titles import display_title, normalize_title, relative_age
 
 from .widgets.composer import Composer, History, project_files
+from .widgets.delete_confirm import DeleteConfirm
 from .widgets.glyphs import Glyphs
 from .widgets.session import (
     EngineSession,
@@ -57,6 +58,7 @@ COMMANDS: dict[str, str] = {
     "/model": "show or switch the model: /model [name]",
     "/status": "model, context, sandbox, session",
     "/rename": "rename this session: /rename <name>",
+    "/delete": "delete a conversation and its checkpoints: /delete [id]",
     "/diff": "diff of files changed in this session",
     "/undo": "undo the last edit (when the engine supports it)",
     "/doctor": "readiness check (inference / read-only / execution)",
@@ -65,7 +67,7 @@ COMMANDS: dict[str, str] = {
     "/quit": "exit Nedster",
 }
 # Commands that change engine/session state wait for the running turn (the text is kept).
-IDLE_ONLY = {"/new", "/resume", "/model", "/undo", "/sessions", "/rename"}
+IDLE_ONLY = {"/new", "/resume", "/model", "/undo", "/sessions", "/rename", "/delete"}
 
 #: How much stored history /resume replays into the view (display only, never re-executed).
 RESUME_REPLAY_LIMIT = 200
@@ -598,7 +600,9 @@ class NedsterApp(App[None]):
             self._line("No saved conversations for this project.")
             return
         self.push_screen(
-            SessionPicker(options, busy=self.busy, ascii_only=self.ascii_only),
+            SessionPicker(
+                options, busy=self.busy, ascii_only=self.ascii_only, on_delete=self._delete_from_picker
+            ),
             self._picker_chosen,
         )
 
@@ -606,6 +610,62 @@ class NedsterApp(App[None]):
         if session_id is None:  # Esc: the composer draft is untouched
             return
         self._cmd_resume([session_id])
+
+    # ------------------------------------------------------------------ delete
+
+    def _checkpoints(self) -> Any:
+        return getattr(getattr(self.session, "core", None), "checkpoints", None)
+
+    def _delete_preview(self, store: Any, session_id: str) -> str:
+        record = store.get_session(session_id) or {}
+        counter = getattr(self._checkpoints(), "checkpoint_count", None)
+        count = counter(session_id) if callable(counter) else 0
+        title = self._title_of(session_id, str(record.get("title") or ""))
+        updated = relative_age(int(record.get("updated_ns") or 0)) or "unknown"
+        messages = len(store.messages(session_id))
+        return (
+            f"{session_id[:SHORT_ID]}  {title}\n"
+            f"updated {updated}{self.glyphs.sep}{messages} message(s){self.glyphs.sep}{count} checkpoint(s)"
+        )
+
+    def _confirm_delete(self, session_id: str, *, after: Any = None) -> None:
+        current = str(getattr(self.session, "session_id", "") or "") if self.session is not None else ""
+        if session_id == current:
+            self._line("Can't delete the current session; switch to another session first.", "warn")
+            return
+        store = self._session_store()
+        if store is None or not callable(getattr(store, "delete_session", None)):
+            self._line("Deleting is not available with this session.", "warn")
+            return
+        preview = self._delete_preview(store, session_id)
+
+        def chosen(confirmed: bool | None) -> None:
+            if confirmed:
+                self._perform_delete(store, session_id, after)
+
+        self.push_screen(DeleteConfirm(preview), chosen)
+
+    def _delete_from_picker(self, session_id: str) -> None:
+        self._confirm_delete(session_id, after=self._close_picker)
+
+    def _close_picker(self) -> None:
+        if isinstance(self.screen, SessionPicker):
+            self.pop_screen()
+
+    def _perform_delete(self, store: Any, session_id: str, after: Any = None) -> None:
+        from ironclad.session_store.checkpoints import delete_session_cascade
+
+        checkpoints = self._checkpoints()
+        if checkpoints is None:
+            deleted = bool(store.delete_session(session_id))
+        else:
+            deleted = delete_session_cascade(store, checkpoints, session_id)
+        if after is not None:  # pop the picker before writing to the transcript behind it
+            after()
+        if not deleted:
+            self._line("That session is active in another Nedster window; close it there first.", "warn")
+            return
+        self._line(f"Deleted session {session_id[:SHORT_ID]}.", "accent")
 
     # ------------------------------------------------------------------ events
 
@@ -892,6 +952,7 @@ class NedsterApp(App[None]):
             "/sessions": self._cmd_sessions,
             "/resume": self._cmd_resume,
             "/rename": lambda _a: self._cmd_rename(rest),
+            "/delete": self._cmd_delete,
             "/model": self._cmd_model,
             "/models": self._cmd_models,
             "/status": self._cmd_status,
@@ -944,6 +1005,29 @@ class NedsterApp(App[None]):
         setter(str(self.session.session_id), clean)
         self._line(f"Renamed session {str(self.session.session_id)[:SHORT_ID]} to {clean}", "accent")
         self._refresh_info()
+
+    def _cmd_delete(self, args: list[str]) -> None:
+        """``/delete [ref]``: confirm, then remove the conversation and its checkpoints.
+
+        Without a reference it opens the picker, where Del (or ``/delete`` on a row) runs the
+        same flow against the highlighted conversation.
+        """
+        if not args:
+            self._open_session_picker()
+            return
+        store = self._session_store()
+        wanted = " ".join(args)
+        if store is None or not callable(getattr(store, "resolve_session", None)):
+            self._line("Deleting is not available with this session.", "warn")
+            return
+        from ironclad.session_store.sqlite_store import SessionResolutionError
+
+        try:
+            session_id = str(store.resolve_session(str(self.config.runtime.project_root), wanted)["id"])
+        except SessionResolutionError as exc:
+            self._line(str(exc), "warn")
+            return
+        self._confirm_delete(session_id)
 
     def _cmd_resume(self, args: list[str]) -> None:
         if not args:  # bare /resume: choose from the picker

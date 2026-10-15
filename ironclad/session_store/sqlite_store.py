@@ -21,7 +21,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -543,10 +543,20 @@ class SqliteSessionStore:
             ).fetchall()
         return [str(row[0]) for row in rows]
 
-    def delete_session(self, session_id: str, *, force: bool = False, ttl_s: float = LOCK_TTL_S) -> bool:
+    def delete_session(
+        self,
+        session_id: str,
+        *,
+        force: bool = False,
+        ttl_s: float = LOCK_TTL_S,
+        extra: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> bool:
         """Delete a session and every row that belongs to it (messages, transcript, outputs,
         state, lock). Returns ``False`` and deletes nothing while the session is active
-        (live lock) unless ``force`` is set. Unknown ids count as deleted (idempotent)."""
+        (live lock) unless ``force`` is set. Unknown ids count as deleted (idempotent).
+
+        ``extra`` runs inside the same transaction, after the lock check but before the session
+        rows, so callers can purge the checkpoint tables that share this database file."""
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
@@ -557,6 +567,8 @@ class SqliteSessionStore:
                 if not force and row is not None and self._lock_live(str(row[0]), int(row[1]), ttl_s):
                     self._connection.execute("ROLLBACK")
                     return False
+                if extra is not None:
+                    extra(self._connection)
                 self._connection.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
                 self._connection.execute("DELETE FROM transcript WHERE session_id = ?", (session_id,))
                 self._connection.execute("DELETE FROM outputs WHERE session_id = ?", (session_id,))

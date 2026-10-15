@@ -149,6 +149,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     accept_global_options(sessions_delete)
     sessions_delete.add_argument("session_id", help="Session id or unique prefix")
+    sessions_delete.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+    sessions_delete.add_argument(
+        "--dry-run", action="store_true", help="Show what would be deleted without deleting anything"
+    )
     sessions_prune = session_actions.add_parser(
         "prune", help="Delete tool outputs older than a cutoff that no message or task state references"
     )
@@ -787,10 +791,50 @@ def _sessions_rename(args: argparse.Namespace, store: Any, project_root: Path) -
     return EXIT_OK
 
 
-def _sessions_delete(args: argparse.Namespace, store: Any, project_root: Path) -> int:
+def _session_delete_preview(store: Any, checkpoints: Any, session: Any) -> list[tuple[str, str]]:
+    """Rows for the delete preview: identity, last update, message count and checkpoint count."""
+    session_id = str(session["id"])
+    counter = getattr(checkpoints, "checkpoint_count", None)
+    return [
+        ("session", session_id),
+        ("title", _display_title(store, session_id, session.get("title", ""))),
+        ("updated", _stamp(session["updated_ns"])),
+        ("messages", str(len(store.messages(session_id)))),
+        ("checkpoints", str(counter(session_id) if callable(counter) else 0)),
+    ]
+
+
+def _print_delete_preview(fields: list[tuple[str, str]]) -> None:
+    width = max(len(name) for name, _ in fields)
+    for name, value in fields:
+        print(f"{name:<{width}}  {value}")
+
+
+def _sessions_delete(args: argparse.Namespace, store: Any, project_root: Path, checkpoints: Any) -> int:
+    from ironclad.session_store.checkpoints import delete_session_cascade
+
     session = _find_session(store, project_root, args.session_id)
     session_id = str(session["id"])
-    if not store.delete_session(session_id):  # atomically refused while a live lock exists
+    fields = _session_delete_preview(store, checkpoints, session)
+    if args.dry_run:
+        if args.json:
+            _emit_json({"dry_run": True, "deleted": False, "session": dict(fields)})
+        else:
+            _print_delete_preview(fields)
+            print("Dry run: nothing deleted.")
+        return EXIT_OK
+    if args.json and not args.yes:
+        raise UsageError("--json needs --yes: machine output cannot be confirmed interactively.")
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise UsageError(
+                "Refusing to delete without confirmation in a non-interactive shell. Re-run with --yes."
+            )
+        _print_delete_preview(fields)
+        if not _ask_yes_no("Delete this conversation and its saved checkpoints?", default=False):
+            print("Cancelled; nothing was deleted.")
+            return EXIT_OK
+    if not delete_session_cascade(store, checkpoints, session_id):  # refused while a live lock exists
         _err(f"nedster: session {session_id} is active (locked); close it in the other Nedster and retry")
         return EXIT_RUNTIME
     if args.json:
@@ -828,7 +872,14 @@ def _sessions(args: argparse.Namespace) -> int:
 
     config, _ = _resolve(args)
     project_root = Path(config.runtime.project_root)
-    store = SqliteSessionStore(Path(config.runtime.state_dir) / "sessions.sqlite3")
+    db_path = Path(config.runtime.state_dir) / "sessions.sqlite3"
+    store = SqliteSessionStore(db_path)
+    if str(getattr(args, "action", None) or "list") == "delete":
+        from ironclad.session_store.checkpoints import CheckpointStore
+
+        checkpoints = CheckpointStore(db_path)  # same file: checkpoints are purged in one transaction
+    else:
+        checkpoints = None
     try:
         action = str(getattr(args, "action", None) or "list")
         if action == "show":
@@ -836,13 +887,15 @@ def _sessions(args: argparse.Namespace) -> int:
         if action == "rename":
             return _sessions_rename(args, store, project_root)
         if action == "delete":
-            return _sessions_delete(args, store, project_root)
+            return _sessions_delete(args, store, project_root, checkpoints)
         if action == "prune":
             return _sessions_prune(args, store, project_root)
         if action == "list":
             return _sessions_list(args, store, project_root)
         raise UsageError(f"unknown sessions action: {action}")
     finally:
+        if checkpoints is not None:
+            checkpoints.close()
         store.close()
 
 

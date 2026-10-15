@@ -725,3 +725,110 @@ async def test_lazy_session_row_is_created_on_the_first_submitted_prompt(tmp_pat
         await session.close()
 
 
+# --- BP1-S5: /delete and the picker delete key ---------------------------------------------------
+
+
+def _delete_modal(app):
+    from nedster_agent.widgets.delete_confirm import DeleteConfirm
+
+    assert isinstance(app.screen, DeleteConfirm)
+    return app.screen
+
+
+@pytest.mark.asyncio
+async def test_delete_command_without_ref_opens_the_picker(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        _seed_conversation(app.session.store, app.session.project_root, "remove me", "hello")
+
+        app._command("/delete")
+        await _settle(pilot)
+
+        assert _picker(app) is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_command_confirms_then_removes_an_old_session(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        store = app.session.store
+        target = _seed_conversation(store, app.session.project_root, "delete me", "old chat")
+
+        app._command(f"/delete {target[:8]}")
+        await _settle(pilot)
+        modal = _delete_modal(app)
+        body = str(modal.query_one("#delete-body").render())
+        assert "delete me" in body and "message(s)" in body and "checkpoint(s)" in body
+
+        await pilot.press("y")
+        await _settle(pilot)
+
+        assert store.get_session(target) is None
+        assert f"Deleted session {target[:8]}." in _transcript(app)
+        assert app.is_running and app.status_bar.state in {"idle", "setup needed"}
+
+
+@pytest.mark.asyncio
+async def test_delete_command_cancel_keeps_the_session(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        store = app.session.store
+        target = _seed_conversation(store, app.session.project_root, "keep me", "hi")
+
+        app._command(f"/delete {target[:8]}")
+        await _settle(pilot)
+        await pilot.press("n")
+        await _settle(pilot)
+
+        assert store.get_session(target) is not None
+        assert "Deleted session" not in _transcript(app)
+
+
+@pytest.mark.asyncio
+async def test_delete_refuses_the_current_session(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        current = app.session.session_id
+
+        app._command(f"/delete {current[:8]}")
+        await _settle(pilot)
+
+        assert "switch to another session first" in _transcript(app)
+        assert app.session.store.get_session(current) is not None
+
+
+@pytest.mark.asyncio
+async def test_picker_delete_key_runs_the_same_confirm_flow(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        store = app.session.store
+        target = _seed_conversation(store, app.session.project_root, "row to delete", "hi")
+
+        app._command("/sessions")
+        await _settle(pilot)
+        from textual.widgets import Input
+
+        app.screen.query_one("#session-filter", Input).value = "row to delete"
+        await _settle(pilot)
+        assert _row_ids(_picker(app)) == [target]
+
+        await pilot.press("delete")
+        await _settle(pilot)
+        assert _delete_modal(app) is not None
+
+        await pilot.press("y")
+        await _settle(pilot)
+
+        assert store.get_session(target) is None
+        assert f"Deleted session {target[:8]}." in _transcript(app)
+        from nedster_agent.widgets.session_picker import SessionPicker
+
+        assert not isinstance(app.screen, SessionPicker)
+
+
+

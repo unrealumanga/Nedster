@@ -11,16 +11,31 @@ from nedster_agent.widgets.session_picker import SessionOption, SessionPicker
 class PickerHarness(App[None]):
     """Smallest app that can host the modal so the widget is tested on its own."""
 
-    def __init__(self, options: list[SessionOption], *, busy: bool = False, ascii_only: bool = False) -> None:
+    def __init__(
+        self,
+        options: list[SessionOption],
+        *,
+        busy: bool = False,
+        ascii_only: bool = False,
+        on_delete=None,
+    ) -> None:
         super().__init__()
         self._options = options
         self._busy = busy
         self._ascii_only = ascii_only
+        self._on_delete = on_delete
         self.result: str | None | object = "unset"
+        self.deleted: list[str] = []
 
     def on_mount(self) -> None:
         self.push_screen(
-            SessionPicker(self._options, busy=self._busy, ascii_only=self._ascii_only), self._record_result
+            SessionPicker(
+                self._options,
+                busy=self._busy,
+                ascii_only=self._ascii_only,
+                on_delete=self._on_delete or self.deleted.append,
+            ),
+            self._record_result,
         )
 
     def _record_result(self, value: str | None) -> None:
@@ -167,3 +182,47 @@ async def test_picker_marks_current_and_locked_in_rows():
         labels = [str(rows.get_option_at_index(i).prompt) for i in range(rows.option_count)]
         assert any("•" in label for label in labels)
         assert any("[locked]" in label for label in labels)
+
+
+@pytest.mark.asyncio
+async def test_picker_del_requests_delete_of_highlighted_row():
+    options = [opt("aaaaaaaa1111", "one"), opt("bbbbbbbb2222", "two")]
+    harness = PickerHarness(options)
+    async with harness.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("down")  # highlight the second row; the filter input still has focus
+        await pilot.pause()
+        await pilot.press("delete")
+        await pilot.pause()
+        assert harness.deleted == ["bbbbbbbb2222"]
+        assert harness.result == "unset"  # the picker stays open until the confirm modal decides
+
+
+@pytest.mark.asyncio
+async def test_picker_del_refuses_the_current_row():
+    options = [opt("aaaaaaaa1111", "this one", current=True)]
+    harness = PickerHarness(options)
+    async with harness.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        picker = harness.screen
+        await pilot.press("delete")
+        await pilot.pause()
+        assert harness.deleted == []
+        assert "switch to another session first" in str(picker.query_one("#session-preview").render())
+
+
+@pytest.mark.asyncio
+async def test_picker_del_refuses_locked_and_busy_rows():
+    harness = PickerHarness([opt("aaaaaaaa1111", "asked elsewhere", locked=True)])
+    async with harness.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("delete")
+        await pilot.pause()
+        assert harness.deleted == []
+
+    busy = PickerHarness([opt("aaaaaaaa1111", "one")], busy=True)
+    async with busy.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("delete")
+        await pilot.pause()
+        assert busy.deleted == []

@@ -57,7 +57,10 @@ def _matches(option: SessionOption, needle: str) -> bool:
 class SessionPicker(ModalScreen[str | None]):
     """Dismisses with the chosen session id, or ``None`` when cancelled."""
 
-    BINDINGS = [Binding("escape", "cancel", "Close")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+        Binding("delete", "delete_row", "Delete", priority=True, show=False),
+    ]
 
     CSS = """
     SessionPicker { align: center middle; background: #000000 60%; }
@@ -81,12 +84,14 @@ class SessionPicker(ModalScreen[str | None]):
         *,
         busy: bool = False,
         ascii_only: bool = False,
+        on_delete: Any = None,
         id: str | None = None,
     ) -> None:
         super().__init__(id=id)
         self._all = list(options)
         self._busy = busy
         self._marker = "*" if ascii_only else "•"
+        self._on_delete = on_delete  # called with the highlighted session id when Del is pressed
         self._filtered: list[SessionOption] = []
         self._query = ""
 
@@ -111,7 +116,7 @@ class SessionPicker(ModalScreen[str | None]):
         help_text = (
             "Finish or stop the current turn to switch conversations."
             if self._busy
-            else "Enter resume · Up/Down move · Esc close (your draft is kept)"
+            else "Enter resume · Del delete · Up/Down move · Esc close (your draft is kept)"
         )
         self.query_one("#session-help", Static).update(help_text)
         if self._busy:
@@ -204,6 +209,26 @@ class SessionPicker(ModalScreen[str | None]):
             )
             return
         self.dismiss(option.id)
+
+    def action_delete_row(self) -> None:
+        """Del on a row asks the app to delete it (same preview + confirm as ``/delete``)."""
+        if self._busy:
+            self._notice("Finish or stop the current turn to delete conversations.")
+            return
+        if self._on_delete is None:
+            return
+        option = self._highlighted()
+        if option is None:
+            return
+        if option.current:
+            self._notice("Can't delete the current session; switch to another session first.")
+            return
+        if option.locked:
+            self._notice(
+                f"Session {option.id[:SHORT_ID]} is active in another Nedster window; close it there first."
+            )
+            return
+        self._on_delete(option.id)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
