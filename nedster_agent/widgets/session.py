@@ -152,8 +152,9 @@ class NativeSession:
             "session_id": self.session_id,
             "engine": "native",
             "instructions": self.instructions,
-            "role": getattr(self.engine, "_role_name", "") or "",
-            "role_label": getattr(self.engine, "_role_label", "") or "",
+            # The real Engine exposes role_name/role_label; the private fields are a fallback for fakes.
+            "role": getattr(self.engine, "role_name", None) or getattr(self.engine, "_role_name", "") or "",
+            "role_label": getattr(self.engine, "role_label", None) or getattr(self.engine, "_role_label", "") or "",
         }
 
     def set_role(self, name: str) -> None:

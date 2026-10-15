@@ -175,7 +175,7 @@ class NativeSession:
         self.checkpoints.on_undone.append(self.tools.invalidate_after_undo)
         self.transport = OllamaTransport(config.models.ollama_url)
         soul_mode = str(getattr(config.runtime, "soul", "off") or "off")
-        role_name = role or str(getattr(config.runtime, "role", "code") or "code")
+        role_name = role or self._saved_role() or str(getattr(config.runtime, "role", "code") or "code")
         self.engine = Engine(
             self.transport,
             self.tools,
@@ -218,9 +218,30 @@ class NativeSession:
             "role_label": self.engine.role_label,
         }
 
+    def _saved_role(self) -> str | None:
+        """The role a resumed session last ran under (an explicit ``role=`` still wins).
+
+        Sessions saved before roles were persisted have no entry and keep the configured role.
+        """
+        if self.started_new or not self.session_id:
+            return None
+        from .engine.loop import ROLE_STATE
+        from .engine.roles import role_names
+
+        saved = self.store.get_state(self.session_id, ROLE_STATE)
+        text = str(saved).strip().lower() if saved else ""
+        return text if text in role_names() else None
+
     def set_role(self, name: str) -> None:
-        """Switch the active role (see ``engine.roles``); the tool gate and session prefix are updated in place."""
+        """Switch the active role (see ``engine.roles``); the tool gate and session prefix are updated in place.
+
+        Refused by the engine while a turn runs; the accepted role is recorded with the session.
+        """
         self.engine.set_role(name)
+        if self.session_id:
+            from .engine.loop import ROLE_STATE
+
+            self.store.set_state(self.session_id, ROLE_STATE, self.engine.role_name)
 
     def note_brief(self, path: str, digest: str) -> None:
         """Record a ``--brief`` file's provenance in the session transcript (display history, not model history)."""
