@@ -226,6 +226,7 @@ class NativeSession:
                 if self.instructions.present
                 else None
             ),
+            "instructions_warning": self.instructions.warning,
             "soul": self.soul.mode,
             "role": self.engine.role_name,
             "role_label": self.engine.role_label,

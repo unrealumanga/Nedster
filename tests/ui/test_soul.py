@@ -27,7 +27,7 @@ async def test_ui_mode_shows_a_thinking_line_and_a_done_line_not_the_answer(tmp_
         assert _message(h.app) == personality.pick("done_ok", h.app.turn_number)
         text = transcript(h.app)
         assert "here is the answer" in text
-        for moment in ("thinking", "done_ok", "done_unvalidated", "done_failed", "idle"):
+        for moment in ("thinking", "done_ok", "done_answered", "done_unvalidated", "done_failed", "idle"):
             for line in personality.lines(moment):
                 assert line not in text
 

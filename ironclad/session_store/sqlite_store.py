@@ -497,17 +497,19 @@ class SqliteSessionStore:
             if mine:
                 raise SessionAmbiguous(self._ambiguous_message(ref, mine))
             raise SessionNotFound(self._not_found_message(ref))
-        if len(wanted) >= MIN_PREFIX_CHARS:
-            prefixed = [s for s in mine if str(s["id"]).lower().startswith(needle)]
-            if len(prefixed) == 1:
-                return prefixed[0]
-            if prefixed:
-                raise SessionAmbiguous(self._ambiguous_message(ref, prefixed))
-        titled = [s for s in mine if str(s["title"]).strip().lower() == needle]
-        if len(titled) == 1:
-            return titled[0]
-        if titled:
-            raise SessionAmbiguous(self._ambiguous_message(ref, titled))
+        # An id prefix and an exact title are equally valid reference forms: union both kinds and
+        # refuse when more than one distinct session matches, so a title that looks like another
+        # session's prefix can never silently pick the wrong one.
+        prefix_ok = len(wanted) >= MIN_PREFIX_CHARS
+        matches = [
+            s for s in mine
+            if (prefix_ok and str(s["id"]).lower().startswith(needle))
+            or str(s["title"]).strip().lower() == needle
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            raise SessionAmbiguous(self._ambiguous_message(ref, matches))
         if len(wanted) >= MIN_PREFIX_CHARS:
             foreign = [
                 s for s in sessions

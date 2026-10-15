@@ -25,6 +25,7 @@ from ironclad.session_store.sqlite_store import SHORT_ID, make_owner
 from ironclad.session_store.titles import display_title, normalize_title, relative_age
 
 from .notify import notification
+from .personality import moment_for_outcome
 from .personality import pick as personality_line
 from .widgets.composer import Composer, History, project_files
 from .widgets.delete_confirm import DeleteConfirm
@@ -480,6 +481,9 @@ class NedsterApp(App[None]):
     def _announce_instructions(self) -> None:
         """One-line notice about the project instruction file that was loaded for this session."""
         info = self.session.info() if self.session is not None else {}
+        warning = info.get("instructions_warning")
+        if warning:
+            self._line(str(warning), "warn")
         loaded = info.get("instructions")
         if not isinstance(loaded, Mapping) or not loaded.get("name"):
             return
@@ -542,15 +546,7 @@ class NedsterApp(App[None]):
             self._message(line)
 
     def _say_done(self, outcome: str) -> None:
-        moment = {
-            "completed": "done_ok",
-            "answered": "done_ok",
-            "no_change_needed": "done_ok",
-            "unvalidated": "done_unvalidated",
-            "incomplete": "done_failed",
-            "failed": "done_failed",
-            "cancelled": "done_failed",
-        }.get(outcome)
+        moment = moment_for_outcome(outcome)
         if moment:
             self._say(moment)
 

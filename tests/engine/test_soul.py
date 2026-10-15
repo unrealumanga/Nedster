@@ -58,7 +58,7 @@ def test_load_soul_truncates_with_visible_marker(tmp_path: Path):
     soul = load_soul(path, mode="full")
     assert soul.truncated and soul.text.endswith("[truncated]")
     assert soul.size == len(body)
-    assert soul.sha256 == hashlib.sha256(body).hexdigest()
+    assert soul.sha256 == hashlib.sha256(body[:MAX_SOUL_BYTES] + b"\0source-size=%d" % len(body)).hexdigest()
 
 
 def test_non_full_mode_carries_no_text(tmp_path: Path):
@@ -127,7 +127,7 @@ async def test_ui_mode_leaves_the_prompt_unchanged_and_never_reaches_the_answer(
     )
     result = await engine.run(sid, "hi")
     assert SOUL_HEADER not in engine.messages(sid)[0].content
-    for moment in ("thinking", "done_ok", "done_unvalidated", "done_failed", "idle"):
+    for moment in ("thinking", "done_ok", "done_answered", "done_unvalidated", "done_failed", "idle"):
         for line in personality.lines(moment):
             assert line not in result.answer
 
