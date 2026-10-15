@@ -325,8 +325,9 @@ class SqliteSessionStore:
         root = normalize_project_root(project_root)
         with self._lock:
             rows = self._connection.execute(
-                "SELECT id, project_root, title, created_ns, updated_ns FROM sessions"
-                " WHERE project_root = ? ORDER BY updated_ns DESC, id DESC LIMIT ?",
+                "SELECT id, project_root, title, created_ns, updated_ns,"
+                " (SELECT COUNT(*) FROM messages WHERE session_id = sessions.id)"
+                " FROM sessions WHERE project_root = ? ORDER BY updated_ns DESC, id DESC LIMIT ?",
                 (root, limit),
             ).fetchall()
         return [
@@ -336,6 +337,7 @@ class SqliteSessionStore:
                 "title": row[2],
                 "created_ns": row[3],
                 "updated_ns": row[4],
+                "message_count": int(row[5]),
             }
             for row in rows
         ]
@@ -370,6 +372,22 @@ class SqliteSessionStore:
             "created_ns": row[3],
             "updated_ns": row[4],
         }
+
+    def set_title(self, session_id: str, title: str) -> None:
+        """Set the session's name. Does not touch ``updated_ns``: renaming is not activity."""
+        self._write([("UPDATE sessions SET title = ? WHERE id = ?", (str(title), session_id))])
+
+    def first_user_text(self, session_id: str) -> str:
+        """Content of the first stored user message that is not blank (``""`` when there is none)."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT content FROM messages WHERE session_id = ? AND role = 'user' ORDER BY seq",
+                (session_id,),
+            ).fetchall()
+        for (content,) in rows:
+            if str(content or "").strip():
+                return str(content)
+        return ""
 
     def resolve_session(self, project_root: str, ref: str) -> dict[str, Any]:
         """Resolve ``ref`` to one session of ``project_root``.

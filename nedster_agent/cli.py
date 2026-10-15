@@ -90,6 +90,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--model", default=None, help="Worker model for the native engine (default: configuration)")
     run.add_argument(
+        "--name",
+        default=None,
+        help="Name the session (sets the title at creation; renames it when resuming)",
+    )
+    run.add_argument(
         "--expect",
         choices=("change", "answer"),
         default=None,
@@ -111,7 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("action", nargs="?", choices=("show",), default="show")
 
     sessions = subcommands.add_parser(
-        "sessions", help="List, show, delete or prune the saved sessions of this project"
+        "sessions", help="List, show, rename, delete or prune the saved sessions of this project"
     )
     accept_global_options(sessions)
     session_actions = sessions.add_subparsers(dest="action")
@@ -121,6 +126,10 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_show = session_actions.add_parser("show", help="One session: metadata + stored transcript")
     accept_global_options(sessions_show)
     sessions_show.add_argument("session_id", help="Session id or unique prefix")
+    sessions_rename = session_actions.add_parser("rename", help="Give a session a new name")
+    accept_global_options(sessions_rename)
+    sessions_rename.add_argument("session_id", help="Session id, unique prefix or exact title")
+    sessions_rename.add_argument("name", help="New name (1-80 characters)")
     sessions_delete = session_actions.add_parser(
         "delete", help="Delete a session; refused while the session is active (locked)"
     )
@@ -479,7 +488,14 @@ def _resolve_run_session(config: Any, ref: str) -> str:
 
 
 async def _run_objective(args: argparse.Namespace, objective: str) -> int:
+    from ironclad.session_store.titles import normalize_title
+
     config, _ = _resolve(args)
+    if getattr(args, "name", None) is not None:
+        name = normalize_title(args.name)
+        if not name:
+            raise UsageError("--name needs at least one visible character.")
+        args.name = name
     if args.session is not None:
         args.session = _resolve_run_session(config, args.session)
     return await _run_native(args, config, objective)
@@ -551,7 +567,12 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> 
             _err(f"  {data.get('tool')} -> {data.get('status')} ({data.get('elapsed_ms', 0):.0f} ms)")
 
     session = NativeSession(
-        config, emit=emit, model=args.model, session_id=args.session, resume_latest=args.resume_latest
+        config,
+        emit=emit,
+        model=args.model,
+        session_id=args.session,
+        resume_latest=args.resume_latest,
+        title=getattr(args, "name", "") or "",
     )
     try:
         heartbeat = _lock_run_session(session)
@@ -624,6 +645,24 @@ def _stamp(ns: int) -> str:
     return datetime.fromtimestamp(int(ns) / 1e9).strftime("%Y-%m-%d %H:%M") if ns else ""
 
 
+def _relative_stamp(ns: int, now: float | None = None) -> str:
+    """Compact age for the list: "5m ago", "yesterday", a date when older than a week."""
+    if not ns:
+        return ""
+    seconds = max(0.0, (time.time() if now is None else now) - int(ns) / 1e9)
+    if seconds < 90:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 86_400:
+        return f"{int(seconds // 3600)}h ago"
+    if seconds < 172_800:
+        return "yesterday"
+    if seconds < 7 * 86_400:
+        return f"{int(seconds // 86_400)}d ago"
+    return datetime.fromtimestamp(int(ns) / 1e9).strftime("%Y-%m-%d")
+
+
 def _clip(text: str, limit: int = SHOW_ENTRY_CHARS) -> str:
     flat = " ".join(str(text).split())
     return flat if len(flat) <= limit else flat[: limit - 3] + "..."
@@ -654,6 +693,17 @@ def _find_session(store: Any, project_root: Path, wanted: str) -> dict[str, Any]
         raise UsageError(str(exc)) from exc
 
 
+def _display_title(store: Any, session_id: str, title: str) -> str:
+    """Name for display: the stored title, else the first user message, else "Untitled conversation"."""
+    from ironclad.session_store.titles import display_title
+
+    if str(title or "").strip():
+        return str(title).strip()
+    first = getattr(store, "first_user_text", None)
+    fallback = first(session_id) if callable(first) else ""
+    return display_title("", fallback)
+
+
 def _sessions_list(args: argparse.Namespace, store: Any, project_root: Path) -> int:
     sessions = store.list_sessions(str(project_root), limit=50)
     rows = [{**entry, "active": bool(store.is_active(entry["id"]))} for entry in sessions]
@@ -662,18 +712,21 @@ def _sessions_list(args: argparse.Namespace, store: Any, project_root: Path) -> 
         return EXIT_OK
     if not rows:
         if not args.plain:
-            print("No saved sessions for this project.")
+            print('No saved conversations here. Start one: nedster run "Explain this project"')
         return EXIT_OK
     if args.plain:
         for row in rows:
             flag = "active" if row["active"] else "-"
             print(f"{row['id']}\t{_stamp(row['updated_ns'])}\t{flag}\t{row['title']}")
         return EXIT_OK
-    print(f"{'id':<10}{'updated':<18}{'state':<9}title")
+    print(f"{'id':<10}{'updated':<12}{'messages':<10}title")
     for row in rows:
-        flag = "active" if row["active"] else ""
-        print(f"{_short(row['id']):<10}{_stamp(row['updated_ns']):<18}{flag:<9}{row['title']}")
-    print(f"{len(rows)} session(s). Actions: nedster sessions show|delete <id>, nedster sessions prune --older-than DAYS")
+        sid = str(row["id"])
+        flag = "  [active]" if row["active"] else ""
+        title = _display_title(store, sid, row.get("title", ""))
+        print(f"{_short(sid):<10}{_relative_stamp(row['updated_ns']):<12}{int(row.get('message_count', 0)):<10}{title}{flag}")
+    print(f"{len(rows)} session(s).")
+    print('Resume: nedster run --session <id or title> "..."')
     return EXIT_OK
 
 
@@ -697,7 +750,7 @@ def _sessions_show(args: argparse.Namespace, store: Any, project_root: Path) -> 
         _emit_json(payload)
         return EXIT_OK
     print(f"session     {session_id}")
-    print(f"title       {session['title']}")
+    print(f"title       {_display_title(store, session_id, session['title'])}")
     print(f"project     {session['project_root']}")
     print(f"created     {_stamp(session['created_ns'])}")
     print(f"updated     {_stamp(session['updated_ns'])}")
@@ -715,6 +768,22 @@ def _sessions_show(args: argparse.Namespace, store: Any, project_root: Path) -> 
     for entry in entries:
         body = _clip(entry["text"])
         print(f"[{entry['role']}] {body}" if body else f"[{entry['role']}]")
+    return EXIT_OK
+
+
+def _sessions_rename(args: argparse.Namespace, store: Any, project_root: Path) -> int:
+    from ironclad.session_store.titles import normalize_title
+
+    session = _find_session(store, project_root, args.session_id)
+    session_id = str(session["id"])
+    name = normalize_title(args.name)
+    if not name:
+        raise UsageError("The new name needs at least one visible character.")
+    store.set_title(session_id, name)
+    if args.json:
+        _emit_json({"renamed": True, "id": session_id, "title": name})
+    else:
+        print(f"Renamed session {session_id[:SHORT_ID]} to {name}.")
     return EXIT_OK
 
 
@@ -764,6 +833,8 @@ def _sessions(args: argparse.Namespace) -> int:
         action = str(getattr(args, "action", None) or "list")
         if action == "show":
             return _sessions_show(args, store, project_root)
+        if action == "rename":
+            return _sessions_rename(args, store, project_root)
         if action == "delete":
             return _sessions_delete(args, store, project_root)
         if action == "prune":

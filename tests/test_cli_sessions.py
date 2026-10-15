@@ -58,7 +58,7 @@ def _backdate(clean_env, handles: list[tuple[str, int]], *, days: float = 10.0) 
 
 def test_sessions_list_human_is_empty_and_successful(clean_env, capsys):
     assert main(["sessions", "list", "--project", str(clean_env)]) == EXIT_OK
-    assert "No saved sessions for this project." in capsys.readouterr().out
+    assert "No saved conversations here. Start one: nedster run" in capsys.readouterr().out
 
 
 def test_sessions_defaults_to_list_and_accepts_flags_after_the_action(clean_env, capsys):
@@ -451,3 +451,142 @@ def test_cli_sessions_parsing_stays_lazy():
         capture_output=True, text=True, check=True, cwd=str(Path(__file__).resolve().parents[1]),
     )
     assert out.stdout.strip() == ""
+
+
+# --- BP1-S2: session names (auto-title, --name, rename, list display) -------------------------
+
+
+def _set_updated(clean_env, session_id: str, *, seconds_ago: float) -> None:
+    connection = sqlite3.connect(Path(clean_env) / "data" / "sessions.sqlite3")
+    try:
+        connection.execute(
+            "UPDATE sessions SET updated_ns = ? WHERE id = ?",
+            (time.time_ns() - int(seconds_ago * 1e9), session_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_sessions_list_human_shows_relative_age_count_and_resume_hint(clean_env, capsys):
+    store, recent = _seed(clean_env, _root(clean_env), title="named one")
+    blank = store.create(_root(clean_env))
+    store.append_message(blank, ChatMessage(role="user", content="  fix   the range\nboundary "))
+    store.append_message(blank, ChatMessage(role="assistant", content="done"))
+    store.close()
+    _set_updated(clean_env, recent, seconds_ago=5 * 60)
+    _set_updated(clean_env, blank, seconds_ago=3 * 86_400)
+
+    assert main(["sessions", "list", "--project", str(clean_env)]) == EXIT_OK
+    out = capsys.readouterr().out
+    header = out.splitlines()[0]
+    assert header.split()[0] == "id" and "updated" in header and "messages" in header and "title" in header
+    assert f"{recent[:8]}" in out and "5m ago" in out
+    assert "named one" in out
+    # an empty title falls back to the first stored user message
+    assert "fix the range" in out
+    assert "3d ago" in out
+    assert 'Resume: nedster run --session <id or title> "..."' in out
+
+
+def test_sessions_list_json_keeps_keys_and_adds_title_and_message_count(clean_env, capsys):
+    store, session = _seed(clean_env, _root(clean_env), title="keep me")
+    store.append_message(session, ChatMessage(role="user", content="hi"))
+    store.close()
+
+    assert main(["sessions", "list", "--project", str(clean_env), "--json"]) == EXIT_OK
+    entry = json.loads(capsys.readouterr().out)["sessions"][0]
+    for key in ("id", "project_root", "title", "created_ns", "updated_ns", "active"):
+        assert key in entry
+    assert entry["title"] == "keep me"
+    assert entry["message_count"] == 1
+
+
+def test_sessions_show_human_falls_back_to_the_first_message(clean_env, capsys):
+    store = _store(clean_env)
+    session = store.create(_root(clean_env))
+    store.append_message(session, ChatMessage(role="user", content="explain the widget"))
+    store.close()
+
+    assert main(["sessions", "show", session, "--project", str(clean_env)]) == EXIT_OK
+    assert "title       explain the widget" in capsys.readouterr().out
+
+
+def test_sessions_rename_by_prefix_and_title(clean_env, capsys):
+    store = _store(clean_env)
+    first = store.create(_root(clean_env), "original name")
+    second = store.create(_root(clean_env), "second")
+    store.close()
+
+    assert main(["sessions", "rename", first[:8], "Fix range boundary", "--project", str(clean_env)]) == EXIT_OK
+    assert "Renamed session" in capsys.readouterr().out
+    # the new name resolves as an exact title, the old one no longer does
+    assert main(["sessions", "rename", "second", "Fix range boundary 2", "--project", str(clean_env)]) == EXIT_OK
+    capsys.readouterr()
+    after = _store(clean_env)
+    assert after.get_session(first)["title"] == "Fix range boundary"
+    assert after.get_session(second)["title"] == "Fix range boundary 2"
+    after.close()
+
+
+def test_sessions_rename_rejects_an_empty_name(clean_env, capsys):
+    store, session = _seed(clean_env, _root(clean_env), title="keep")
+    store.close()
+
+    assert main(["sessions", "rename", session[:8], "   ", "--project", str(clean_env)]) == EXIT_USAGE
+    assert "visible character" in capsys.readouterr().err
+    after = _store(clean_env)
+    assert after.get_session(session)["title"] == "keep"
+    after.close()
+
+
+def test_run_name_is_normalized_and_used_at_creation(clean_env, capsys):
+    seen: dict[str, str | None] = {}
+
+    class _FakeSession:
+        def __init__(self, config, *, emit=None, model=None, session_id=None, resume_latest=False, title="", **_):
+            seen["session_id"] = session_id
+            seen["title"] = title
+            self.session_id = session_id or "new"
+
+        async def run(self, text, *, intent=None):
+            from ironclad.contracts import AcceptanceResult, Outcome
+
+            return AcceptanceResult(outcome=Outcome.ANSWERED, answer="ok")
+
+        async def aclose(self): ...
+
+    with patch("ironclad.native.NativeSession", _FakeSession):
+        assert main(["run", "--name", "  Fix  the range ", "--project", str(clean_env), "hi"]) == EXIT_OK
+    assert seen["session_id"] is None
+    assert seen["title"] == "Fix the range"
+
+
+def test_run_name_renames_the_resumed_session(clean_env, capsys):
+    store, session = _seed(clean_env, _root(clean_env), title="old name")
+    store.close()
+    seen: dict[str, str | None] = {}
+
+    class _FakeSession:
+        def __init__(self, config, *, emit=None, model=None, session_id=None, resume_latest=False, title="", **_):
+            seen["session_id"] = session_id
+            seen["title"] = title
+            self.session_id = session_id or "new"
+
+        async def run(self, text, *, intent=None):
+            from ironclad.contracts import AcceptanceResult, Outcome
+
+            return AcceptanceResult(outcome=Outcome.ANSWERED, answer="ok")
+
+        async def aclose(self): ...
+
+    with patch("ironclad.native.NativeSession", _FakeSession):
+        assert main(["run", "--session", session[:8], "--name", "New name", "--project", str(clean_env), "hi"]) == EXIT_OK
+    assert seen["session_id"] == session
+    assert seen["title"] == "New name"
+
+
+def test_run_empty_name_is_a_usage_error(clean_env, capsys):
+    assert main(["run", "--name", "   ", "--project", str(clean_env), "hi"]) == EXIT_USAGE
+    assert "--name needs at least one visible character" in capsys.readouterr().err
+

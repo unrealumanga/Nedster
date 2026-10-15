@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import AcceptanceResult, EngineEvent
+from .session_store.titles import normalize_title
 
 DEFAULT_WORKER = "nedster-worker"
 FALLBACK_CONTEXT_TOKENS = 32_768
@@ -144,7 +145,13 @@ class NativeSession:
             session_id = str(self.store.resolve_session(root, session_id)["id"])
         elif resume_latest:
             session_id = self.store.latest_session(root)
-        self.session_id = session_id or self.store.create(root, title)
+        name = normalize_title(title)
+        if session_id is None:
+            self.session_id = self.store.create(root, name)
+        else:
+            self.session_id = session_id
+            if name:  # an explicit --name renames the session it resumes
+                self.store.set_title(self.session_id, name)
         self.model = worker_model(config, model)
         self.tools, self.executor = build_tools(self.project_root, config, self.checkpoints)
         self.checkpoints.on_undone.append(self.tools.invalidate_after_undo)
@@ -172,11 +179,24 @@ class NativeSession:
 
     async def run(self, text: str, *, intent: Any = None) -> AcceptanceResult:
         """``intent``: an ``engine.intent.Intent`` that overrides the classifier (``nedster run --expect``)."""
+        self._auto_title(text)
         self.checkpoints.begin_turn(self.session_id, self.project_root)
         try:
             return await self.engine.run(self.session_id, text, intent=intent)
         finally:
             self.checkpoints.end_turn()  # also on cancel/error: stores post-images of partial writes
+
+    def _auto_title(self, text: str) -> None:
+        """Name a still-unnamed session from its first user turn (one place for CLI and TUI).
+
+        Never overwrites a name; for an old blank-title session the first stored message wins.
+        """
+        session = self.store.get_session(self.session_id)
+        if session is None or str(session.get("title") or "").strip():
+            return
+        name = normalize_title(self.store.first_user_text(self.session_id) or text)
+        if name:
+            self.store.set_title(self.session_id, name)
 
     def undo_last(self) -> Any:
         """Undo the last turn's file-tool changes (UndoReport; ``str()`` is the user message). Command side

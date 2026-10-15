@@ -258,7 +258,7 @@ async def test_native_engine_is_wired_and_uses_the_session_store(tmp_path):
 
 from pathlib import Path  # noqa: E402
 
-from ironclad.contracts import ToolCall  # noqa: E402
+from ironclad.contracts import ChatMessage, ToolCall  # noqa: E402
 from ironclad.session_store.sqlite_store import (  # noqa: E402
     INTERRUPTED_TEXT,
     SqliteSessionStore,
@@ -504,3 +504,65 @@ async def test_tui_session_turns_can_edit_files_and_undo(tmp_path):
         assert (tmp_path / "rng.py").read_bytes() == b"x = 1\n", str(report)
     finally:
         await session.close()
+
+
+# --- BP1-S2: session names ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_first_turn_titles_the_session_once_and_never_overwrites(tmp_path):
+    from nedster_agent.tui import native_session
+    from tests.engine.fakes import ScriptedTransport, Turn
+
+    config = NedsterConfig()
+    config.runtime.project_root = tmp_path
+    config.runtime.state_dir = tmp_path / "state"
+    config.runtime.context_tokens = 8192
+    session = native_session(config, lambda event: None)
+    try:
+        session.core.engine.transport = ScriptedTransport([Turn("one"), Turn("two")])
+        await session.submit("  Fix   the range\nboundary please ")
+        assert session.store.get_session(session.session_id)["title"] == "Fix the range"
+        await session.submit("a totally unrelated follow-up")
+        assert session.store.get_session(session.session_id)["title"] == "Fix the range"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_rename_command_sets_the_title_identity_and_usage_hint(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        sid = app.session.session_id
+        assert "Untitled conversation" in str(app.query_one("#identity").render())
+
+        app._command("/rename Fix   range boundary")
+        await _settle(pilot)
+        assert app.session.store.get_session(sid)["title"] == "Fix range boundary"
+        assert "Fix range boundary" in str(app.query_one("#identity").render())
+
+        app._command("/status")
+        await _settle(pilot)
+        assert "Fix range boundary" in _transcript(app)
+
+        app._command("/rename")
+        await _settle(pilot)
+        assert "Usage: /rename <name>" in _transcript(app)
+
+
+@pytest.mark.asyncio
+async def test_sessions_command_shows_first_message_when_title_is_empty(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        store = app.session.store
+        blank = store.create(app.session.project_root)
+        store.append_message(blank, ChatMessage(role="user", content="explain the widget"))
+
+        app._command("/sessions")
+        await _settle(pilot)
+
+        text = _transcript(app)
+        assert blank[:8] in text and "explain the widget" in text
+

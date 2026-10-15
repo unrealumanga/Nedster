@@ -23,6 +23,7 @@ from textual.widgets import Footer, OptionList, RichLog, Static
 from ironclad.config import NedsterConfig
 from ironclad.contracts import EngineEvent
 from ironclad.session_store.sqlite_store import SHORT_ID, make_owner
+from ironclad.session_store.titles import display_title, normalize_title
 
 from .widgets.composer import Composer, History, project_files
 from .widgets.glyphs import Glyphs
@@ -55,6 +56,7 @@ COMMANDS: dict[str, str] = {
     "/resume": "resume a session: /resume [id]",
     "/model": "show or switch the model: /model [name]",
     "/status": "model, context, sandbox, session",
+    "/rename": "rename this session: /rename <name>",
     "/diff": "diff of files changed in this session",
     "/undo": "undo the last edit (when the engine supports it)",
     "/doctor": "readiness check (inference / read-only / execution)",
@@ -63,7 +65,7 @@ COMMANDS: dict[str, str] = {
     "/quit": "exit Nedster",
 }
 # Commands that change engine/session state wait for the running turn (the text is kept).
-IDLE_ONLY = {"/new", "/resume", "/model", "/undo", "/sessions"}
+IDLE_ONLY = {"/new", "/resume", "/model", "/undo", "/sessions", "/rename"}
 
 #: How much stored history /resume replays into the view (display only, never re-executed).
 RESUME_REPLAY_LIMIT = 200
@@ -343,8 +345,9 @@ class NedsterApp(App[None]):
         g = self.glyphs
         provider = str(info.get("provider") or "LOCAL")
         where = provider
+        title = self._current_title()
         self.query_one("#identity", Static).update(
-            g.text(f"Nedster / {self._project_name()}{g.sep}{where}{g.sep}{info.get('model') or 'no model'}")
+            g.text(f"Nedster / {self._project_name()}{g.sep}{title}{g.sep}{where}{g.sep}{info.get('model') or 'no model'}")
         )
 
     # ------------------------------------------------------------------ helpers
@@ -369,6 +372,26 @@ class NedsterApp(App[None]):
 
     def _session_store(self) -> Any:
         return getattr(self.session, "store", None) if self.session is not None else None
+
+    def _title_of(self, session_id: str, title: str = "") -> str:
+        """Display name for a session: stored title, else its first message, else "Untitled conversation"."""
+        store = self._session_store()
+        if store is None:
+            return display_title(title)
+        if not str(title or "").strip():
+            getter = getattr(store, "get_session", None)
+            record = getter(session_id) if callable(getter) else None
+            title = str(record.get("title") or "") if record else title
+        if str(title or "").strip():
+            return display_title(title)
+        first = getattr(store, "first_user_text", None)
+        fallback = first(session_id) if callable(first) else ""
+        return display_title("", fallback)
+
+    def _current_title(self) -> str:
+        if self.session is None:
+            return ""
+        return self._title_of(str(getattr(self.session, "session_id", "")))
 
     def _acquire_lock(self, session_id: str, *, warn: bool = True) -> bool:
         """Mark this window as the holder of ``session_id``; False when another live Nedster has it."""
@@ -742,8 +765,10 @@ class NedsterApp(App[None]):
     # ------------------------------------------------------------------ commands
 
     def _command(self, value: str) -> None:
-        parts = value.split()
-        command, args = parts[0].lower(), parts[1:]
+        head = value.split(None, 1)
+        command = head[0].lower()
+        args = head[1].split() if len(head) > 1 else []
+        rest = head[1] if len(head) > 1 else ""  # spaces kept for /rename
         handlers: dict[str, Callable[[list[str]], Any]] = {
             "/quit": lambda _a: self.exit(),
             "/exit": lambda _a: self.exit(),
@@ -752,6 +777,7 @@ class NedsterApp(App[None]):
             "/new": self._cmd_new,
             "/sessions": self._cmd_sessions,
             "/resume": self._cmd_resume,
+            "/rename": lambda _a: self._cmd_rename(rest),
             "/model": self._cmd_model,
             "/models": self._cmd_models,
             "/status": self._cmd_status,
@@ -804,7 +830,21 @@ class NedsterApp(App[None]):
             updated = item.get("updated_ns")
             when = datetime.fromtimestamp(int(updated) / 1e9).strftime("%Y-%m-%d %H:%M") if updated else ""
             marker = "*" if sid == current else " "
-            self._line(f" {marker} {sid[:SHORT_ID]}  {when}  {item.get('title') or ''}")
+            self._line(f" {marker} {sid[:SHORT_ID]}  {when}  {self._title_of(sid, str(item.get('title') or ''))}")
+
+    def _cmd_rename(self, name: str) -> None:
+        store = self._session_store()
+        setter = getattr(store, "set_title", None)
+        if self.session is None or not callable(setter):
+            self._line("Renaming is not available with this session.", "warn")
+            return
+        clean = normalize_title(name)
+        if not clean:
+            self._line("Usage: /rename <name>", "warn")
+            return
+        setter(str(self.session.session_id), clean)
+        self._line(f"Renamed session {str(self.session.session_id)[:SHORT_ID]} to {clean}", "accent")
+        self._refresh_info()
 
     def _cmd_resume(self, args: list[str]) -> None:
         resume = getattr(self.session, "resume", None)
@@ -868,6 +908,7 @@ class NedsterApp(App[None]):
             ("context", f"{info.get('context_used', 0)}/{info.get('context_max', 0) or 'n/a'} tokens"),
             ("sandbox", label),
             ("session", str(info.get("session_id", ""))[:SHORT_ID]),
+            ("title", self._current_title()),
             ("changed", f"{len(self.changed_paths)} file(s)"),
             ("queued", str(len(self.queue))),
             ("state", self.status_bar.state),
