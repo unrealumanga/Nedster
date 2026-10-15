@@ -25,6 +25,7 @@ from ironclad.session_store.sqlite_store import SHORT_ID, make_owner
 from ironclad.session_store.titles import display_title, normalize_title, relative_age
 
 from .notify import notification
+from .personality import pick as personality_line
 from .widgets.composer import Composer, History, project_files
 from .widgets.delete_confirm import DeleteConfirm
 from .widgets.glyphs import Glyphs
@@ -55,6 +56,7 @@ COMMANDS: dict[str, str] = {
     "/help": "show commands and keys",
     "/new": "start a new conversation",
     "/clear": "clear the display (conversation is kept)",
+    "/init": "write a starter AGENTS.md from repository facts (/init --print to preview)",
     "/sessions": "browse saved sessions (Ctrl+S)",
     "/resume": "resume a session: /resume [id] (no id opens the picker)",
     "/model": "show or switch the model: /model [name]",
@@ -66,14 +68,18 @@ COMMANDS: dict[str, str] = {
     "/doctor": "readiness check (inference / read-only / execution)",
     "/models": "browse and switch installed models",
     "/permissions": "show the autonomy policy",
+    "/soul": "show or edit the opt-in personality (soul.md)",
+    "/role": "switch role: /role [name] | /role list roles",
+    "/act": "execute plan: switch to code mode and submit 'Execute the plan above.'",
     "/quit": "exit Nedster",
 }
 # Commands that change engine/session state wait for the running turn (the text is kept).
-IDLE_ONLY = {"/new", "/resume", "/model", "/models", "/undo", "/sessions", "/rename", "/delete"}
+IDLE_ONLY = {"/new", "/resume", "/model", "/models", "/undo", "/sessions", "/rename", "/delete", "/soul", "/role"}
 # Commands that take no argument: extra text is rejected with a usage hint instead of being ignored.
+# /init, /soul and /role take arguments, so they are not listed here.
 NO_ARG_COMMANDS = frozenset({
     "/help", "/new", "/clear", "/sessions", "/models", "/status",
-    "/diff", "/undo", "/doctor", "/permissions", "/quit", "/exit",
+    "/diff", "/undo", "/doctor", "/permissions", "/act", "/quit", "/exit",
 })
 
 #: How much stored history /resume replays into the view (display only, never re-executed).
@@ -162,6 +168,7 @@ def native_session(
     session.started_new = core.started_new
     session.project_root = info["project_root"]
     session.sandbox, session.isolation = info["sandbox"], info["isolation"]
+    session.instructions = info.get("instructions")
     return session
 
 
@@ -241,6 +248,7 @@ class NedsterApp(App[None]):
         Binding("ctrl+s", "session_picker", "sessions"),
         Binding("ctrl+r", "history", "history"),
         Binding("escape", "escape", "stop", priority=True),
+        Binding("shift+tab", "toggle_role", "role plan/code", priority=True),
         Binding("f2", "details", "events", show=False),
         Binding("ctrl+c", "interrupt", "quit x2", priority=True, show=False),
         Binding("ctrl+l", "clear", "clear", show=False),
@@ -303,6 +311,10 @@ class NedsterApp(App[None]):
         self._lock_owner = make_owner("tui")
         self._locked: tuple[Any, str] | None = None  # (store, session_id) held by this window
         self._last_lock_refresh = 0.0
+        self.soul_mode = str(getattr(config.runtime, "soul", "off") or "off")
+        self.turn_number = 0
+        self._pending_soul: tuple[str, Any] | None = None  # ("remember"|"reset", SoulEdit|None)
+        self._plan_hint_shown = False  # whether we've shown the "Plan ready" hint after a plan turn
 
     # ------------------------------------------------------------------ layout
 
@@ -439,8 +451,20 @@ class NedsterApp(App[None]):
                 self._replay_session(session_id)  # opened straight on an existing conversation
         self._set_state("idle")
         self._message("Ready")
+        self._say("idle")
+        self._announce_instructions()
         if self.open_picker_on_start:
             self._open_session_picker()
+
+    def _announce_instructions(self) -> None:
+        """One-line notice about the project instruction file that was loaded for this session."""
+        info = self.session.info() if self.session is not None else {}
+        loaded = info.get("instructions")
+        if not isinstance(loaded, Mapping) or not loaded.get("name"):
+            return
+        size = int(loaded.get("size") or 0)
+        note = " [truncated]" if loaded.get("truncated") else ""
+        self._line(f"Loaded {loaded['name']} ({size / 1024:.1f} KB){note}", "muted")
 
     def _refresh_info(self) -> None:
         if self.session is None:
@@ -487,6 +511,27 @@ class NedsterApp(App[None]):
             self._files_refreshing = False
         self._files_cache = list(files)
         self._files_at = time.monotonic()
+
+    def _say(self, moment: str) -> None:
+        """Opt-in personality line in the status message area; never enters the answer or events."""
+        if self.soul_mode not in ("ui", "full"):
+            return
+        line = personality_line(moment, self.turn_number)
+        if line:
+            self._message(line)
+
+    def _say_done(self, outcome: str) -> None:
+        moment = {
+            "completed": "done_ok",
+            "answered": "done_ok",
+            "no_change_needed": "done_ok",
+            "unvalidated": "done_unvalidated",
+            "incomplete": "done_failed",
+            "failed": "done_failed",
+            "cancelled": "done_failed",
+        }.get(outcome)
+        if moment:
+            self._say(moment)
 
     def _set_state(self, state: str, detail: str = "", *, force: bool = False) -> None:
         if self.cancelling and not force:
@@ -865,7 +910,17 @@ class NedsterApp(App[None]):
         if self.cancelling:
             self.cancelling = False
             self._message("Cancelled")
+        else:
+            self._say_done(str(event.data.get("outcome") or ""))
         self._set_state("idle")
+        # Show plan-ready hint after a completed plan turn
+        if not self.busy and not self._plan_hint_shown:
+            info = self.session.info() if self.session else {}
+            role = str(info.get("role", "")).lower()
+            outcome = str(event.data.get("outcome") or "")
+            if role == "plan" and outcome in ("completed", "answered", "no_change_needed"):
+                self._line("Plan ready. /act to execute it in code mode.", "accent")
+                self._plan_hint_shown = True
 
     def _on_error(self, event: EngineEvent) -> None:
         message = str(event.data.get("message") or "error")
@@ -980,9 +1035,13 @@ class NedsterApp(App[None]):
     @on(Composer.Submitted, "#prompt")
     def on_submit(self, event: Composer.Submitted) -> None:
         value = event.value.strip()
+        composer = event.composer
+        if self._pending_soul is not None:  # y/N answer to /soul remember|reset (Enter = no)
+            composer.set_text("")
+            self._confirm_soul(value)
+            return
         if not value:
             return
-        composer = event.composer
         if value.startswith("/"):
             command = value.split()[0].lower()
             if self.busy and command in IDLE_ONLY:
@@ -997,6 +1056,9 @@ class NedsterApp(App[None]):
         self.submit_text(value)
 
     def submit_text(self, value: str) -> None:
+        if self._pending_soul is not None:  # treat a programmatic submit as the y/N answer
+            self._confirm_soul(value)
+            return
         if self.busy:
             self.queue.append(value)
             g = self.glyphs
@@ -1018,6 +1080,8 @@ class NedsterApp(App[None]):
         self.turn_closed = False
         self._turn_started = time.monotonic()
         self._turn_outcome = ""
+        self.turn_number += 1
+        self._say("thinking")
         self.status_bar.start_turn()
         self._set_state("thinking")
         self.run_worker(self._run_turn(value), group="turn")
@@ -1155,6 +1219,7 @@ class NedsterApp(App[None]):
             "/exit": lambda _a: self.exit(),
             "/help": self._cmd_help,
             "/clear": lambda _a: self.action_clear(),
+            "/init": self._cmd_init,
             "/new": self._cmd_new,
             "/sessions": self._cmd_sessions,
             "/resume": self._cmd_resume,
@@ -1167,6 +1232,9 @@ class NedsterApp(App[None]):
             "/undo": lambda _a: self.run_worker(self._cmd_undo(), group="command"),
             "/doctor": lambda _a: self.run_worker(self._cmd_doctor(), group="command"),
             "/permissions": self._cmd_permissions,
+            "/soul": self._cmd_soul,
+            "/role": self._cmd_role,
+            "/act": lambda _a: self._cmd_act(_a),
         }
         handler = handlers.get(command)
         if handler is None:
@@ -1187,6 +1255,31 @@ class NedsterApp(App[None]):
         self._line("  F1 help · F4 models · Ctrl+S switch conversation · F2 raw events · Ctrl+L clear · Ctrl+O verbose")
         self._line("  Tool rows: focus with Tab/click, Enter expands argv, output and diff")
         self._line("  On a tool row, press o for the full stored output (Esc closes)")
+        self._line("  Shift+Tab toggle role between plan/code (idle only)")
+
+    def _cmd_init(self, args: list[str]) -> None:
+        from ironclad.scaffold import AGENTS_FILENAME, line_count, starter_agents_md, write_agents_md
+
+        root = Path(self.config.runtime.project_root)
+        preview = bool(args) and args[0] in ("--print", "-p", "print")
+        try:
+            content = starter_agents_md(root, self.config)
+        except Exception as exc:  # noqa: BLE001 - shown in the transcript, never fatal
+            self._line(f"init failed: {exc}", "fail")
+            return
+        if preview:
+            self.transcript.add(Static(self._text(content)))
+            self._line(f"{AGENTS_FILENAME} preview ({line_count(content)} lines, nothing written)", "accent")
+            return
+        try:
+            path = write_agents_md(root, content)
+        except FileExistsError:
+            self._line(f"{AGENTS_FILENAME} already exists in {root}; not overwritten.", "warn")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._line(f"init failed: {exc}", "fail")
+            return
+        self._line(f"Wrote {path.name} ({line_count(content)} lines). Edit it to describe this project.", "accent")
 
     def _cmd_new(self, _args: list[str]) -> None:
         new = getattr(self.session, "new", None)
@@ -1435,8 +1528,138 @@ class NedsterApp(App[None]):
         policy = self.config.policy
         self._line(f"Autonomous: {policy.autonomous} · automatic risk ceiling: {policy.max_auto_risk}")
 
+    def _read_soul_text(self, path: Path) -> str:
+        from ironclad.engine.prompt import DEFAULT_SOUL_TEMPLATE
+
+        try:
+            return path.read_text(encoding="utf-8") if path.is_file() else DEFAULT_SOUL_TEMPLATE
+        except OSError:
+            return DEFAULT_SOUL_TEMPLATE
+
+    def _cmd_soul(self, args: list[str]) -> None:
+        from ironclad.engine.prompt import soul_path
+
+        path = soul_path()
+        if not args:
+            try:
+                size = path.stat().st_size if path.is_file() else 0
+            except OSError:
+                size = 0
+            self._line(f"Soul: {self.soul_mode} · {path} · {size} bytes")
+            if self.soul_mode != "full":
+                self._line('soul.md reaches the prompt only in "full" mode (runtime.soul = "full").')
+            self._line("Usage: /soul remember <preference> | /soul reset")
+            return
+        action = args[0].lower()
+        if action == "remember":
+            from ironclad.engine.prompt import with_preference
+
+            preference = " ".join(args[1:]).strip()
+            if not preference:
+                self._line("Usage: /soul remember <preference>", "warn")
+                return
+            edit = with_preference(self._read_soul_text(path), preference)
+            if not edit.ok:
+                self._line("That preference is already saved." if edit.action == "duplicate" else "Empty preference.", "warn")
+                return
+            notice = f" (drops oldest: {edit.dropped})" if edit.dropped else ""
+            self._line(f"Will add: {edit.bullet}{notice}", "accent")
+            if self.soul_mode != "full":
+                self._line(f'Note: soul.md reaches the prompt only in "full" mode (runtime.soul = "{self.soul_mode}").', "warn")
+            self._pending_soul = ("remember", edit)
+            self._message("Append this preference? y/N · applies from your next session")
+            return
+        if action == "reset":
+            self._pending_soul = ("reset", None)
+            self._message("Restore the default soul.md template? y/N · your edits are lost")
+            return
+        self._line("Usage: /soul remember <preference> | /soul reset", "warn")
+
+    def _confirm_soul(self, answer: str) -> None:
+        from ironclad.engine.prompt import DEFAULT_SOUL_TEMPLATE, soul_path, write_soul
+
+        pending, self._pending_soul = self._pending_soul, None
+        if pending is None:
+            return
+        kind, edit = pending
+        if answer.strip().lower() not in ("y", "yes"):
+            self._message("")
+            self._line("Cancelled; soul.md unchanged.")
+            return
+        path = soul_path()
+        if kind == "remember":
+            text, notice = edit.text, (f" (dropped oldest: {edit.dropped})" if edit.dropped else "")
+            message = f"Saved preference{notice}. Applies from your next session."
+        else:
+            text, message = DEFAULT_SOUL_TEMPLATE, "Restored the default soul.md template. Applies from your next session."
+        try:
+            write_soul(path, text)
+        except OSError as exc:
+            self._line(f"Could not write {path}: {exc}", "fail")
+            return
+        self._message("")
+        self._line(message, "accent")
+
+    def _set_role(self, name: str) -> None:
+        """Switch to a named role and update the status bar."""
+        from ironclad.engine.roles import get_role
+
+        if self.busy:
+            self._line("Finish or stop the current turn first.", "warn")
+            return
+        role = get_role(name)
+        setter = getattr(self.session, "set_role", None) if self.session else None
+        if setter is not None:
+            setter(name)
+        info = self.session.info() if self.session else {}
+        self.status_bar.set_info(info)
+        self._line(f"Mode: {role.label} · read-only" if role.read_only else f"Mode: {role.label}", "accent")
+        self._plan_hint_shown = False
+
+    def _cmd_role(self, args: list[str]) -> None:
+        from ironclad.engine.roles import list_roles, role_names
+
+        if not args or args[0] == "list":
+            current = self.session.info().get("role", "") if self.session else ""
+            for role in list_roles():
+                marker = "*" if role.name == current else " "
+                label = f"{role.label} · read-only" if role.read_only else role.label
+                self._line(f"  {marker} /role {role.name:<8}{label} — {role.description}")
+            return
+        name = args[0].lower()
+        names = role_names()
+        if name not in set(n.lower() for n in names):
+            self._line(f"Unknown role '{name}'. Valid roles: {', '.join(names)}", "warn")
+            return
+        self._set_role(name)
+
+    def action_toggle_role(self) -> None:
+        """Shift+Tab: toggle between code and plan while idle."""
+        if self.busy:
+            self._line("Finish or stop the current turn first.", "warn")
+            return
+        if self.session is None:
+            self._line("Runtime unavailable.", "warn")
+            return
+        info = self.session.info()
+        current = str(info.get("role", "")).lower()
+        target = "plan" if current != "plan" else "code"
+        self._set_role(target)
+
+    def _cmd_act(self, _args: list[str]) -> None:
+        """Switch to code mode then submit 'Execute the plan above.'"""
+        if self.busy:
+            self._line("Finish or stop the current turn first.", "warn")
+            return
+
+        self._set_role("code")
+        # Switch to code mode, then submit the plan execution text
+        composer = self.query_one("#prompt", Composer)
+        composer.set_text("Execute the plan above.")
+        # Trigger submission programmatically
+        self.submit_text("Execute the plan above.")
+
     async def on_unmount(self) -> None:
-        self._release_lock()
         close = getattr(self.session, "close", None)
         if close is not None:
             with suppress(Exception):

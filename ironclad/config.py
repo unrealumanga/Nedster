@@ -74,6 +74,8 @@ class RuntimeConfig:
     max_tool_calls: int = 120  # tool calls per run; 0 = no limit
     notify: str = "bell"  # completion notice in the TUI: "off" | "bell" | "osc9"
     notify_after_s: float = 15.0  # only turns longer than this notify (seconds)
+    soul: str = "off"  # opt-in personality: "off" (plain), "ui" (status lines only) or "full" (soul.md in the prompt)
+    role: str = "code"  # enforced workflow preset: code | plan | review | explain (read-only roles only remove tools)
 
 
 @dataclass(slots=True)
@@ -92,12 +94,13 @@ Config = NedsterConfig
 _BOOL_TRUE = {"1", "true", "yes", "on"}
 _BOOL_FALSE = {"0", "false", "no", "off", ""}
 _ENGINES = ("native", "legacy")  # "legacy" is accepted once more so old configs warn instead of failing
+_SOUL_MODES = ("off", "ui", "full")
 _RISK_ORDER = ("read", "write", "execute", "destructive", "external")
 # A cloned repo's .nedster/config.toml is untrusted: it may only pick model names / tuning,
 # and may only tighten (never loosen) the security settings below.
 _PROJECT_SAFE_KEYS = frozenset({
     "models.router", "models.coder", "models.reasoner", "models.critic", "models.summarizer",
-    "runtime.context_tokens", "runtime.profile", "engine",
+    "runtime.context_tokens", "runtime.profile", "runtime.role", "engine",
 })
 _PROJECT_TIGHTEN_KEYS = frozenset({
     "sandbox.allow_host_execution", "policy.autonomous", "policy.max_auto_risk",
@@ -204,6 +207,24 @@ def _set(config: Config, key: str, value: Any) -> bool:
             message = 'engine = "legacy" was removed; the native engine runs instead (rollback: tag v3-legacy)'
             if message not in config.warnings:
                 config.warnings.append(message)
+    if key == "runtime.soul":
+        text = str(coerced).strip().lower()
+        if text not in _SOUL_MODES:
+            message = f'unknown runtime.soul {coerced!r}; using "off"'
+            if message not in config.warnings:
+                config.warnings.append(message)
+            text = "off"
+        coerced = text
+    if key == "runtime.role":
+        from ironclad.engine.roles import DEFAULT_ROLE, role_names
+
+        text = str(coerced).strip().lower()
+        if text not in role_names():
+            message = f'unknown runtime.role {coerced!r}; using "{DEFAULT_ROLE}"'
+            if message not in config.warnings:
+                config.warnings.append(message)
+            text = DEFAULT_ROLE
+        coerced = text
     setattr(target, name, coerced)
     return True
 

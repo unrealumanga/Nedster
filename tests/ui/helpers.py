@@ -36,6 +36,8 @@ class FakeSession:
         self.new_calls = 0
         self._gate: asyncio.Event | None = None
         self.run = 0
+        self._role_name: str = ""
+        self._role_label: str = ""
 
     async def submit(self, text: str) -> None:
         self.submitted.append(text)
@@ -48,7 +50,18 @@ class FakeSession:
         self.cancel_requests += 1
 
     def info(self) -> dict[str, Any]:
-        return dict(self._info)
+        result = dict(self._info)
+        result["role"] = self._role_name
+        result["role_label"] = self._role_label
+        return result
+
+    def set_role(self, name: str) -> None:
+        """Set the fake role for testing."""
+        from ironclad.engine.roles import get_role
+
+        role = get_role(name)
+        self._role_name = role.name
+        self._role_label = role.status_label()
 
     def new(self) -> str:
         self.new_calls += 1
@@ -86,6 +99,7 @@ class Harness:
         self.config = config
         self.session: FakeSession | None = None
         info = app_kwargs.pop("info", None)
+        config.runtime.soul = app_kwargs.pop("soul", "off")
 
         def factory(_config: NedsterConfig, emit: EventCallback) -> FakeSession:
             self.session = FakeSession(emit, info)

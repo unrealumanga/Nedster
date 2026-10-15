@@ -90,7 +90,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subcommands.add_parser("run", help="Run one objective and exit")
     accept_global_options(run)
+    run.add_argument("--role", choices=("code", "plan", "review", "explain"), default=None,
+                     help="Role preset for the run (default: use config runtime.role)")
     run.add_argument("objective", nargs="?", help="Objective (default: read from piped stdin)")
+    run.add_argument("--brief", default=None, help="Read the objective from a brief file")
     run.add_argument("--jsonl", action="store_true", help="Emit an event stream, one JSON object per line")
     run.add_argument(
         "--engine",
@@ -115,6 +118,12 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument(
         "--session", default=None, help="Continue a session by id, unique id prefix or exact title"
     )
+    init = subcommands.add_parser("init", help="Write a starter AGENTS.md from repository facts")
+    accept_global_options(init)
+    init.add_argument(
+        "--print", dest="print_only", action="store_true",
+        help="Show the starter file without writing it",
+    )
     tui = subcommands.add_parser("tui", help="Open the interactive terminal interface")
     accept_global_options(tui)
     tui_open = tui.add_mutually_exclusive_group()
@@ -135,6 +144,18 @@ def build_parser() -> argparse.ArgumentParser:
     accept_global_options(ledger)
     permissions = subcommands.add_parser("permissions", help="Show the active tool permission policy")
     accept_global_options(permissions)
+    soul = subcommands.add_parser("soul", help="Show or edit the opt-in personality (soul.md)")
+    accept_global_options(soul)
+    soul_actions = soul.add_subparsers(dest="action")
+    soul.set_defaults(action="show")
+    soul_show = soul_actions.add_parser("show", help="Show the soul mode, file path and size (default)")
+    accept_global_options(soul_show)
+    soul_path_cmd = soul_actions.add_parser("path", help="Print the soul.md path")
+    accept_global_options(soul_path_cmd)
+    soul_remember = soul_actions.add_parser("remember", help="Append a style preference bullet to soul.md")
+    accept_global_options(soul_remember)
+    soul_remember.add_argument("text", help="The style preference to add")
+    soul_remember.add_argument("--yes", action="store_true", help="Confirm without prompting (required when not a TTY)")
     config = subcommands.add_parser("config", help="Inspect the effective configuration")
     accept_global_options(config)
     config.add_argument("action", nargs="?", choices=("show", "get", "path"), default="show")
@@ -245,10 +266,18 @@ def _config_dict(config: Any) -> dict[str, Any]:
 
 
 def _config_show(args: argparse.Namespace) -> int:
+    from ironclad.engine.prompt import load_project_instructions
+
     config, provenance = _resolve(args)
     data = _config_dict(config)
+    instructions = load_project_instructions(config.runtime.project_root)
     if args.json:
-        _emit_json({"config": data, "provenance": provenance})
+        payload = {
+            "config": data,
+            "provenance": provenance,
+            "project_instructions": instructions.to_dict() if instructions else None,
+        }
+        _emit_json(payload)
         return EXIT_OK
     from ironclad.config import config_dir
 
@@ -259,6 +288,14 @@ def _config_show(args: argparse.Namespace) -> int:
             node = node[part]
         value = json.dumps(node) if not isinstance(node, str) else node
         print(f"{key} = {value}  [{provenance[key]}]")
+    if instructions is None:
+        print("project instructions: none (no AGENTS.md or NEDSTER.md in the project root)")
+    else:
+        note = " (truncated)" if instructions.truncated else ""
+        print(
+            f"project instructions: {instructions.name} "
+            f"({instructions.size / 1024:.1f} KB, sha256 {instructions.sha256[:12]}){note}"
+        )
     for warning in config.warnings:
         print(f"# warning: {warning}")
     return EXIT_OK
@@ -318,6 +355,29 @@ def _config_path(args: argparse.Namespace) -> int:
     print(f"user config: {user_cfg}{user_suffix}")
     print(f"project config: {proj_cfg}{proj_suffix}")
     print(f"data dir: {state_d}")
+    return EXIT_OK
+
+
+def _init(args: argparse.Namespace) -> int:
+    from ironclad.scaffold import AGENTS_FILENAME, line_count, starter_agents_md, write_agents_md
+
+    config, _ = _resolve(args)
+    root = Path(config.runtime.project_root)
+    content = starter_agents_md(root, config)
+    if args.print_only:
+        print(content, end="")
+        return EXIT_OK
+    try:
+        path = write_agents_md(root, content)
+    except FileExistsError:
+        _err(f"nedster: {AGENTS_FILENAME} already exists in {root}; not overwritten.")
+        return EXIT_RUNTIME
+    if args.json:
+        _emit_json({"path": str(path), "lines": line_count(content), "bytes": len(content.encode("utf-8"))})
+    elif args.plain:
+        print(f"path\t{path}")
+    else:
+        print(f"Wrote {path} ({line_count(content)} lines). Review and edit it to describe this project.")
     return EXIT_OK
 
 
@@ -592,6 +652,23 @@ def _models(args: argparse.Namespace) -> int:
 
 def _read_objective(args: argparse.Namespace) -> str:
     objective = args.objective
+    brief_path = args.brief
+
+    # Validate mutual exclusivity: use either an objective or --brief, not both
+    if objective and brief_path is not None:
+        raise UsageError("Use either an objective or --brief, not both.")
+
+    if brief_path is not None:
+        path = Path(brief_path)
+        if not path.exists():
+            raise UsageError(f"brief file not found: {brief_path}")
+        data = path.read_text(encoding="utf-8")
+        if len(data) > 32768:
+            raise UsageError(f"brief file is too large ({len(data)} bytes, max 32768)")
+        objective = data.strip()
+        if not objective:
+            raise UsageError(f"brief file is empty: {brief_path}")
+
     if not objective and not sys.stdin.isatty():
         objective = sys.stdin.read()
     objective = (objective or "").strip()
@@ -634,7 +711,7 @@ async def _run_objective(args: argparse.Namespace, objective: str) -> int:
         args.name = name
     if args.session is not None:
         args.session = _resolve_run_session(config, args.session)
-    return await _run_native(args, config, objective)
+    return await _run_native(args, config, objective, args.brief)
 
 
 class ProgressLine:
@@ -768,8 +845,9 @@ def _lock_run_session(session: Any) -> _SessionHeartbeat | None:
     return _SessionHeartbeat(store, session_id, owner)
 
 
-async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> int:
+async def _run_native(args: argparse.Namespace, config: Any, objective: str, brief_path: str | None) -> int:
     from dataclasses import asdict
+    from hashlib import sha256
 
     from ironclad.native import NativeSession
 
@@ -800,6 +878,7 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> 
         session_id=args.session,
         resume_latest=args.resume_latest,
         title=getattr(args, "name", "") or "",
+        role=args.role,
     )
     if args.resume_latest and getattr(session, "started_new", False):
         _err("No previous conversation here; starting a new one.")  # F06: never silently continue an empty launch
@@ -808,6 +887,10 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> 
     except SessionActive:
         await session.aclose()
         raise
+    if brief_path is not None:
+        path = Path(brief_path)
+        data = path.read_bytes()
+        session.note_brief(str(path), sha256(data).hexdigest())
     try:
         from ironclad.engine.intent import parse_expect
 
@@ -901,6 +984,83 @@ def _permissions(args: argparse.Namespace) -> int:
         print(f"Autonomous: {policy.autonomous}")
         print(f"Automatic risk ceiling: {policy.max_auto_risk}")
         print("Allowed commands: " + ", ".join(policy.allowed_commands))
+    return EXIT_OK
+
+
+def _soul(args: argparse.Namespace) -> int:
+    from ironclad.engine.prompt import (
+        DEFAULT_SOUL_TEMPLATE,
+        SOUL_PREFERENCES_HEADER,
+        soul_path,
+        with_preference,
+        write_soul,
+    )
+
+    config, _ = _resolve(args)
+    mode = str(getattr(config.runtime, "soul", "off") or "off")
+    path = soul_path()
+    action = str(getattr(args, "action", None) or "show")
+    if action == "path":
+        if args.json:
+            _emit_json({"path": str(path)})
+        else:
+            print(path)
+        return EXIT_OK
+    if action == "remember":
+        try:
+            current = path.read_text(encoding="utf-8") if path.is_file() else DEFAULT_SOUL_TEMPLATE
+        except OSError as exc:
+            _err(f"nedster: could not read {path}: {exc}")
+            return EXIT_RUNTIME
+        edit = with_preference(current, args.text)
+        if not edit.ok:
+            reason = "already in soul.md" if edit.action == "duplicate" else "empty; nothing to add"
+            _err(f"nedster: preference is {reason}")
+            return EXIT_USAGE
+        if not args.yes:
+            if not sys.stdin.isatty():  # never hang on piped stdin
+                _err("nedster: refusing to edit soul.md without confirmation; pass --yes")
+                return EXIT_USAGE
+            print(f"Add this preference under {SOUL_PREFERENCES_HEADER}?")
+            print(f"  {edit.bullet}")
+            if not _ask_yes_no("Save it?", default=False):
+                print("Cancelled; soul.md unchanged.")
+                return EXIT_OK
+        try:
+            write_soul(path, edit.text)
+        except OSError as exc:
+            _err(f"nedster: could not write {path}: {exc}")
+            return EXIT_RUNTIME
+        if args.json:
+            _emit_json({"path": str(path), "added": edit.bullet, "dropped": edit.dropped, "applies": "next session"})
+        elif args.plain:
+            print(f"added\t{edit.bullet}")
+            print(f"dropped\t{edit.dropped}")
+        else:
+            extra = f" (dropped oldest: {edit.dropped})" if edit.dropped else ""
+            print(f"Added to {path}{extra}. Applies from your next session.")
+            if mode != "full":
+                print(f'Note: soul.md reaches the prompt only in "full" mode (runtime.soul = "{mode}").')
+        return EXIT_OK
+    if action != "show":
+        raise UsageError(f"unknown soul action: {action}")
+
+    exists = path.is_file()
+    size = path.stat().st_size if exists else 0
+    if args.json:
+        _emit_json({"mode": mode, "path": str(path), "exists": exists, "size": size})
+        return EXIT_OK
+    if args.plain:
+        print(f"mode\t{mode}")
+        print(f"path\t{path}")
+        print(f"exists\t{str(exists).lower()}")
+        print(f"size\t{size}")
+        return EXIT_OK
+    print(f"mode    {mode}")
+    print(f"path    {path}")
+    print(f"size    {size} bytes" + ("" if exists else " (file missing)"))
+    if mode != "full":
+        print('note    soul.md reaches the prompt only in "full" mode')
     return EXIT_OK
 
 
@@ -1259,6 +1419,8 @@ def _dispatch(args: argparse.Namespace) -> int:
     command = args.command
     if command == "config":
         return _config(args)
+    if command == "init":
+        return _init(args)
     if command == "setup":
         return _setup(args)
     if command == "doctor":
@@ -1269,6 +1431,8 @@ def _dispatch(args: argparse.Namespace) -> int:
         return _verify_ledger(args)
     if command == "permissions":
         return _permissions(args)
+    if command == "soul":
+        return _soul(args)
     if command == "sessions":
         return _sessions(args)
     if command == "resume":

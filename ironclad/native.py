@@ -126,6 +126,7 @@ class NativeSession:
         resume_latest: bool = False,
         title: str = "",
         lazy: bool = False,
+        role: str | None = None,
     ) -> None:
         from .engine.loop import Engine
         from .session_store.checkpoints import CheckpointStore
@@ -173,6 +174,8 @@ class NativeSession:
         self.tools, self.executor = build_tools(self.project_root, config, self.checkpoints)
         self.checkpoints.on_undone.append(self.tools.invalidate_after_undo)
         self.transport = OllamaTransport(config.models.ollama_url)
+        soul_mode = str(getattr(config.runtime, "soul", "off") or "off")
+        role_name = role or str(getattr(config.runtime, "role", "code") or "code")
         self.engine = Engine(
             self.transport,
             self.tools,
@@ -181,7 +184,16 @@ class NativeSession:
             budget=engine_budget(config, self.model),
             emit=emit,
             project_root=self.project_root,
+            soul=soul_mode,
+            role=role_name,
         )
+        from .engine.prompt import session_instructions, session_soul
+
+        # A lazily-created session has no row yet: preview without storing; the engine snapshots both
+        # for the real id at the first turn.
+        snapshot_store = self.store if self.session_id else None
+        self.instructions = session_instructions(snapshot_store, self.session_id, self.project_root)
+        self.soul = session_soul(snapshot_store, self.session_id, soul_mode)
 
     def info(self) -> dict[str, Any]:
         status = self.executor.backend_status()
@@ -192,7 +204,29 @@ class NativeSession:
             "project_root": str(self.project_root),
             "sandbox": status.name if status else "none",
             "isolation": status.isolation if status else "none",
+            "instructions": (
+                {
+                    "name": self.instructions.name,
+                    "size": self.instructions.size,
+                    "truncated": self.instructions.truncated,
+                }
+                if self.instructions.present
+                else None
+            ),
+            "soul": self.soul.mode,
+            "role": self.engine.role_name,
+            "role_label": self.engine.role_label,
         }
+
+    def set_role(self, name: str) -> None:
+        """Switch the active role (see ``engine.roles``); the tool gate and session prefix are updated in place."""
+        self.engine.set_role(name)
+
+    def note_brief(self, path: str, digest: str) -> None:
+        """Record a ``--brief`` file's provenance in the session transcript (display history, not model history)."""
+        append = getattr(self.store, "append_transcript", None)
+        if callable(append):
+            append(self.ensure_session_id(), "user", f"brief: {path} (sha256 {digest[:12]})")
 
     async def run(self, text: str, *, intent: Any = None) -> AcceptanceResult:
         """``intent``: an ``engine.intent.Intent`` that overrides the classifier (``nedster run --expect``)."""

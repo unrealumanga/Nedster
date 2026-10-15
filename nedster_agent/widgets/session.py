@@ -118,6 +118,7 @@ class NativeSession:
         self.store = store
         self.project_root = project_root
         self.sandbox, self.isolation, self.endpoint = sandbox, isolation, endpoint
+        self.instructions: Mapping[str, Any] | None = None
         self.context_used = 0
         self.session_id = self._create()
 
@@ -150,7 +151,21 @@ class NativeSession:
             "max_steps": getattr(budget, "max_steps", None),  # None = no limit
             "session_id": self.session_id,
             "engine": "native",
+            "instructions": self.instructions,
+            "role": getattr(self.engine, "_role_name", "") or "",
+            "role_label": getattr(self.engine, "_role_label", "") or "",
         }
+
+    def set_role(self, name: str) -> None:
+        """Switch the engine to a named role preset."""
+        if hasattr(self.engine, "set_role"):
+            self.engine.set_role(name)
+        # Track role locally for info() in case the engine doesn't expose it
+        from ironclad.engine.roles import get_role
+
+        role = get_role(name)
+        self.engine._role_name = role.name
+        self.engine._role_label = role.status_label()
 
     def new(self) -> str:
         self.session_id = self._create()

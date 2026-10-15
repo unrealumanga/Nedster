@@ -106,6 +106,10 @@ class StatusBar(Widget):
         info = self.info
         line = Text(no_wrap=True)
         line.append(g.text(str(info.get("model") or "no model")), style="bold")
+        role_label = str(info.get("role_label", "")).strip()
+        if role_label:
+            line.append(g.sep, style=g.style("faint"))
+            line.append(g.text(role_label), style=g.style("muted"))
         line.append(g.sep, style=g.style("faint"))
         line.append_text(self._context_metric(g))
         line.append(g.sep, style=g.style("faint"))

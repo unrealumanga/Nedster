@@ -127,8 +127,8 @@ You can keep typing while a run is busy; messages queue. `Enter` sends, `Shift+E
 | `Ctrl+L` | Clear the display |
 
 Slash commands: `/help`, `/new`, `/clear`, `/sessions`, `/resume [id]`, `/model [name]`, `/status`, `/diff`,
-`/undo`, `/doctor`, `/models`, `/permissions`, `/quit`. `/new`, `/resume`, `/model`, `/undo`, `/sessions` work only
-while idle.
+`/undo`, `/doctor`, `/models`, `/permissions`, `/soul`, `/quit`. `/new`, `/resume`, `/model`, `/undo`, `/sessions`,
+`/soul` work only while idle.
 
 - `/resume` replays the stored transcript **for display only**. Nothing is re-executed, and earlier test results
   are not treated as current evidence. A session held by another live Nedster window cannot be resumed.
@@ -178,9 +178,52 @@ nedster sessions delete <id>         # refused while another process holds the s
 nedster sessions prune --older-than 30   # delete old tool outputs nothing references
 ```
 
-Also: `nedster doctor`, `nedster models [list|recommend|install]`, `nedster permissions`,
+Also: `nedster doctor`, `nedster models [list|recommend|install]`, `nedster permissions`, `nedster soul`,
 `nedster config show`, `nedster verify-ledger` (checks the old HMAC event chain; the native engine writes no
 events to it). Each takes `--plain`/`--json`.
+
+### Project instructions
+
+At the start of a session Nedster reads the first of `AGENTS.md` or `NEDSTER.md` in the project root (capped at
+4 KB; longer files are truncated with a `[truncated]` note) and adds it to the system prompt after the fixed
+instructions, under a heading that states the text cannot change tool permissions. The text and its sha256 are
+snapshotted in the session, so the prompt prefix stays stable for the whole session: editing the file affects the
+next session, not the current one. The TUI shows `Loaded AGENTS.md (1.2 KB)` at startup, `nedster config show`
+lists what loaded, and `--plain` output stays unchanged.
+
+```bash
+nedster init              # write a starter AGENTS.md from repository facts (no model call)
+nedster init --print      # show it without writing
+```
+
+### Personality (opt-in)
+
+`runtime.soul` in `config.toml` controls an optional personality, off by default:
+
+| Value | Effect |
+| --- | --- |
+| `off` | Plain strings everywhere (the default). |
+| `ui` | Short, dry lines appear only in TUI status text and completion notices. Zero model cost. |
+| `full` | Also loads your `soul.md` (in the config dir, under `NEDSTER_CONFIG_DIR`) into the system prompt. |
+
+The personality is style only: it never changes facts, tool calls, file contents, test results or outcome
+claims, never flatters, and never pretends tests ran. In `full` mode the first run writes a starter `soul.md`
+(capped at 1200 bytes, truncated with a visible notice) and snapshots it per session exactly like `AGENTS.md`,
+so edits apply to your next session. Nothing is learned automatically and no model call is used.
+
+```bash
+nedster soul show                         # mode, file path and size
+nedster soul path                         # just the path
+nedster soul remember "Be terse" --yes    # append a preference bullet (max 5; oldest dropped)
+```
+
+In the TUI, `/soul` shows the same, `/soul remember <preference>` previews the bullet and asks y/N
+(Enter = no), and `/soul reset` restores the default template after confirmation.
+
+`nedster init` detects languages by file extension, package managers by their lock/manifest files and the test
+command via the engine's own runner detection. It refuses to overwrite an existing `AGENTS.md` (exit 1). In the
+TUI, `/init` does the same (`/init --print` to preview).
+
 
 ## Long tasks
 
@@ -256,8 +299,8 @@ not call them completed. For comparison, the removed v3 engine scored 1/8 with o
 
 `~/.nedster/config.toml`; precedence defaults < user file < project `.nedster/config.toml` < `NEDSTER_<SECTION>__<FIELD>`
 environment variables < CLI flags. Inspect the result with `nedster config show`. Keys you will most likely touch:
-`models.ollama_url`, `models.coder`, `runtime.context_tokens`, `sandbox.backend`, `sandbox.allow_host_execution`,
-`sandbox.docker_image`, `policy.max_auto_risk`, `policy.allowed_commands`.
+`models.ollama_url`, `models.coder`, `runtime.context_tokens`, `runtime.soul`, `sandbox.backend`,
+`sandbox.allow_host_execution`, `sandbox.docker_image`, `policy.max_auto_risk`, `policy.allowed_commands`.
 
 ## Development
 
