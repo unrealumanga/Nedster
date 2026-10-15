@@ -97,10 +97,11 @@ _ENGINES = ("native", "legacy")  # "legacy" is accepted once more so old configs
 _SOUL_MODES = ("off", "ui", "full")
 _RISK_ORDER = ("read", "write", "execute", "destructive", "external")
 # A cloned repo's .nedster/config.toml is untrusted: it may only pick model names / tuning,
-# and may only tighten (never loosen) the security settings below.
+# and may only tighten (never loosen) the security settings below. ``runtime.role`` is deliberately
+# absent: a role widens or narrows the tool set, so only the user (config, env, --role, /role) picks it.
 _PROJECT_SAFE_KEYS = frozenset({
     "models.router", "models.coder", "models.reasoner", "models.critic", "models.summarizer",
-    "runtime.context_tokens", "runtime.profile", "runtime.role", "engine",
+    "runtime.context_tokens", "runtime.profile", "engine",
 })
 _PROJECT_TIGHTEN_KEYS = frozenset({
     "sandbox.allow_host_execution", "policy.autonomous", "policy.max_auto_risk",
@@ -216,14 +217,16 @@ def _set(config: Config, key: str, value: Any) -> bool:
             text = "off"
         coerced = text
     if key == "runtime.role":
-        from ironclad.engine.roles import DEFAULT_ROLE, role_names
+        from ironclad.engine.roles import role_names
 
         text = str(coerced).strip().lower()
         if text not in role_names():
-            message = f'unknown runtime.role {coerced!r}; using "{DEFAULT_ROLE}"'
+            # Keep the role an earlier (trusted) layer chose; a typo must never widen a read-only role.
+            current = getattr(target, name)
+            message = f'unknown runtime.role {coerced!r}; keeping "{current}"'
             if message not in config.warnings:
                 config.warnings.append(message)
-            text = DEFAULT_ROLE
+            return False
         coerced = text
     setattr(target, name, coerced)
     return True

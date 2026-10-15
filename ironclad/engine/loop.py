@@ -74,6 +74,7 @@ EVENT_DATA_KEYS = ("exit_code", "tests_run", "tests_failed", "diff", "backend", 
 VALIDATABLE_TOOLS = acceptance.FLAGGABLE_TOOLS
 TRUNCATED = ("length", "error")  # done reasons whose tool calls may be cut off: never executed
 COMPACTION_STATE = "compaction_state"  # session state: {"compactions": n, "summary": SummaryData.to_dict()}
+ROLE_STATE = "role"  # session state: the role the session last ran under (restored on resume)
 CONTEXT_EXHAUSTED = "context budget exhausted: the request cannot fit the model window even after compaction"
 COMPACTED: EventKind = cast(EventKind, "context.compacted")  # proposed addition to contracts.EventKind
 JOB_STOP_TIMEOUT_S = 10.0
@@ -219,6 +220,7 @@ class Engine:
         self._sessions: dict[str, _Session] = {}
         self._running: set[JobHandle] = set()
         self._task: asyncio.Task[Stop] | None = None
+        self._in_turn = False  # True for the whole of run(): the role is frozen while it is set
         self._augmented: set[str] = set()
         self._validating: set[str] = set()
 
@@ -245,11 +247,20 @@ class Engine:
     def role_label(self) -> str:
         return self._role.status_label()
 
+    @property
+    def busy(self) -> bool:
+        """True while a turn runs or a tool job is still active."""
+        return self._in_turn or bool(self._running) or (self._task is not None and not self._task.done())
+
     def set_role(self, name: str) -> None:
         """Switch the active role: re-gate the runtime (remove-only) and re-render each session's prefix.
 
-        The step budget and recorded history are never reset, so a switch cannot launder work already done.
+        Only allowed while idle (raises ``RuntimeError`` during a turn or tool job), so a turn's role is
+        frozen from start to finish. The step budget and recorded history are never reset, so a switch
+        cannot launder work already done.
         """
+        if self.busy:
+            raise RuntimeError("cannot change the role while a turn or tool job is active; stop or finish it first")
         self._role = get_role(name)
         self._apply_role()
         for session in self._sessions.values():
@@ -263,22 +274,28 @@ class Engine:
     async def run(self, session_id: str, user_text: str, *, intent: Intent | None = None) -> AcceptanceResult:
         """Run one user message. ``intent`` (e.g. from ``--expect``) overrides the deterministic classifier."""
         session = self._session(session_id)
+        if self.store is not None:  # the role this session runs under, restored on resume (see native.py)
+            self.store.set_state(session_id, ROLE_STATE, self._role.name)
         run = _Run(uuid.uuid4().hex[:12], time.monotonic(), intent=classify(user_text, intent))
         if self._role.read_only:  # a read-only role can only inspect/answer; never a change request
             run.intent = Intent.QUESTION
         session.state.intent = run.intent.value
-        self._event("turn.started", session, run, {"user_text": user_text})
-        self._task = asyncio.create_task(self._drive(session, run, user_text))
+        self._in_turn = True
         try:
-            stop, detail = await self._task
-        except asyncio.CancelledError:
-            current = asyncio.current_task()
-            if current is not None and current.cancelling():
-                raise
-            stop, detail = "cancelled", ""
+            self._event("turn.started", session, run, {"user_text": user_text})
+            self._task = asyncio.create_task(self._drive(session, run, user_text))
+            try:
+                stop, detail = await self._task
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                stop, detail = "cancelled", ""
+            finally:
+                self._task = None
+            return self._finish(session, run, stop, detail)
         finally:
-            self._task = None
-        return self._finish(session, run, stop, detail)
+            self._in_turn = False
 
     # ------------------------------------------------------------------ session setup
 
