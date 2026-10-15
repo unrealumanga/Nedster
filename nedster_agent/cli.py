@@ -171,7 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
     accept_global_options(sessions_list)
     sessions_show = session_actions.add_parser("show", help="One session: metadata + stored transcript")
     accept_global_options(sessions_show)
-    sessions_show.add_argument("session_id", help="Session id or unique prefix")
+    sessions_show.add_argument("session_id", help="Session id, unique id prefix or exact title")
     sessions_rename = session_actions.add_parser("rename", help="Give a session a new name")
     accept_global_options(sessions_rename)
     sessions_rename.add_argument("session_id", help="Session id, unique prefix or exact title")
@@ -180,7 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
         "delete", help="Delete a session; refused while the session is active (locked)"
     )
     accept_global_options(sessions_delete)
-    sessions_delete.add_argument("session_id", help="Session id or unique prefix")
+    sessions_delete.add_argument("session_id", help="Session id, unique id prefix or exact title")
     sessions_delete.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
     sessions_delete.add_argument(
         "--dry-run", action="store_true", help="Show what would be deleted without deleting anything"
@@ -1196,7 +1196,7 @@ def _sessions_list(args: argparse.Namespace, store: Any, project_root: Path) -> 
         title = _display_title(store, sid, row.get("title", ""))
         print(f"{_short(sid):<10}{relative_age(int(row['updated_ns'])):<12}{int(row.get('message_count', 0)):<10}{title}{flag}")
     print(f"{len(rows)} session(s).")
-    print('Resume: nedster run --session <id or title> "..."')
+    print('Resume: nedster resume <id or title>   (scripts: nedster run --session <id or title> "...")')
     return EXIT_OK
 
 

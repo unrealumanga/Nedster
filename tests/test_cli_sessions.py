@@ -553,7 +553,7 @@ def test_sessions_list_human_shows_relative_age_count_and_resume_hint(clean_env,
     # an empty title falls back to the first stored user message
     assert "fix the range" in out
     assert "3d ago" in out
-    assert 'Resume: nedster run --session <id or title> "..."' in out
+    assert 'Resume: nedster resume <id or title>' in out and 'nedster run --session <id or title>' in out
 
 
 def test_sessions_list_json_keeps_keys_and_adds_title_and_message_count(clean_env, capsys):
