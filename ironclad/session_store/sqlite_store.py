@@ -779,6 +779,18 @@ class SqliteSessionStore:
             raise KeyError(f"no output {handle} in session {session_id}")
         return str(row[0])
 
+    def output_for_call(self, session_id: str, call_id: str) -> str | None:
+        """Full text stored for one tool call, or None. Newest handle wins if a call stored more than once."""
+        if not call_id:
+            return None
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT full_text FROM outputs WHERE session_id = ? AND call_id = ?"
+                " ORDER BY handle DESC LIMIT 1",
+                (session_id, call_id),
+            ).fetchone()
+        return None if row is None else str(row[0])
+
     def outputs_report(self, session_id: str) -> dict[str, int]:
         """Visible retention picture for one session: how many handles exist, how many are still
         referenced by a message or task state, and how many are prunable."""

@@ -24,9 +24,11 @@ from ironclad.contracts import EngineEvent
 from ironclad.session_store.sqlite_store import SHORT_ID, make_owner
 from ironclad.session_store.titles import display_title, normalize_title, relative_age
 
+from .notify import notification
 from .widgets.composer import Composer, History, project_files
 from .widgets.delete_confirm import DeleteConfirm
 from .widgets.glyphs import Glyphs
+from .widgets.output_viewer import OutputViewer
 from .widgets.session import (
     EngineSession,
     EventCallback,
@@ -62,17 +64,26 @@ COMMANDS: dict[str, str] = {
     "/diff": "diff of files changed in this session",
     "/undo": "undo the last edit (when the engine supports it)",
     "/doctor": "readiness check (inference / read-only / execution)",
-    "/models": "list the active model fleet",
+    "/models": "browse and switch installed models",
     "/permissions": "show the autonomy policy",
     "/quit": "exit Nedster",
 }
 # Commands that change engine/session state wait for the running turn (the text is kept).
-IDLE_ONLY = {"/new", "/resume", "/model", "/undo", "/sessions", "/rename", "/delete"}
+IDLE_ONLY = {"/new", "/resume", "/model", "/models", "/undo", "/sessions", "/rename", "/delete"}
+# Commands that take no argument: extra text is rejected with a usage hint instead of being ignored.
+NO_ARG_COMMANDS = frozenset({
+    "/help", "/new", "/clear", "/sessions", "/models", "/status",
+    "/diff", "/undo", "/doctor", "/permissions", "/quit", "/exit",
+})
 
 #: How much stored history /resume replays into the view (display only, never re-executed).
 RESUME_REPLAY_LIMIT = 200
 #: Activity-lock heartbeat period; well below the store's 60 s lock TTL.
 LOCK_REFRESH_S = 5.0
+#: Longest the @file inventory may stay stale when no turn changed files.
+FILE_REFRESH_S = 30.0
+#: Acceptance outcomes that count as a failed turn for the completion notice.
+FAILURE_OUTCOMES = frozenset({"failed", "incomplete", "unvalidated"})
 
 DoctorProvider = Callable[[NedsterConfig], Mapping[str, Mapping[str, Any]]]
 SessionFactoryFor = Callable[[NedsterConfig, EventCallback], EngineSession]
@@ -103,6 +114,17 @@ class _WiredNativeSession(NativeSession):
     def undo_last(self) -> Any:
         self.core.session_id = self.session_id
         return self.core.undo_last()
+
+    def set_model(self, name: str) -> None:
+        super().set_model(name)
+        if self.core is None:
+            return
+        from ironclad.native import context_budget
+
+        self.core.model = name
+        budget = getattr(self.core.engine, "budget", None)
+        if budget is not None:  # a switch must rebuild the compaction budget for the new window
+            budget.context_tokens = context_budget(self.core.config, name)
 
     async def close(self) -> None:
         if self.core is not None:
@@ -195,6 +217,8 @@ class NedsterApp(App[None]):
     #work { height: 1fr; padding: 0 2; background: #0b0d10; color: #e6edf3; scrollbar-color: #394150; scrollbar-color-hover: #596579; scrollbar-size-vertical: 1; }
     #details { height: 1fr; padding: 0 2; display: none; background: #0b0d10; color: #e6edf3; }
     #completions { height: auto; max-height: 8; margin: 0 2; display: none; background: #11151b; border: round #394150; }
+    #search-hint { height: 1; padding: 0 2; display: none; background: #0b0d10; color: #d29922; }
+    #follow-hint { height: 1; padding: 0 2; display: none; background: #0b0d10; color: #58a6ff; }
     #prompt { height: auto; min-height: 3; max-height: 8; margin: 0 2; background: #11151b; color: #f0f6fc; border: round #394150; }
     #prompt:focus { border: round #7aa2f7; }
     #status { height: 1; padding: 0 2; background: #0b0d10; color: #c9d1d9; }
@@ -203,7 +227,7 @@ class NedsterApp(App[None]):
     #too-small { display: none; height: 1fr; content-align: center middle; text-align: center; }
     .queued { color: #d29922; }
     .no-color, .no-color #identity, .no-color #work, .no-color #details, .no-color #message, .no-color #status,
-    .no-color Footer, .no-color #prompt, .no-color #completions { color: ansi_default; background: ansi_default; }
+    .no-color Footer, .no-color #prompt, .no-color #completions, .no-color #search-hint, .no-color #follow-hint { color: ansi_default; background: ansi_default; }
     .no-color #prompt, .no-color #completions { border: round ansi_default; }
     .no-color #prompt:focus { border: round ansi_default; }
     .no-color .queued { color: ansi_default; text-style: italic; }
@@ -212,11 +236,15 @@ class NedsterApp(App[None]):
     """
 
     BINDINGS = [
-        Binding("escape", "escape", "Stop", priority=True),
-        Binding("ctrl+c", "interrupt", "Quit (x2)", priority=True),
-        Binding("ctrl+s", "session_picker", "Sessions"),
-        Binding("f2", "details", "Events"),
-        Binding("ctrl+l", "clear", "Clear"),
+        Binding("f1", "help", "help"),
+        Binding("f4", "models", "models"),
+        Binding("ctrl+s", "session_picker", "sessions"),
+        Binding("ctrl+r", "history", "history"),
+        Binding("escape", "escape", "stop", priority=True),
+        Binding("f2", "details", "events", show=False),
+        Binding("ctrl+c", "interrupt", "quit x2", priority=True, show=False),
+        Binding("ctrl+l", "clear", "clear", show=False),
+        Binding("ctrl+o", "verbose", "verbose", show=False),
     ]
 
     def __init__(
@@ -231,6 +259,7 @@ class NedsterApp(App[None]):
         session_ref: str | None = None,
         resume_latest: bool = False,
         open_picker_on_start: bool = False,
+        model_source: Callable[[str], Sequence[Any]] | None = None,
     ):
         super().__init__()
         self.config = config
@@ -243,7 +272,11 @@ class NedsterApp(App[None]):
         self.resume_latest = resume_latest
         self.open_picker_on_start = open_picker_on_start
         root = Path(config.runtime.project_root)
-        self.files_source = files or (lambda: project_files(root))
+        self._files_fetch = files or (lambda: project_files(root))
+        self._files_cache: list[str] = []  # refreshed by a worker; read from the UI thread without blocking
+        self._files_at = 0.0
+        self._files_refreshing = False
+        self.model_source = model_source or self._default_model_source
         self.history = History.for_project(Path(config.runtime.state_dir), root)
         self.session: EngineSession | None = None
         self.busy = False
@@ -254,11 +287,18 @@ class NedsterApp(App[None]):
         self.event_buffer: list[str] = []
         self.tool_rows: dict[str, ToolRow] = {}
         self.changed_paths: list[str] = []
+        self._turn_changed = False  # did the current turn touch any file (drives @file inventory refresh)?
         self.current_reply: AssistantMessage | None = None
         self.turn_replies: list[AssistantMessage] = []
         self.pending_badge: OutcomeBadge | None = None
         self.turn_closed = True
         self.last_interrupt = 0.0
+        self.verbose = False  # Ctrl+O: auto-expand every tool row (in-memory, per session)
+        self._output_handles: dict[str, str] = {}  # call_id -> stored-output handle (for the full-output modal)
+        self._turn_started = 0.0  # wall-clock start of the running turn (drives the completion notice)
+        self._turn_outcome = ""  # acceptance outcome reported by the engine for this turn
+        self._notify_writer: Callable[[str], None] = self._default_notify_writer
+        self._model_started: float | None = None  # wall-clock start of the model call in flight (speed fallback)
         self._loop_thread = threading.get_ident()
         self._lock_owner = make_owner("tui")
         self._locked: tuple[Any, str] | None = None  # (store, session_id) held by this window
@@ -273,12 +313,16 @@ class NedsterApp(App[None]):
         yield Transcript(id="work")
         yield RichLog(id="details", markup=False, wrap=False, auto_scroll=True)
         yield OptionList(id="completions")
+        yield Static("", id="search-hint")
+        yield Static("", id="follow-hint")
         yield Composer(
             id="prompt",
             history=self.history,
             commands=list(COMMANDS),
-            files=self.files_source,
+            command_descriptions=COMMANDS,
+            files=lambda: self._files_cache,
             menu=lambda: self.query_one("#completions", OptionList),
+            hint=self._search_hint,
         )
         yield StatusBar(g, id="status")
         yield Static("", id="message")
@@ -287,6 +331,13 @@ class NedsterApp(App[None]):
     def _project_name(self) -> str:
         return Path(self.config.runtime.project_root).name or str(self.config.runtime.project_root)
 
+    def _default_model_source(self, current: str) -> Sequence[Any]:
+        """Installed Ollama models; runs in a worker thread so the UI never blocks on the network."""
+        from .model_manager import OllamaManager, list_installed_models
+
+        manager = OllamaManager(self.config.models.ollama_url)
+        return list_installed_models(manager, current)
+
     async def on_mount(self) -> None:
         self._loop_thread = threading.get_ident()
         if self.no_color_mode:
@@ -294,6 +345,7 @@ class NedsterApp(App[None]):
         if self.ascii_only:
             self.screen.add_class("ascii")
         self._apply_size(self.size.width, self.size.height)
+        self.transcript.on_follow_change = self._show_follow_hint
         prompt = self.query_one("#prompt", Composer)
         prompt.cursor_blink = False
         prompt.focus()
@@ -305,6 +357,7 @@ class NedsterApp(App[None]):
             "@ mentions a file, / lists commands, Esc stops a running turn."
         ), g.style("muted")))
         self.set_interval(0.5, self._tick)
+        self.run_worker(self._refresh_files(), group="files", exclusive=True)
         self.run_worker(self._initialize(), group="startup", exclusive=True)
 
     @property
@@ -323,6 +376,8 @@ class NedsterApp(App[None]):
         self.query_one("#details").display = not too_small and self.details_visible
         if too_small:
             self.query_one("#completions").display = False
+            self.query_one("#search-hint").display = False
+            self.query_one("#follow-hint").display = False
         for selector in ("#prompt", "#status", "#message", "Footer"):
             self.query_one(selector).display = not too_small
 
@@ -340,6 +395,13 @@ class NedsterApp(App[None]):
             for row in self.tool_rows.values():
                 if row.finished is None:
                     row.refresh()
+        elif (
+            not self._files_refreshing
+            and self._files_at
+            and time.monotonic() - self._files_at >= FILE_REFRESH_S
+        ):
+            # keep the @file inventory from going stale even when no turn has run for a while
+            self.run_worker(self._refresh_files(), group="files", exclusive=True)
 
     # ------------------------------------------------------------------ startup
 
@@ -405,6 +467,26 @@ class NedsterApp(App[None]):
 
     def _message(self, text: str) -> None:
         self.query_one("#message", Static).update(Text(self._text(text)))
+
+    def _search_hint(self, text: str | None) -> None:
+        """Composer callback: show/hide the one-line reverse-search hint above the prompt."""
+        hint = self.query_one("#search-hint", Static)
+        hint.display = text is not None
+        hint.update(Text(self._text(text or "")))
+
+    async def _refresh_files(self, *, force: bool = False) -> None:
+        """Refresh the @file inventory in a worker thread; a changed turn forces it, otherwise 30 s TTL."""
+        if not force and self._files_cache and time.monotonic() - self._files_at < FILE_REFRESH_S:
+            return
+        self._files_refreshing = True
+        try:
+            files = await asyncio.to_thread(self._files_fetch)
+        except Exception:  # noqa: BLE001 - a failed scan keeps the last inventory rather than crashing
+            return
+        finally:
+            self._files_refreshing = False
+        self._files_cache = list(files)
+        self._files_at = time.monotonic()
 
     def _set_state(self, state: str, detail: str = "", *, force: bool = False) -> None:
         if self.cancelling and not force:
@@ -548,12 +630,13 @@ class NedsterApp(App[None]):
                 except Exception as exc:  # noqa: BLE001
                     self._line(f"Could not read the transcript: {exc}", "warn")
         self._line(f"Resumed session {session_id[:SHORT_ID]}", "accent")
-        for widget in replay_widgets(self.glyphs, entries):
+        for widget in replay_widgets(self.glyphs, entries, output_loader=self._output_loader_for):
             self.transcript.add(widget)
         if not entries:
             self._line("No saved transcript for this session.", "muted")
         self.transcript.add(Banner(self.glyphs, RESUME_BANNER))
         self._refresh_info()
+        self.status_bar.reset_usage()  # the resumed session's context usage is unknown until the next call
 
     # ------------------------------------------------------------------ picker
 
@@ -699,28 +782,42 @@ class NedsterApp(App[None]):
 
     def _on_turn_started(self, event: EngineEvent) -> None:
         self.turn_closed = False
+        self._model_started = None
         self._set_state("thinking")
 
     def _on_model_delta(self, event: EngineEvent) -> None:
+        if self._model_started is None:
+            self._model_started = time.monotonic()
         if self.current_reply is None:
             self.current_reply = AssistantMessage(self.glyphs)
             self.turn_replies.append(self.current_reply)
             self.transcript.add(self.current_reply)
         self.current_reply.append(str(event.data.get("text") or ""), str(event.data.get("kind") or "content"))
-        self.transcript.call_after_refresh(self.transcript.scroll_end, animate=False)
+        self.transcript.follow_output()
         self._set_state("thinking")
 
     def _on_model_usage(self, event: EngineEvent) -> None:
-        used = int(event.data.get("prompt_tokens") or 0) + int(event.data.get("completion_tokens") or 0)
-        info = dict(self.status_bar.info)
-        info["context_used"] = used
-        self.status_bar.set_info(info)
+        data = event.data
+        wall = time.monotonic() - self._model_started if self._model_started is not None else None
+        self._model_started = None
+        self.status_bar.note_usage(
+            int(data.get("prompt_tokens") or 0),
+            int(data.get("completion_tokens") or 0),
+            decode_ms=float(data.get("decode_ms") or 0.0),
+            wall_s=wall,
+        )
+        self.status_bar.advance_step()
 
     def _on_tool_started(self, event: EngineEvent) -> None:
         self.current_reply = None
         call_id = str(event.data.get("call_id") or f"call-{len(self.tool_rows)}")
         tool = str(event.data.get("tool") or "tool")
-        row = ToolRow(self.glyphs, call_id, tool, dict(event.data.get("arguments") or {}), diff_loader=self._diff_loader)
+        row = ToolRow(
+            self.glyphs, call_id, tool, dict(event.data.get("arguments") or {}),
+            diff_loader=self._diff_loader,
+            output_loader=lambda cid=call_id: self._load_full_output(cid),
+            expanded=self.verbose,
+        )
         self.tool_rows[call_id] = row
         self.transcript.add(row)
         self._set_state("running tool", tool)
@@ -728,9 +825,17 @@ class NedsterApp(App[None]):
     def _on_tool_finished(self, event: EngineEvent) -> None:
         data = dict(event.data)
         call_id = str(data.get("call_id") or "")
+        handle = str(data.get("output_handle") or "")
+        if handle:
+            self._output_handles[call_id] = handle
         row = self.tool_rows.get(call_id)
         if row is None:
-            row = ToolRow(self.glyphs, call_id, str(data.get("tool") or "tool"), {}, diff_loader=self._diff_loader)
+            row = ToolRow(
+                self.glyphs, call_id, str(data.get("tool") or "tool"), {},
+                diff_loader=self._diff_loader,
+                output_loader=lambda cid=call_id: self._load_full_output(cid),
+                expanded=self.verbose,
+            )
             self.tool_rows[call_id or f"call-{len(self.tool_rows)}"] = row
             self.transcript.add(row)
         row.finish(data)
@@ -752,6 +857,7 @@ class NedsterApp(App[None]):
 
     def _on_turn_finished(self, event: EngineEvent) -> None:
         answer = str(event.data.get("answer") or "").strip()
+        self._turn_outcome = str(event.data.get("outcome") or "")
         self._show_answer(answer)
         if self.pending_badge is None and event.data.get("outcome"):
             self.pending_badge = OutcomeBadge(self.glyphs, str(event.data["outcome"]))
@@ -796,9 +902,78 @@ class NedsterApp(App[None]):
         for path in paths:
             if str(path) not in self.changed_paths:
                 self.changed_paths.append(str(path))
+                self._turn_changed = True
 
     def _diff_loader(self, paths: Sequence[str]) -> str:
         return session_diff(Path(self.config.runtime.project_root), paths)
+
+    # ------------------------------------------------------------------ completion notice
+
+    def _turn_outcome_word(self) -> str:
+        """One word for the completion notice: cancelled / failed / completed."""
+        if self.cancelling:
+            return "cancelled"
+        return "failed" if self._turn_outcome in FAILURE_OUTCOMES else "completed"
+
+    def _notify_turn(self, outcome: str, seconds: float) -> None:
+        """Emit the configured completion notice; silent in machine modes (the TUI never runs there)."""
+        mode = str(getattr(self.config.runtime, "notify", "bell") or "off")
+        threshold = float(getattr(self.config.runtime, "notify_after_s", 15.0) or 0.0)
+        data = notification(mode, outcome, seconds, threshold=threshold, interactive=True)
+        if data is not None:
+            self._notify_writer(data)
+
+    def _default_notify_writer(self, data: str) -> None:
+        """Write an escape sequence straight to the terminal (bypasses the screen buffer)."""
+        file = getattr(self.console, "file", None)
+        if file is None:
+            return
+        with suppress(Exception):
+            file.write(data)
+            file.flush()
+
+    # ------------------------------------------------------------------ full output + follow hint
+
+    def _load_full_output(self, call_id: str) -> str:
+        """Read a tool call's complete stored output (blocking; call from a worker)."""
+        store = self._session_store()
+        session_id = str(getattr(self.session, "session_id", "")) if self.session is not None else ""
+        reader = getattr(store, "output_for_call", None)
+        if callable(reader) and session_id and call_id:
+            try:
+                return str(reader(session_id, call_id) or "")
+            except Exception:  # noqa: BLE001 - fall back to whatever the row already has
+                return ""
+        return ""
+
+    @on(ToolRow.FullOutput)
+    def _open_full_output(self, message: ToolRow.FullOutput) -> None:
+        row = message.row
+        loader = row.output_loader
+        if loader is None and not row.event_output():
+            self._message("No stored output to show for this tool call")
+            return
+        name = self.glyphs.text(row.tool)
+        self.push_screen(
+            OutputViewer(
+                self.glyphs,
+                title=name,
+                loader=loader,
+                fallback=row.event_output(),
+                historical=row.historical,
+            )
+        )
+
+    def _output_loader_for(self, call_id: str) -> Callable[[], str]:
+        return lambda: self._load_full_output(call_id)
+
+    def _show_follow_hint(self, pending: bool) -> None:
+        hint = self.query_one("#follow-hint", Static)
+        if pending and self.size.width >= 80 and self.size.height >= 24:
+            hint.update(Text(self._text("New output - End to follow")))
+            hint.display = True
+        else:
+            hint.display = False
 
     # ------------------------------------------------------------------ input
 
@@ -841,6 +1016,8 @@ class NedsterApp(App[None]):
         self._activate_session()
         self.busy = True
         self.turn_closed = False
+        self._turn_started = time.monotonic()
+        self._turn_outcome = ""
         self.status_bar.start_turn()
         self._set_state("thinking")
         self.run_worker(self._run_turn(value), group="turn")
@@ -857,6 +1034,7 @@ class NedsterApp(App[None]):
         except Exception as exc:  # noqa: BLE001 - shown in the transcript
             self._line(f"{g.icon('fail')} Turn failed: {exc}", "fail")
         self._close_turn()
+        self._notify_turn(self._turn_outcome_word(), time.monotonic() - self._turn_started)
         self.busy = False
         if self.cancelling:
             self.cancelling = False
@@ -864,6 +1042,8 @@ class NedsterApp(App[None]):
         self.status_bar.end_turn()
         self._set_state("idle")
         self._refresh_info()
+        self.run_worker(self._refresh_files(force=self._turn_changed), group="files", exclusive=True)
+        self._turn_changed = False
         self._dequeue()
 
     def _dequeue(self) -> None:
@@ -879,7 +1059,17 @@ class NedsterApp(App[None]):
     # ------------------------------------------------------------------ actions
 
     def action_escape(self) -> None:
+        from textual.screen import ModalScreen
+
+        if isinstance(self.screen, ModalScreen):  # app-level Esc has priority; let the modal handle it
+            cancel = getattr(self.screen, "action_cancel", None)
+            if cancel is not None:
+                cancel()
+            return
         composer = self.query_one("#prompt", Composer)
+        if composer.search_active:
+            composer.cancel_search()  # Esc restores the draft that was in the composer
+            return
         if composer.completion is not None:
             composer.close_completion()
             return
@@ -918,6 +1108,9 @@ class NedsterApp(App[None]):
     def action_help(self) -> None:
         self._command("/help")
 
+    def action_history(self) -> None:
+        self.query_one("#prompt", Composer).cycle_search()
+
     def action_details(self) -> None:
         self.details_visible = not self.details_visible
         self.query_one("#work").display = not self.details_visible
@@ -932,6 +1125,20 @@ class NedsterApp(App[None]):
     def action_clear(self) -> None:
         self.transcript.remove_children()
         self.tool_rows = {k: v for k, v in self.tool_rows.items() if v.finished is None}
+        self.transcript.following = True
+        self.transcript.new_output = False
+        self._show_follow_hint(False)
+
+    def action_verbose(self) -> None:
+        """Ctrl+O: expand every tool row in this session (in-memory; not persisted)."""
+        self.verbose = not self.verbose
+        for row in self.tool_rows.values():
+            row.expanded = self.verbose
+            row.refresh(layout=True)
+        self._message("Verbose transcript · tool rows expanded" if self.verbose else "")
+
+    def action_models(self) -> None:
+        self._open_model_picker()
 
     def action_session_picker(self) -> None:
         self._open_session_picker()
@@ -965,6 +1172,9 @@ class NedsterApp(App[None]):
         if handler is None:
             self._line(f"Unknown command {command}. /help lists commands.", "warn")
             return
+        if command in NO_ARG_COMMANDS and args:
+            self._line(f"{command} takes no arguments · usage: {command}", "warn")
+            return
         handler(args)
 
     def _cmd_help(self, _args: list[str]) -> None:
@@ -972,9 +1182,11 @@ class NedsterApp(App[None]):
         for name, text in COMMANDS.items():
             self._line(f"  {name:<13}{text}")
         self._line("Keys", "accent")
-        self._line("  Enter send · Shift+Enter/Ctrl+J newline · Up/Down history · @ file · / command")
-        self._line("  Ctrl+S switch conversation · Esc stop the running turn · Ctrl+C twice exit · F2 raw events · Ctrl+L clear")
+        self._line("  Enter send · Shift+Enter/Ctrl+J newline · Up/Down history · Ctrl+R search history")
+        self._line("  @ file · / command · Esc stop the running turn · Ctrl+C twice exit")
+        self._line("  F1 help · F4 models · Ctrl+S switch conversation · F2 raw events · Ctrl+L clear · Ctrl+O verbose")
         self._line("  Tool rows: focus with Tab/click, Enter expands argv, output and diff")
+        self._line("  On a tool row, press o for the full stored output (Esc closes)")
 
     def _cmd_new(self, _args: list[str]) -> None:
         new = getattr(self.session, "new", None)
@@ -988,6 +1200,7 @@ class NedsterApp(App[None]):
         self.changed_paths.clear()
         self._line(f"New conversation {str(session_id)[:SHORT_ID]}", "accent")
         self._refresh_info()
+        self.status_bar.reset_usage()
 
     def _cmd_sessions(self, _args: list[str]) -> None:
         self._open_session_picker()
@@ -1061,25 +1274,89 @@ class NedsterApp(App[None]):
             self._acquire_lock(session_id, warn=False)
         self._replay_session(session_id)
 
+    def _cmd_models(self, _args: list[str]) -> None:
+        self._open_model_picker()
+
     def _cmd_model(self, args: list[str]) -> None:
-        info = self.session.info() if self.session else {}
         if not args:
-            self._line(f"Model: {info.get('model') or 'none'} ({info.get('provider') or 'LOCAL'})")
+            self._open_model_picker()
             return
+        self.run_worker(self._switch_model(args[0]), group="command")
+
+    def _current_model(self) -> str:
+        return str(self.session.info().get("model") or "") if self.session is not None else ""
+
+    def _open_model_picker(self) -> None:
+        if self.session is None:
+            self._line("Runtime unavailable · run nedster setup", "warn")
+            return
+        if self.busy:
+            self._message(f"Models waits for the running turn {self.glyphs.sep} Esc stops it")
+            return
+        self.run_worker(self._load_models_and_pick(), group="command")
+
+    async def _load_models_and_pick(self) -> None:
+        from .widgets.model_picker import ModelPicker
+
+        current = self._current_model()
+        try:
+            models = await asyncio.to_thread(self.model_source, current)
+        except Exception:  # noqa: BLE001 - a dead endpoint is explained, never a crash
+            self._line(self._models_unreachable(), "warn")
+            return
+        if not models:
+            self._line("No models are installed. Add one with: ollama pull <model>", "warn")
+            return
+        self.push_screen(ModelPicker(models, current=current, glyphs=self.glyphs), self._on_model_picked)
+
+    def _on_model_picked(self, name: str | None) -> None:
+        self._message("")
+        if not name or self.session is None:
+            return
+        if name == self._current_model():
+            self._message(f"{name} is already the active model")
+            return
+        self._apply_model(name)
+
+    async def _switch_model(self, name: str) -> None:
+        if self.session is None:
+            self._line("Runtime unavailable · run nedster setup", "warn")
+            return
+        from .model_manager import match_installed_model, model_not_installed_message
+
+        current = self._current_model()
+        try:
+            models = await asyncio.to_thread(self.model_source, current)
+        except Exception:  # noqa: BLE001 - cannot validate offline; keep the previous model
+            self._line(self._models_unreachable(), "warn")
+            return
+        installed = [model.name for model in models]
+        canonical = match_installed_model(name, installed)
+        if canonical is None:
+            self._line(model_not_installed_message(name, installed), "warn")
+            return
+        self._apply_model(canonical)
+
+    def _apply_model(self, name: str) -> None:
         setter = getattr(self.session, "set_model", None)
         if setter is None:
             self._line("This engine picks models from the fleet; change models.coder in config.toml.", "warn")
             return
-        setter(args[0])
-        self._line(f"Model set to {args[0]}", "accent")
+        try:
+            setter(name)
+        except Exception as exc:  # noqa: BLE001 - shown, never fatal
+            self._line(f"Could not switch model: {exc}", "fail")
+            return
+        self._line(f"Model set to {name}", "accent")
         self._refresh_info()
+        self.status_bar.reset_usage()  # a different model's measured context/speed does not apply
 
-    def _cmd_models(self, _args: list[str]) -> None:
-        rows = getattr(self.session, "models", lambda: [])()
-        if not rows:
-            self._line("No model fleet is active. Run `nedster setup`.")
-        for role, model, backend in rows:
-            self._line(f"{role}: {model} ({backend})")
+    def _models_unreachable(self) -> str:
+        g = self.glyphs
+        return (
+            f"{g.icon('fail')} Ollama is not reachable at {self.config.models.ollama_url}. "
+            "Start it (`ollama serve`), then retry."
+        )
 
     def _cmd_status(self, _args: list[str]) -> None:
         if self.session is None:

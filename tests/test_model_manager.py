@@ -224,3 +224,150 @@ def test_describe_permissions_states_exact_capability():
     assert "read and write" in describe_permissions("write", False)
     assert "isolated sandbox" in describe_permissions("execute", False)
     assert "NO isolation" in describe_permissions("execute", True)
+
+
+# --- installed-model discovery + truthful switching (BP2) --------------------------------------
+
+import httpx  # noqa: E402
+
+from nedster_agent.model_manager import (  # noqa: E402
+    is_embedding_model,
+    is_model_missing_error,
+    list_installed_models,
+    match_installed_model,
+    model_not_installed_message,
+    set_default_worker,
+)
+
+
+class _ListingManager:
+    """Minimal OllamaManager double: tags details plus an /api/show probe that can fail."""
+
+    def __init__(self, entries, contexts=None):
+        self.entries = list(entries)
+        self.contexts = contexts or {}
+        self.probed: list[str] = []
+
+    def list_model_details(self):
+        return list(self.entries)
+
+    def context_window(self, model):
+        self.probed.append(model)
+        if model in self.contexts:
+            return self.contexts[model]
+        raise httpx.HTTPError("dead endpoint")
+
+
+class _ShowManager:
+    """Double exposing the real ``show`` path so context *and* capabilities come from one /api/show."""
+
+    def __init__(self, entries, shows=None):
+        self.entries = list(entries)
+        self.shows = shows or {}
+        self.shown: list[str] = []
+
+    def list_model_details(self):
+        return list(self.entries)
+
+    def show(self, model):
+        self.shown.append(model)
+        if model in self.shows:
+            return self.shows[model]
+        raise httpx.HTTPError("dead endpoint")
+
+
+def _entry(name, size=9_500_000_000, params="9B", quant="Q4_K_M"):
+    return {"name": name, "size": size, "details": {"parameter_size": params, "quantization_level": quant}}
+
+
+def test_list_installed_models_reports_details_and_marks_the_current_one():
+    manager = _ListingManager(
+        [_entry("qwen3.6:27b", size=18_000_000_000, params="27B"), _entry("nedster-worker:latest")],
+        contexts={"qwen3.6:27b": (40960, None)},
+    )
+    rows = list_installed_models(manager, "nedster-worker")
+
+    assert [row.name for row in rows] == ["qwen3.6:27b", "nedster-worker:latest"]
+    assert rows[0].size_gb == 18.0 and rows[0].parameter_size == "27B" and rows[0].quantization == "Q4_K_M"
+    assert rows[0].context_length == 40960 and rows[0].current is False
+    assert rows[1].current is True  # "nedster-worker" matches "nedster-worker:latest"
+    assert rows[1].context_length is None and rows[1].context_label() == "unknown"
+    assert manager.probed == ["qwen3.6:27b", "nedster-worker:latest"]
+
+
+def test_list_installed_models_can_skip_context_probes():
+    manager = _ListingManager([_entry("qwen3.6:27b")], contexts={"qwen3.6:27b": (40960, None)})
+    rows = list_installed_models(manager, with_context=False)
+    assert rows[0].context_length is None and manager.probed == []
+
+
+def test_is_embedding_model_by_name_and_capabilities():
+    assert is_embedding_model("nomic-embed-text:latest")  # obvious name
+    assert is_embedding_model("embeddinggemma:300m")  # the recommended default embedding model
+    assert is_embedding_model("mystery:7b", {"embedding"})  # no completion capability
+    assert not is_embedding_model("qwen3.6:27b", {"completion", "tools"})
+    assert not is_embedding_model("qwen3.6:27b", set())  # unknown capabilities: trust the name
+
+
+def test_list_installed_models_hides_embeddings_unless_asked():
+    entries = [_entry("qwen3.6:27b"), _entry("nomic-embed-text:latest")]
+    manager = _ShowManager(
+        entries,
+        shows={
+            "qwen3.6:27b": {"parameters": "num_ctx 65536", "capabilities": ["completion", "tools"]},
+            "nomic-embed-text:latest": {"parameters": "", "capabilities": ["embedding"]},
+        },
+    )
+    visible = list_installed_models(manager)
+    assert [row.name for row in visible] == ["qwen3.6:27b"]
+    assert all(not row.embedding for row in visible)
+
+    everything = list_installed_models(manager, include_embedding=True)
+    assert [row.name for row in everything] == ["qwen3.6:27b", "nomic-embed-text:latest"]
+    assert everything[1].embedding is True and everything[1].kind_label() == "(embedding)"
+    assert everything[0].context_length == 65536  # context comes from the same show probe
+    assert manager.shown == ["qwen3.6:27b", "nomic-embed-text:latest"]
+
+
+def test_match_installed_model_accepts_an_implicit_latest_tag():
+    installed = ["nedster-worker:latest", "qwen3.6:27b"]
+    assert match_installed_model("nedster-worker", installed) == "nedster-worker:latest"
+    assert match_installed_model("qwen3.6:27b:latest", installed) == "qwen3.6:27b"
+    assert match_installed_model("qwen3.6:27b", installed) == "qwen3.6:27b"
+    assert match_installed_model("", installed) is None
+    assert match_installed_model("missing", installed) is None
+
+
+def test_model_not_installed_message_names_the_remedy_and_closest_installed():
+    message = model_not_installed_message("qwen3.6:27", ["qwen3.6:27b", "llama3:8b"])
+    assert message.startswith("Model 'qwen3.6:27' is not installed.")
+    assert "Choose one with /models" in message
+    assert "ollama pull qwen3.6:27" in message
+    assert "qwen3.6:27b" in message  # difflib suggestion
+    assert "llama3:8b" not in message
+
+
+def test_is_model_missing_error_recognizes_ollama_404s():
+    assert is_model_missing_error("Client error '404 Not Found' for url 'http://127.0.0.1:11434/api/chat'")
+    assert is_model_missing_error("Ollama error: model 'x' not found")
+    assert not is_model_missing_error("connection refused")
+
+
+def test_set_default_worker_preserves_other_keys_and_backs_up(tmp_path: Path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[models]\nrouter = "nedster-router"\ncoder = "old"\n[policy]\nmax_auto_risk = "write"\n',
+        encoding="utf-8",
+    )
+    backup = set_default_worker(path, "qwen3.6:27b")
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert data["models"]["coder"] == "qwen3.6:27b"
+    assert data["models"]["router"] == "nedster-router"  # untouched
+    assert data["policy"]["max_auto_risk"] == "write"  # untouched
+    assert backup is not None and Path(backup).read_text(encoding="utf-8").startswith("[models]")
+
+
+def test_set_default_worker_creates_a_config_when_missing(tmp_path: Path):
+    path = tmp_path / "nested" / "config.toml"
+    assert set_default_worker(path, "qwen3.6:27b") is None
+    assert tomllib.loads(path.read_text(encoding="utf-8"))["models"]["coder"] == "qwen3.6:27b"

@@ -19,6 +19,7 @@ DEFAULT_INFO: dict[str, Any] = {
     "isolation": "full",
     "context_used": 1200,
     "context_max": 32768,
+    "max_steps": 40,
     "session_id": "sess-1",
     "engine": "fake",
 }
@@ -53,6 +54,9 @@ class FakeSession:
         self.new_calls += 1
         self._info["session_id"] = f"sess-{self.new_calls + 1}"
         return self._info["session_id"]
+
+    def set_model(self, name: str) -> None:
+        self._info["model"] = name
 
     # ------------------------------------------------------------------ test controls
 

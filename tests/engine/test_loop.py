@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 
 from ironclad.contracts import ChatMessage, Outcome, ToolCall, ToolResult, ToolStatus, TransportError
-from ironclad.engine.loop import Engine
+from ironclad.engine.loop import EVENT_OUTPUT_CHARS, Engine
 from ironclad.engine.state import Budget
 
 from .fakes import Events, FakeRuntime, MemoryStore, ScriptedTransport, Turn, call, ok
@@ -74,6 +74,46 @@ async def test_edit_then_tests_is_completed_with_code_summary() -> None:
     assert [e.data["status"] for e in finished] == ["ok", "ok", "ok"]
     assert finished[1].data["mutated_paths"] == ["calc.py"]
     assert events.of("acceptance")[0].data["outcome"] == "completed"
+
+
+async def test_oversized_tool_output_is_stored_full_for_the_ui_and_the_event_preview_is_bounded() -> None:
+    big = "line\n" * 1_500  # ~7 500 chars: bigger than the event preview, under the model truncation budget
+    body = big
+
+    def verbose(c: ToolCall) -> ToolResult:
+        return ok(c, body)
+
+    store = MemoryStore()
+    engine, _, _, events = make(
+        [Turn(calls=[call("read_file", "call-1", path="a.py")]), Turn("done")],
+        {"read_file": verbose},
+        store=store,
+    )
+    await engine.run("s", "read a.py")
+
+    finished = events.of("tool.finished")[0].data
+    assert len(finished["output"]) == EVENT_OUTPUT_CHARS  # the event only carries a preview
+    assert finished["output_handle"]
+    assert store.output_for_call("s", "call-1") == body  # the UI can still fetch the whole thing
+
+
+async def test_output_larger_than_the_budget_is_stored_only_once() -> None:
+    body = "x" * 20_000
+
+    def huge(c: ToolCall) -> ToolResult:
+        return ok(c, body)
+
+    store = MemoryStore()
+    engine, _, _, events = make(
+        [Turn(calls=[call("read_file", "call-2", path="a.py")]), Turn("done")],
+        {"read_file": huge},
+        store=store,
+    )
+    await engine.run("s", "read a.py")
+
+    stored = [text for (sid, _handle), text in store.outputs.items() if sid == "s"]
+    assert stored == [body]  # the preview store and the model truncation store share one row
+    assert events.of("tool.finished")[0].data["output_handle"]
 
 
 async def test_b02_green_baseline_then_rejected_write_is_not_completed() -> None:

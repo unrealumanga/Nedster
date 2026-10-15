@@ -69,12 +69,18 @@ class OutputVault:
     session_id: str
     store: SessionStore | None = None
     _memory: dict[int, str] = field(default_factory=dict)
+    _latest: dict[tuple[str, str], int] = field(default_factory=dict)
 
     def put(self, tool: str, call_id: str, text: str) -> int:
         put = getattr(self.store, "put_output", None)
         handle = int(put(self.session_id, tool, call_id, text)) if callable(put) else len(self._memory) + 1
         self._memory[handle] = text
+        self._latest[(tool, call_id)] = handle
         return handle
+
+    def handle_for(self, tool: str, call_id: str) -> int | None:
+        """The most recent handle stored for a call, so the UI preview and the model message share one row."""
+        return self._latest.get((tool, call_id))
 
     def get(self, handle: int) -> str | None:
         if handle in self._memory:
@@ -98,7 +104,9 @@ def tool_message(result: ToolResult, vault: OutputVault, max_chars: int) -> Chat
     """Bounded model-facing tool message. Oversized output keeps head+tail and a handle to the rest."""
     output = result.output
     if len(output) > max_chars:
-        handle = vault.put(result.tool, result.call_id, output)
+        handle = vault.handle_for(result.tool, result.call_id)
+        if handle is None:  # the event preview may already have stored it; do not store it twice
+            handle = vault.put(result.tool, result.call_id, output)
         half = max(max_chars // 2, 1)
         omitted = len(output) - 2 * half
         output = (

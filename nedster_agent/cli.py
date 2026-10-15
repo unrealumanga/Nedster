@@ -82,9 +82,11 @@ def build_parser() -> argparse.ArgumentParser:
     accept_global_options(doctor)
     models = subcommands.add_parser("models", help="Inspect or install the local model fleet")
     accept_global_options(models)
-    models.add_argument("action", nargs="?", choices=("list", "recommend", "install"), default="list")
+    models.add_argument("action", nargs="?", choices=("list", "recommend", "install", "use"), default="list")
+    models.add_argument("name", nargs="?", help="Model name for `models use`")
     models.add_argument("--profile", choices=("fast", "balanced", "maximum"), default="balanced")
     models.add_argument("--dry-run", action="store_true")
+    models.add_argument("--all", action="store_true", help="Also list models that cannot chat (embeddings)")
 
     run = subcommands.add_parser("run", help="Run one objective and exit")
     accept_global_options(run)
@@ -516,7 +518,16 @@ def _doctor(args: argparse.Namespace) -> int:
 
 
 def _models(args: argparse.Namespace) -> int:
-    from .model_manager import OllamaManager, install_plan, recommend_plan
+    from .model_manager import (
+        OllamaManager,
+        install_plan,
+        list_installed_models,
+        match_installed_model,
+        model_not_installed_message,
+        recommend_plan,
+        set_default_worker,
+        state_dir,
+    )
 
     config, _ = _resolve(args)
     manager = OllamaManager(config.models.ollama_url)
@@ -531,15 +542,51 @@ def _models(args: argparse.Namespace) -> int:
     if args.action == "install":
         install_plan(plan, ollama_url=config.models.ollama_url, dry_run=args.dry_run, progress=_err)
         return EXIT_OK
+    if args.action == "use":
+        name = (getattr(args, "name", None) or "").strip()
+        if not name:
+            raise UsageError("models use needs a model name: nedster models use <name>")
+        if not manager.api_available():
+            _err(f"Ollama is not reachable at {manager.url}, so '{name}' cannot be checked. Start it and retry.")
+            return EXIT_NOT_READY
+        installed = manager.list_models()
+        canonical = match_installed_model(name, installed)
+        if canonical is None:
+            _err(model_not_installed_message(name, installed))
+            return EXIT_USAGE
+        path = state_dir() / "config.toml"
+        backup = set_default_worker(path, canonical)
+        if args.json:
+            _emit_json({"default_worker": canonical, "config": str(path), "backup": str(backup) if backup else None})
+        else:
+            print(f"Default worker model set to {canonical}")
+            print(f"Config: {path}" + (f" (previous saved to {backup})" if backup else ""))
+        return EXIT_OK
     if not manager.api_available():
         _err(f"Ollama is not reachable at {manager.url}. Run `nedster setup`.")
         return EXIT_NOT_READY
-    models = manager.list_models()
+    worker = config.models.coder if config.models.coder != "auto" else "nedster-worker"
+    show_all = bool(getattr(args, "all", False))
+    rows = list_installed_models(manager, worker, include_embedding=show_all)
     if args.json:
-        _emit_json({"models": models})
+        # `models` stays a list of names (machine contract); `installed` adds the details.
+        _emit_json({"models": [row.name for row in rows], "current": worker, "installed": [asdict(row) for row in rows]})
+    elif args.plain:
+        for row in rows:
+            print(f"{row.name}{'  (embedding)' if row.embedding else ''}")
     else:
-        for model in models:
-            print(model)
+        print(f"{'':2}{'model':<30}{'size':>9}  {'params':>7}  {'quant':>8}  {'context':>8}")
+        for row in rows:
+            mark = "*" if row.current else " "
+            tag = "  (embedding)" if row.embedding else ""
+            print(
+                f"{mark:2}{row.name:<30}{row.size_label():>9}  {row.parameter_size or '?':>7}  "
+                f"{row.quantization or '?':>8}  {row.context_label():>8}{tag}"
+            )
+        print(f"{len(rows)} model(s) installed · current: {worker}")
+        if not show_all:
+            print("Embedding models are hidden; `nedster models list --all` shows them.")
+        print("Switch this session with /models, or persist with: nedster models use <name>")
     return EXIT_OK
 
 
@@ -655,10 +702,11 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> 
             data = event.data
             _err(f"  {data.get('tool')} -> {data.get('status')} ({data.get('elapsed_ms', 0):.0f} ms)")
 
+    model = _validate_requested_model(args.model, config)
     session = NativeSession(
         config,
         emit=emit,
-        model=args.model,
+        model=model,
         session_id=args.session,
         resume_latest=args.resume_latest,
         title=getattr(args, "name", "") or "",
@@ -678,6 +726,7 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> 
         if heartbeat is not None:
             heartbeat.close()  # releases the lock; before aclose() closes the store
         await session.aclose()
+    _report_model_transport_error(result, model)
     if args.json:
         payload = asdict(result)
         payload["outcome"] = result.outcome.value
@@ -688,6 +737,44 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> 
         print(result.answer)
         _err(f"[{result.outcome.value} · session {session.session_id[:SHORT_ID]}]")
     return EXIT_OK if result.passed else EXIT_RUNTIME
+
+
+def _installed_model_names(config: Any) -> list[str] | None:
+    """Installed names, or None when Ollama cannot be reached (validation is skipped, not failed)."""
+    import httpx
+
+    from .model_manager import OllamaManager
+
+    manager = OllamaManager(config.models.ollama_url)
+    try:
+        return manager.list_models() if manager.api_available() else None
+    except httpx.HTTPError:
+        return None
+
+
+def _validate_requested_model(model: str | None, config: Any) -> str | None:
+    """Reject `run --model X` when X is not installed; keep the configured model on a typo."""
+    if not model:
+        return model
+    from .model_manager import match_installed_model, model_not_installed_message
+
+    installed = _installed_model_names(config)
+    if installed is None:
+        return model  # endpoint offline: let the run surface the transport error itself
+    canonical = match_installed_model(model, installed)
+    if canonical is None:
+        raise UsageError(model_not_installed_message(model, installed))
+    return canonical
+
+
+def _report_model_transport_error(result: Any, model: str) -> None:
+    """Map a transport 404/not-found onto the same actionable message as a typo."""
+    from .model_manager import is_model_missing_error, model_not_installed_message
+
+    if result.outcome.value != "failed" or not model:
+        return
+    if any(is_model_missing_error(str(reason)) for reason in result.reasons):
+        _err(model_not_installed_message(model, []))
 
 
 def _verify_ledger(args: argparse.Namespace) -> int:

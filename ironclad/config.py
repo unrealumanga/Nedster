@@ -72,6 +72,8 @@ class RuntimeConfig:
     context_tokens: int = 0  # engine context budget; 0 = the worker model's num_ctx (from Ollama), else 32768
     max_steps: int = 40  # model calls per run; 0 = no limit
     max_tool_calls: int = 120  # tool calls per run; 0 = no limit
+    notify: str = "bell"  # completion notice in the TUI: "off" | "bell" | "osc9"
+    notify_after_s: float = 15.0  # only turns longer than this notify (seconds)
 
 
 @dataclass(slots=True)
@@ -165,6 +167,11 @@ def _coerce(current: Any, value: Any, key: str) -> Any:
             return int(value)
         except (TypeError, ValueError):
             raise ValueError(f"{key}: expected an integer, got {value!r}") from None
+    if isinstance(current, float):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key}: expected a number, got {value!r}") from None
     if isinstance(current, list):
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
