@@ -239,6 +239,7 @@ class Engine:
         # ``owner_guard(session_id)``: False once this process no longer owns the session's lock. Checked
         # before every tool dispatch and every persisted message; a lost lock ends the run as cancelled.
         self.owner_guard: Callable[[str], bool] | None = None
+        self._late: dict[str, ToolResult] = {}  # call id -> result of a job that finished while being cancelled
 
     # ------------------------------------------------------------------ public API
 
@@ -296,6 +297,9 @@ class Engine:
         if self._role.read_only:  # a read-only role can only inspect/answer; never a change request
             run.intent = Intent.QUESTION
         session.state.intent = run.intent.value
+        set_commit_guard = getattr(self.tools, "set_commit_guard", None)
+        if callable(set_commit_guard):  # file commits re-check ownership right before writing
+            set_commit_guard((lambda: self._owns(session)) if self.owner_guard is not None else None)
         self._in_turn = True
         try:
             self._event("turn.started", session, run, {"user_text": user_text})
@@ -617,7 +621,18 @@ class Engine:
         elif call.name == DECLARE_NO_CHANGE:
             result = declare_no_change_result(call.arguments, call.id)
         else:
-            result = await self._start_and_wait(self._runtime_call(call))
+            try:
+                result = await self._start_and_wait(self._runtime_call(call))
+            except asyncio.CancelledError:
+                # A mutation that completed while being cancelled is still a change: record it so
+                # changed_paths and "Changed files:" stay truthful (the record is in memory only).
+                late = self._late.pop(call.id, None)
+                if late is not None and late.status is ToolStatus.OK and late.mutated_paths:
+                    record = ToolRecord(call, late, before, self.tools.revision(), mutating, False)
+                    run.records.append(record)
+                    session.records.append(record)
+                    session.state.note_record(record)
+                raise
         record = ToolRecord(call, result, before, self.tools.revision(), mutating, validation)
         run.records.append(record)
         session.records.append(record)
@@ -661,7 +676,9 @@ class Engine:
         try:
             return await handle.wait()
         except asyncio.CancelledError:
-            await self._stop_job(handle)
+            late = await self._stop_job(handle)
+            if late is not None:
+                self._late[call.id] = late
             raise
         except Exception as exc:
             return ToolResult(call.id, call.name, ToolStatus.FAILED, f"tool runtime error: {exc}")
@@ -669,13 +686,15 @@ class Engine:
             self._running.discard(handle)
 
     @staticmethod
-    async def _stop_job(handle: JobHandle) -> None:
-        """Cancel and wait until the job has really stopped (bounded so a broken job cannot hang us)."""
+    async def _stop_job(handle: JobHandle) -> ToolResult | None:
+        """Cancel and wait until the job has really stopped (bounded so a broken job cannot hang us).
+
+        Returns the job's own result when it still finished (e.g. a file write already in progress)."""
         try:
             await asyncio.wait_for(handle.cancel(), JOB_STOP_TIMEOUT_S)
-            await asyncio.wait_for(handle.wait(), JOB_STOP_TIMEOUT_S)
+            return await asyncio.wait_for(handle.wait(), JOB_STOP_TIMEOUT_S)
         except Exception:  # best effort; the job reports its own failure
-            pass
+            return None
 
     # ------------------------------------------------------------------ context + persistence
 

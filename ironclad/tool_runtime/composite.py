@@ -156,6 +156,14 @@ class CompositeToolRuntime:
         self._role_name = name
         self._allowed_tools = frozenset(allowed_tools) if allowed_tools is not None else None
 
+    def set_commit_guard(self, guard: Callable[[], bool] | None) -> None:
+        """Forward the session-ownership guard to every tool group with a single commit point (file
+        writes/edits). Execution jobs have no such point: losing the lock cancels (kills) them instead."""
+        for tools in self._sync_groups:
+            setter = getattr(tools, "set_commit_guard", None)
+            if callable(setter):
+                setter(guard)
+
     def invalidate_after_undo(self, paths: Iterable[str] = ()) -> None:
         """Call after a successful undo (CheckpointStore.on_undone): forgets read-before-edit hashes and bumps
         the workspace revision so earlier validation evidence is no longer fresh."""

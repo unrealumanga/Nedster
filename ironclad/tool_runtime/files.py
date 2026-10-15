@@ -66,6 +66,13 @@ class MutationJournal(Protocol):
     def record_pre_image(self, rel: str, path: Path) -> None: ...
 
 
+LOCK_LOST_REFUSAL = "session lock lost: nothing was written"
+
+
+class CommitRefused(Exception):
+    """The commit guard said this process no longer owns the session: the write is refused."""
+
+
 class ToolError(Exception):
     """Argument/scope problem. Mapped to ToolStatus.INVALID; nothing was executed."""
 
@@ -364,6 +371,10 @@ class FileTools:
         self._own_writes: dict[str, tuple[str, str]] = {}  # rel -> (sha256 we wrote, HH:MM:SS)
         self.journal = journal
         self.mutation_lock: Any = journal.mutation_lock if journal is not None else threading.RLock()
+        # ``commit_guard()``: False once the session lock is lost. Checked immediately before the actual
+        # write/replace (and before the journal's pre-image), so a call dispatched before the loss but
+        # committing after it writes nothing.
+        self.commit_guard: Callable[[], bool] | None = None
         self._schemas: dict[str, Mapping[str, Any]] = {
             READ_FILE: READ_SCHEMA,
             WRITE_FILE: WRITE_SCHEMA,
@@ -421,6 +432,8 @@ class FileTools:
             return ToolResult(call.id, call.name, ToolStatus.INVALID, "\n".join(errors))
         try:
             return handler(call)
+        except CommitRefused:
+            return ToolResult(call.id, call.name, ToolStatus.DENIED, LOCK_LOST_REFUSAL)
         except ToolError as exc:
             return ToolResult(call.id, call.name, ToolStatus.INVALID, str(exc))
         except OSError as exc:
@@ -447,6 +460,27 @@ class FileTools:
             return data.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ToolError(f"binary file (not valid UTF-8): {rel}") from exc
+
+    def set_commit_guard(self, guard: Callable[[], bool] | None) -> None:
+        self.commit_guard = guard
+
+    def _check_commit(self) -> None:
+        """Last ownership check before a mutation commits.
+
+        Residual window: the check and the write/rename are not one atomic step, so a lock lost in the
+        instant between this check and ``os.replace``/``open(x)`` can still let that one write land. The
+        engine then reports it (``changed_paths``) because the tool's result is recorded even after a
+        cancel; nothing after it is dispatched or persisted.
+        """
+        guard = self.commit_guard
+        if guard is None:
+            return
+        try:
+            owned = bool(guard())
+        except Exception:  # noqa: BLE001 - an unverifiable lock is a lost lock
+            owned = False
+        if not owned:
+            raise CommitRefused(LOCK_LOST_REFUSAL)
 
     def _journal_before(self, located: Located) -> None:
         if self.journal is not None:
@@ -542,12 +576,14 @@ class FileTools:
                     f"no change: {located.rel} already has this content, sha256:{digest[:16]}",
                     {"sha256": digest, "sha": digest[:16], "created": False},
                 )
+            self._check_commit()
             self._journal_before(located)
             atomic_replace(target, payload, stat.S_IMODE(target.stat().st_mode))
         else:
             if expected:
                 raise ToolError("file changed since read / read it first")
             payload = content.encode("utf-8")
+            self._check_commit()
             self._journal_before(located)
             target.parent.mkdir(parents=True, exist_ok=True)
             try:
@@ -620,6 +656,7 @@ class FileTools:
                 f"no change: replacement produced identical content, sha256:{digest[:16]}",
                 {"sha256": digest, "sha": digest[:16]},
             )
+        self._check_commit()
         self._journal_before(located)
         atomic_replace(located.path, payload, stat.S_IMODE(located.path.stat().st_mode))
         new_digest = sha256_hex(payload)

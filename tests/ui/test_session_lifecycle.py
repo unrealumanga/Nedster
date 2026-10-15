@@ -485,3 +485,80 @@ async def test_engine_guard_blocks_persisting_and_dispatch_once_ownership_is_los
         assert [m.content for m in core.store.messages(a)] == ["alpha", "reply to alpha", "write it"]
     finally:
         await core.aclose()
+
+
+# --- re-check 3 B3: the lock is lost while a file tool is already executing -----------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bypass_commit_guard", [False, True], ids=["commit-guard", "write-already-started"])
+async def test_lock_lost_while_a_file_write_is_executing(tmp_path, monkeypatch, bypass_commit_guard):
+    import threading
+
+    from ironclad.engine.loop import Engine
+    from ironclad.tool_runtime.files import FileTools
+
+    config = _config(tmp_path)
+    (a,) = _seed(config, "alpha")
+    after = Path(config.runtime.project_root) / "after-loss.txt"
+    entered, release = threading.Event(), threading.Event()
+    results: list[Any] = []
+    finished: list[Any] = []
+    original_write, original_run, original_finish = FileTools._write_locked, FileTools.run, Engine._finish
+
+    def paused_write(self: Any, call_: Any) -> Any:  # after dispatch, before the write
+        entered.set()
+        assert release.wait(10)
+        return original_write(self, call_)
+
+    def recording_run(self: Any, call_: Any) -> Any:
+        result = original_run(self, call_)
+        results.append(result)
+        return result
+
+    def recording_finish(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = original_finish(self, *args, **kwargs)
+        finished.append(result)
+        return result
+
+    monkeypatch.setattr(FileTools, "_write_locked", paused_write)
+    monkeypatch.setattr(FileTools, "run", recording_run)
+    monkeypatch.setattr(Engine, "_finish", recording_finish)
+    if bypass_commit_guard:  # simulate a write that had already passed the commit check
+        monkeypatch.setattr(FileTools, "_check_commit", lambda self: None)
+
+    factory = _Factory(
+        [Turn(calls=[call("write_file", "w1", path="after-loss.txt", content="late\n")]), Turn("done")],
+        session_id=a,
+        lazy=False,
+    )
+    app = _app(config, factory)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await ready(pilot, app)
+        app.submit_text("write after-loss.txt")
+        await wait_for(pilot, entered.is_set)
+        persisted = _contents(config, a)
+
+        other = _expire_and_take_over(config, a)
+        app._last_lock_refresh = 0.0
+        app._heartbeat_lock()  # detects the loss and cancels the running turn
+        assert app._locked is None
+        await pilot.pause()
+        release.set()  # the worker resumes and reaches the commit point
+        await wait_for(pilot, lambda: not app.busy and app.status_bar.state == "idle")
+
+        assert app._turn_outcome == "cancelled"
+        assert _contents(config, a) == persisted  # nothing persisted after the loss
+        assert app.session.store.lock_info(a)["owner"] == other
+        answer = app.session.core.engine.last_answer
+        (result,) = finished
+        if bypass_commit_guard:
+            assert after.read_text() == "late\n"
+            assert result.changed_paths == ("after-loss.txt",)
+            assert "Changed files: after-loss.txt" in answer
+        else:
+            assert not after.exists()
+            assert [r.status.value for r in results] == ["denied"]
+            assert results[0].output == "session lock lost: nothing was written"
+            assert result.changed_paths == ()
+            assert "Changed files: none" in answer
