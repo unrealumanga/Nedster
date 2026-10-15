@@ -9,11 +9,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from ironclad.contracts import ChatMessage
-from ironclad.session_store.sqlite_store import SqliteSessionStore, make_owner
+from ironclad.session_store.sqlite_store import MIN_PREFIX_CHARS, SqliteSessionStore, make_owner
 from nedster_agent.cli import EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, main
 
 
@@ -131,7 +132,8 @@ def test_sessions_show_human_prints_roles_and_the_stored_text(clean_env, capsys)
 
 def test_sessions_delete_unknown_id_is_a_usage_error(clean_env, capsys):
     assert main(["sessions", "delete", "deadbeef", "--project", str(clean_env)]) == EXIT_USAGE
-    assert "no session matches" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "No session matches 'deadbeef' in this project. Run: nedster sessions list" in err
 
 
 def test_sessions_delete_prefix_must_be_unique(clean_env, capsys):
@@ -256,6 +258,181 @@ def test_sessions_show_marks_a_session_another_window_is_using(clean_env, capsys
     cleanup = _store(clean_env)
     cleanup.release_lock(session, owner)
     cleanup.close()
+
+
+# --- BP1-S1: one project-bound session resolver ------------------------------------------------
+
+
+def _counts(clean_env) -> tuple[int, int]:
+    connection = sqlite3.connect(Path(clean_env) / "data" / "sessions.sqlite3")
+    try:
+        sessions = connection.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        messages = connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    finally:
+        connection.close()
+    return int(sessions), int(messages)
+
+
+def test_resolve_session_accepts_prefix_and_exact_title_and_searches_all(clean_env):
+    store = _store(clean_env)
+    ids = [store.create(_root(clean_env), f"title {index}") for index in range(25)]
+    oldest = ids[0]
+    assert oldest not in {entry["id"] for entry in store.list_sessions(_root(clean_env))}
+    assert store.resolve_session(_root(clean_env), oldest)["id"] == oldest
+    assert store.resolve_session(_root(clean_env), oldest[:MIN_PREFIX_CHARS])["id"] == oldest
+    assert store.resolve_session(_root(clean_env), "Title 7")["id"] == ids[7]
+    store.close()
+
+
+def test_resolve_session_reports_unknown_ambiguous_and_foreign(clean_env):
+    from ironclad.session_store.sqlite_store import (
+        SessionAmbiguous,
+        SessionForeignProject,
+        SessionNotFound,
+    )
+
+    other = clean_env / "other-project"
+    other.mkdir()
+    store = _store(clean_env)
+    store.create(_root(clean_env), "duplicate")
+    store.create(_root(clean_env), "duplicate")
+    foreign = store.create(str(other.resolve()), "elsewhere")
+    with pytest.raises(SessionNotFound):
+        store.resolve_session(_root(clean_env), "deadbeef")
+    with pytest.raises(SessionAmbiguous) as ambiguous:
+        store.resolve_session(_root(clean_env), "duplicate")
+    assert "matches 2 sessions" in str(ambiguous.value)
+    with pytest.raises(SessionForeignProject):
+        store.resolve_session(_root(clean_env), foreign)
+    store.close()
+
+
+def test_sessions_show_and_delete_accept_a_unique_prefix(clean_env, capsys):
+    store, session = _seed(clean_env, _root(clean_env), title="inspect me")
+    store.append_transcript(session, "user", "hello")
+    store.close()
+
+    assert main(["sessions", "show", session[:6], "--project", str(clean_env)]) == EXIT_OK
+    assert f"session     {session}" in capsys.readouterr().out
+    assert main(["sessions", "delete", session[:6], "--project", str(clean_env)]) == EXIT_OK
+    after = _store(clean_env)
+    assert after.get_session(session) is None
+    after.close()
+
+
+def test_sessions_show_and_delete_accept_an_exact_title(clean_env, capsys):
+    store, session = _seed(clean_env, _root(clean_env), title="Fix the range bug")
+    store.append_transcript(session, "user", "hello")
+    store.close()
+
+    assert main(["sessions", "show", "fix the range bug", "--project", str(clean_env)]) == EXIT_OK
+    assert f"session     {session}" in capsys.readouterr().out
+    assert main(["sessions", "delete", "Fix the range bug", "--project", str(clean_env)]) == EXIT_OK
+    assert f"Deleted session {session}." in capsys.readouterr().out
+
+
+def test_sessions_ambiguous_title_lists_candidates_and_writes_nothing(clean_env, capsys):
+    store = _store(clean_env)
+    first = store.create(_root(clean_env), "duplicate")
+    second = store.create(_root(clean_env), "duplicate")
+    store.close()
+    before = _counts(clean_env)
+
+    assert main(["sessions", "delete", "duplicate", "--project", str(clean_env)]) == EXIT_USAGE
+    err = capsys.readouterr().err
+    assert "matches 2 sessions" in err
+    assert first[:8] in err and second[:8] in err
+    assert _counts(clean_env) == before
+
+
+def test_sessions_foreign_id_is_a_usage_error_and_writes_nothing(clean_env, capsys):
+    other = clean_env / "other-project"
+    other.mkdir()
+    store = _store(clean_env)
+    _seed(clean_env, _root(clean_env))
+    foreign = store.create(str(other.resolve()), "elsewhere")
+    store.close()
+    before = _counts(clean_env)
+
+    assert main(["sessions", "show", foreign, "--project", str(clean_env)]) == EXIT_USAGE
+    assert "belongs to another project" in capsys.readouterr().err
+    assert main(["sessions", "delete", foreign, "--project", str(clean_env)]) == EXIT_USAGE
+    assert "belongs to another project" in capsys.readouterr().err
+    assert _counts(clean_env) == before
+    after = _store(clean_env)
+    assert after.get_session(foreign) is not None
+    after.close()
+
+
+def test_run_session_and_continue_are_mutually_exclusive(clean_env, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["run", "--session", "deadbeef", "--continue", "--project", str(clean_env), "hi"])
+    assert exit_info.value.code == EXIT_USAGE
+    assert "not allowed with" in capsys.readouterr().err
+
+
+def test_run_session_prefix_resolves_to_the_full_id(clean_env, capsys):
+    store, session = _seed(clean_env, _root(clean_env), title="resume me")
+    store.close()
+    seen: dict[str, str | None] = {}
+
+    class _FakeSession:
+        def __init__(self, config, *, emit=None, model=None, session_id=None, resume_latest=False, **_):
+            seen["session_id"] = session_id
+            self.session_id = session_id
+
+        async def run(self, text, *, intent=None):
+            from ironclad.contracts import AcceptanceResult, Outcome
+
+            return AcceptanceResult(outcome=Outcome.ANSWERED, answer="ok")
+
+        async def aclose(self): ...
+
+    with patch("ironclad.native.NativeSession", _FakeSession):
+        assert main(["run", "--session", session[:8], "--project", str(clean_env), "hi"]) == EXIT_OK
+    assert seen["session_id"] == session
+    assert capsys.readouterr().out == "ok\n"
+
+
+def test_run_unknown_session_exits_2_and_writes_nothing(clean_env, capsys):
+    store, _ = _seed(clean_env, _root(clean_env), title="the only one")
+    store.close()
+    before = _counts(clean_env)
+
+    assert main(["run", "--session", "deadbeef", "--project", str(clean_env), "hi"]) == EXIT_USAGE
+    assert "No session matches 'deadbeef'" in capsys.readouterr().err
+    assert _counts(clean_env) == before
+
+
+def test_run_foreign_session_exits_2_and_writes_nothing(clean_env, capsys):
+    other = clean_env / "other-project"
+    other.mkdir()
+    store, _ = _seed(clean_env, _root(clean_env))
+    foreign = store.create(str(other.resolve()), "elsewhere")
+    store.close()
+    before = _counts(clean_env)
+
+    assert main(["run", "--session", foreign, "--project", str(clean_env), "hi"]) == EXIT_USAGE
+    assert "belongs to another project" in capsys.readouterr().err
+    assert _counts(clean_env) == before
+
+
+def test_run_session_locked_elsewhere_exits_1_and_writes_nothing(clean_env, capsys):
+    store, session = _seed(clean_env, _root(clean_env), title="busy")
+    store.append_message(session, ChatMessage(role="user", content="in flight"))
+    owner = make_owner("tui")
+    assert store.acquire_lock(session, owner)
+    store.close()
+    before = _counts(clean_env)
+
+    assert main(["run", "--session", session[:8], "--project", str(clean_env), "hi"]) == EXIT_RUNTIME
+    err = capsys.readouterr().err
+    assert f"Session {session[:8]} is active in another Nedster. Close it there and retry." in err
+    assert _counts(clean_env) == before
+    after = _store(clean_env)
+    assert len(after.messages(session)) == 1
+    after.release_lock(session, owner)
+    after.close()
 
 
 def test_cli_sessions_parsing_stays_lazy():

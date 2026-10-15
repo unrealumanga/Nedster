@@ -139,7 +139,10 @@ class NativeSession:
         self.checkpoints = CheckpointStore(db_path)
         self.recovery_notes = self.checkpoints.recover()
         root = str(self.project_root)
-        if session_id is None and resume_latest:
+        if session_id is not None:
+            # A full id, a unique prefix or an exact title, scoped to this project (F01/F02/F07).
+            session_id = str(self.store.resolve_session(root, session_id)["id"])
+        elif resume_latest:
             session_id = self.store.latest_session(root)
         self.session_id = session_id or self.store.create(root, title)
         self.model = worker_model(config, model)

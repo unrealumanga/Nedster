@@ -18,9 +18,16 @@ from . import __version__
 
 EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, EXIT_NOT_READY = 0, 1, 2, 3
 
+#: Characters of a session id shown in human output (one length on every surface).
+SHORT_ID = 8
+
 
 class UsageError(Exception):
     """Bad invocation (exit 2)."""
+
+
+class SessionActive(RuntimeError):
+    """Another live Nedster holds the session's activity lock (exit 1)."""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -88,8 +95,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="What a successful run must do: change files, or only answer (default: inferred from the objective)",
     )
-    run.add_argument("--continue", dest="resume_latest", action="store_true", help="Continue the latest session here")
-    run.add_argument("--session", default=None, help="Continue a specific session id")
+    resume = run.add_mutually_exclusive_group()
+    resume.add_argument("--continue", dest="resume_latest", action="store_true", help="Continue the latest session here")
+    resume.add_argument(
+        "--session", default=None, help="Continue a session by id, unique id prefix or exact title"
+    )
     tui = subcommands.add_parser("tui", help="Open the interactive terminal interface")
     accept_global_options(tui)
     ledger = subcommands.add_parser("verify-ledger", help="Verify the local event chain")
@@ -445,8 +455,33 @@ def _read_objective(args: argparse.Namespace) -> str:
     return objective
 
 
+def _resolve_run_session(config: Any, ref: str) -> str:
+    """Resolve ``--session`` to one project session before any engine/store write.
+
+    Unknown, ambiguous and foreign references raise :class:`UsageError` (exit 2); a session
+    another live Nedster is using raises :class:`SessionActive` (exit 1). Nothing is written.
+    """
+    from ironclad.session_store.sqlite_store import SessionResolutionError, SqliteSessionStore
+
+    store = SqliteSessionStore(Path(config.runtime.state_dir) / "sessions.sqlite3")
+    try:
+        try:
+            session_id = str(store.resolve_session(str(config.runtime.project_root), ref)["id"])
+        except SessionResolutionError as exc:
+            raise UsageError(str(exc)) from exc
+        if store.is_active(session_id):
+            raise SessionActive(
+                f"Session {session_id[:SHORT_ID]} is active in another Nedster. Close it there and retry."
+            )
+        return session_id
+    finally:
+        store.close()
+
+
 async def _run_objective(args: argparse.Namespace, objective: str) -> int:
     config, _ = _resolve(args)
+    if args.session is not None:
+        args.session = _resolve_run_session(config, args.session)
     return await _run_native(args, config, objective)
 
 
@@ -482,7 +517,8 @@ class _SessionHeartbeat:
 
 
 def _lock_run_session(session: Any) -> _SessionHeartbeat | None:
-    """Take the activity lock for a CLI run; None (with a stderr note) when it cannot be held."""
+    """Take the activity lock for a CLI run; ``SessionActive`` (exit 1) when another live
+    Nedster holds it, so a lock conflict is refused instead of silently writing (F03)."""
     from ironclad.session_store.sqlite_store import make_owner
 
     store = getattr(session, "store", None)
@@ -496,8 +532,9 @@ def _lock_run_session(session: Any) -> _SessionHeartbeat | None:
     except Exception:  # noqa: BLE001 - never block a run on the lock layer
         return None
     if not acquired:
-        _err(f"[warning] session {session_id[:8]} is active in another Nedster; continuing anyway")
-        return None
+        raise SessionActive(
+            f"Session {session_id[:SHORT_ID]} is active in another Nedster. Close it there and retry."
+        )
     return _SessionHeartbeat(store, session_id, owner)
 
 
@@ -516,7 +553,11 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> 
     session = NativeSession(
         config, emit=emit, model=args.model, session_id=args.session, resume_latest=args.resume_latest
     )
-    heartbeat = _lock_run_session(session)
+    try:
+        heartbeat = _lock_run_session(session)
+    except SessionActive:
+        await session.aclose()
+        raise
     try:
         from ironclad.engine.intent import parse_expect
 
@@ -533,7 +574,7 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> 
         _emit_json(payload)
     elif not args.jsonl:
         print(result.answer)
-        _err(f"[{result.outcome.value} · session {session.session_id[:8]}]")
+        _err(f"[{result.outcome.value} · session {session.session_id[:SHORT_ID]}]")
     return EXIT_OK if result.passed else EXIT_RUNTIME
 
 
@@ -588,6 +629,10 @@ def _clip(text: str, limit: int = SHOW_ENTRY_CHARS) -> str:
     return flat if len(flat) <= limit else flat[: limit - 3] + "..."
 
 
+def _short(session_id: str) -> str:
+    return str(session_id)[:SHORT_ID]
+
+
 def _lock_label(lock: Any) -> str:
     if not lock:
         return "none"
@@ -599,14 +644,14 @@ def _lock_label(lock: Any) -> str:
 
 
 def _find_session(store: Any, project_root: Path, wanted: str) -> dict[str, Any]:
-    """Project-bound lookup: only sessions of *this* canonical root can be shown or deleted."""
-    sessions = store.list_sessions(str(project_root), limit=10_000)
-    matches = [entry for entry in sessions if str(entry["id"]).startswith(wanted)]
-    if not matches:
-        raise UsageError(f"no session matches {wanted!r} in this project ({project_root})")
-    if len(matches) > 1:
-        raise UsageError(f"{wanted!r} matches {len(matches)} sessions; give a longer id")
-    return matches[0]
+    """Project-bound lookup via the store's one resolver (id, prefix or title); a resolution
+    failure is a usage error (exit 2) before anything is shown, deleted or written."""
+    from ironclad.session_store.sqlite_store import SessionResolutionError
+
+    try:
+        return store.resolve_session(str(project_root), wanted)
+    except SessionResolutionError as exc:
+        raise UsageError(str(exc)) from exc
 
 
 def _sessions_list(args: argparse.Namespace, store: Any, project_root: Path) -> int:
@@ -624,10 +669,10 @@ def _sessions_list(args: argparse.Namespace, store: Any, project_root: Path) -> 
             flag = "active" if row["active"] else "-"
             print(f"{row['id']}\t{_stamp(row['updated_ns'])}\t{flag}\t{row['title']}")
         return EXIT_OK
-    print(f"{'id':<34}{'updated':<18}{'state':<9}title")
+    print(f"{'id':<10}{'updated':<18}{'state':<9}title")
     for row in rows:
         flag = "active" if row["active"] else ""
-        print(f"{row['id']:<34}{_stamp(row['updated_ns']):<18}{flag:<9}{row['title']}")
+        print(f"{_short(row['id']):<10}{_stamp(row['updated_ns']):<18}{flag:<9}{row['title']}")
     print(f"{len(rows)} session(s). Actions: nedster sessions show|delete <id>, nedster sessions prune --older-than DAYS")
     return EXIT_OK
 

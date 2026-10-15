@@ -32,6 +32,33 @@ SCHEMA_VERSION = 2
 #: A session counts as *active* while its lock heartbeat is younger than this.
 LOCK_TTL_S = 60.0
 
+#: Shortest id prefix ``resolve_session`` accepts; shorter refs must be an exact title.
+MIN_PREFIX_CHARS = 4
+#: How many ambiguous candidates the error message lists.
+MAX_AMBIGUOUS_SHOWN = 5
+#: Characters of a session id shown in human output (one length on every surface).
+SHORT_ID = 8
+
+
+class SessionResolutionError(LookupError):
+    """A session reference did not resolve to exactly one session of this project.
+
+    Subclasses ``LookupError`` so display layers that already handle that type keep working;
+    ``str()`` is a complete user-facing sentence.
+    """
+
+
+class SessionNotFound(SessionResolutionError):
+    """No session of this project matches the reference."""
+
+
+class SessionAmbiguous(SessionResolutionError):
+    """The reference matches several sessions of this project."""
+
+
+class SessionForeignProject(SessionResolutionError):
+    """The reference matches a session that belongs to a different project."""
+
 #: Synthetic result text for an assistant call that never produced one.
 #: Kept byte-identical to ``ironclad.engine.loop.INTERRUPTED``.
 INTERRUPTED_TEXT = "[cancelled] not completed: session was interrupted"
@@ -343,6 +370,85 @@ class SqliteSessionStore:
             "created_ns": row[3],
             "updated_ns": row[4],
         }
+
+    def resolve_session(self, project_root: str, ref: str) -> dict[str, Any]:
+        """Resolve ``ref`` to one session of ``project_root``.
+
+        Accepts a full id, a unique id prefix (at least :data:`MIN_PREFIX_CHARS`) or an exact
+        title (case-insensitive). Searches every session of the project, independent of any
+        display/list limit. Raises :class:`SessionResolutionError` (a ``LookupError``) whose
+        message is user-facing for: no match, ambiguity, or a reference that resolves to a
+        session of another project.
+        """
+        root = normalize_project_root(project_root)
+        wanted = (ref or "").strip()
+        needle = wanted.lower()
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT id, project_root, title, created_ns, updated_ns FROM sessions"
+                " ORDER BY updated_ns DESC, id DESC"
+            ).fetchall()
+        sessions = [
+            {
+                "id": row[0],
+                "project_root": row[1],
+                "title": row[2],
+                "created_ns": row[3],
+                "updated_ns": row[4],
+            }
+            for row in rows
+        ]
+        if wanted:
+            exact = next((s for s in sessions if str(s["id"]).lower() == needle), None)
+            if exact is not None:
+                if str(exact["project_root"]) != root:
+                    raise SessionForeignProject(self._foreign_message(exact))
+                return exact
+        mine = [s for s in sessions if str(s["project_root"]) == root]
+        if not wanted:
+            if len(mine) == 1:
+                return mine[0]
+            if mine:
+                raise SessionAmbiguous(self._ambiguous_message(ref, mine))
+            raise SessionNotFound(self._not_found_message(ref))
+        if len(wanted) >= MIN_PREFIX_CHARS:
+            prefixed = [s for s in mine if str(s["id"]).lower().startswith(needle)]
+            if len(prefixed) == 1:
+                return prefixed[0]
+            if prefixed:
+                raise SessionAmbiguous(self._ambiguous_message(ref, prefixed))
+        titled = [s for s in mine if str(s["title"]).strip().lower() == needle]
+        if len(titled) == 1:
+            return titled[0]
+        if titled:
+            raise SessionAmbiguous(self._ambiguous_message(ref, titled))
+        if len(wanted) >= MIN_PREFIX_CHARS:
+            foreign = [
+                s for s in sessions
+                if str(s["project_root"]) != root and str(s["id"]).lower().startswith(needle)
+            ]
+            if len(foreign) == 1:
+                raise SessionForeignProject(self._foreign_message(foreign[0]))
+        raise SessionNotFound(self._not_found_message(ref))
+
+    @staticmethod
+    def _not_found_message(ref: str) -> str:
+        return f"No session matches {ref!r} in this project. Run: nedster sessions list"
+
+    @staticmethod
+    def _foreign_message(session: Mapping[str, Any]) -> str:
+        return f"Session {str(session['id'])[:SHORT_ID]} belongs to another project, not this one."
+
+    @staticmethod
+    def _ambiguous_message(ref: str, matches: list[dict[str, Any]]) -> str:
+        lines = [
+            f"  {str(m['id'])[:SHORT_ID]}  {str(m['title']).strip() or 'Untitled conversation'}"
+            for m in matches[:MAX_AMBIGUOUS_SHOWN]
+        ]
+        return (
+            f"{ref!r} matches {len(matches)} sessions in this project; "
+            "use a longer id or the full title:\n" + "\n".join(lines)
+        )
 
     def state_keys(self, session_id: str) -> list[str]:
         with self._lock:

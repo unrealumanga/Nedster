@@ -22,7 +22,7 @@ from textual.widgets import Footer, OptionList, RichLog, Static
 
 from ironclad.config import NedsterConfig
 from ironclad.contracts import EngineEvent
-from ironclad.session_store.sqlite_store import make_owner
+from ironclad.session_store.sqlite_store import SHORT_ID, make_owner
 
 from .widgets.composer import Composer, History, project_files
 from .widgets.glyphs import Glyphs
@@ -425,22 +425,24 @@ class NedsterApp(App[None]):
         self._message("" if recovered else "Session lock lost - another Nedster may have taken over")
 
     def _resolve_session_id(self, wanted: str | None) -> str:
-        """Mirror of ``NativeSession.resume`` resolution, so the lock is taken *before* switching."""
+        """Resolve ``/resume`` so the lock is taken *before* switching.
+
+        An explicit ref goes through the store's one resolver (full id, unique prefix or exact
+        title, over every session); a bare ``/resume`` keeps the newest-session behaviour.
+        """
+        store = self._session_store()
+        resolver = getattr(store, "resolve_session", None)
+        if wanted is not None and callable(resolver):
+            return str(resolver(str(self.config.runtime.project_root), wanted)["id"])
         lister = getattr(self.session, "list_sessions", None)
         if lister is not None:
             sessions = list(lister())
         else:
-            store = self._session_store()
             store_lister = getattr(store, "list_sessions", None)
             sessions = list(store_lister(str(self.config.runtime.project_root))) if callable(store_lister) else []
         if not sessions:
             raise LookupError("no saved sessions for this project")
-        if wanted is None:
-            return str(sessions[0]["id"])
-        matches = [item for item in sessions if str(item.get("id", "")).startswith(wanted)]
-        if len(matches) != 1:
-            raise LookupError(f"no unique session matches {wanted!r}")
-        return str(matches[0]["id"])
+        return str(sessions[0]["id"])
 
     def _replay_session(self, session_id: str) -> None:
         """Rebuild the view from the stored display transcript, then warn that it is history."""
@@ -464,7 +466,7 @@ class NedsterApp(App[None]):
                     entries = list(read(session_id, RESUME_REPLAY_LIMIT))
                 except Exception as exc:  # noqa: BLE001
                     self._line(f"Could not read the transcript: {exc}", "warn")
-        self._line(f"Resumed session {session_id[:12]}", "accent")
+        self._line(f"Resumed session {session_id[:SHORT_ID]}", "accent")
         for widget in replay_widgets(self.glyphs, entries):
             self.transcript.add(widget)
         if not entries:
@@ -783,7 +785,7 @@ class NedsterApp(App[None]):
         self._acquire_lock(str(session_id))
         self.action_clear()
         self.changed_paths.clear()
-        self._line(f"New conversation {str(session_id)[:12]}", "accent")
+        self._line(f"New conversation {str(session_id)[:SHORT_ID]}", "accent")
         self._refresh_info()
 
     def _cmd_sessions(self, _args: list[str]) -> None:
@@ -802,14 +804,14 @@ class NedsterApp(App[None]):
             updated = item.get("updated_ns")
             when = datetime.fromtimestamp(int(updated) / 1e9).strftime("%Y-%m-%d %H:%M") if updated else ""
             marker = "*" if sid == current else " "
-            self._line(f" {marker} {sid[:12]}  {when}  {item.get('title') or ''}")
+            self._line(f" {marker} {sid[:SHORT_ID]}  {when}  {item.get('title') or ''}")
 
     def _cmd_resume(self, args: list[str]) -> None:
         resume = getattr(self.session, "resume", None)
         if resume is None:
             self._line("Resuming a saved session is not available with this session.", "warn")
             return
-        wanted = args[0] if args else None
+        wanted = " ".join(args) if args else None  # join so an exact title may contain spaces
         store = self._session_store()
         target: str | None = None
         if callable(getattr(store, "transcript", None)):
@@ -865,7 +867,7 @@ class NedsterApp(App[None]):
             ("model", f"{info.get('model', '')} ({info.get('provider', 'LOCAL')})"),
             ("context", f"{info.get('context_used', 0)}/{info.get('context_max', 0) or 'n/a'} tokens"),
             ("sandbox", label),
-            ("session", info.get("session_id", "")),
+            ("session", str(info.get("session_id", ""))[:SHORT_ID]),
             ("changed", f"{len(self.changed_paths)} file(s)"),
             ("queued", str(len(self.queue))),
             ("state", self.status_bar.state),

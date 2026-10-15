@@ -313,10 +313,7 @@ class _FakeNativeSession:
         if session_id is None:
             chosen = sessions[0]
         else:
-            matches = [s for s in sessions if str(s["id"]).startswith(session_id)]
-            if len(matches) != 1:
-                raise LookupError(f"no unique session matches {session_id!r}")
-            chosen = matches[0]
+            chosen = self.store.resolve_session(self.project_root, session_id)
         self.session_id = str(chosen["id"])
         return self.session_id
 
@@ -411,7 +408,47 @@ async def test_resume_unknown_id_warns_and_stays_put(tmp_path):
         app._command("/resume deadbeef")
         await _settle(pilot)
 
-        assert "no unique session matches" in _transcript(app)
+        assert "No session matches 'deadbeef' in this project." in _transcript(app)
+        assert app.session.session_id == current
+
+
+@pytest.mark.asyncio
+async def test_resume_resolves_a_session_beyond_the_list_limit(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        store = app.session.store
+        ids = [store.create(app.session.project_root, f"old {index}") for index in range(25)]
+        oldest = ids[0]
+        # the newest-20 page the TUI used to search never contains the oldest session
+        assert oldest not in {entry["id"] for entry in app.session.list_sessions()}
+
+        app._command(f"/resume {oldest[:8]}")
+        await _settle(pilot)
+
+        assert app.session.session_id == oldest
+        assert f"Resumed session {oldest[:8]}" in _transcript(app)
+        assert app.session.store.is_active(oldest) is True
+
+
+@pytest.mark.asyncio
+async def test_resume_by_title_and_unknown_message(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        store = app.session.store
+        named = store.create(app.session.project_root, "Fix the range bug")
+        store.append_transcript(named, "user", "fix it")
+
+        app._command("/resume Fix the range bug")
+        await _settle(pilot)
+        assert app.session.session_id == named
+        assert "fix it" in _transcript(app)
+
+        current = app.session.session_id
+        app._command("/resume no-such-session")
+        await _settle(pilot)
+        assert "No session matches 'no-such-session' in this project." in _transcript(app)
         assert app.session.session_id == current
 
 
