@@ -385,6 +385,34 @@ Small repos, one run each, one local model. Five runs ended `unvalidated`: the f
 there was no trusted passing test record afterwards, so Nedster did
 not call them completed. For comparison, the removed v3 engine scored 1/8 with one false success on a-h.
 
+### Companion suite (realistic tasks)
+
+`evals/companion/` holds 14 harder fixtures phrased the way a busy engineer types them: a bug from a pasted
+traceback, a rounding bug with no test, a 3-file feature, an 8-file rename with traps, one function in a 2,759-line
+file, a plain-JavaScript fix, writing tests that must catch hidden mutants, an O(n²) rewrite, an architecture
+question, a request about a setting that does not exist, a spec-to-module implementation, a CRLF/UTF-8 edit, a vague
+"clean it up", and an unusual vendored API. Every check fails on the untouched repo, passes a reference fix and
+rejects deliberately wrong fixes (`python evals/companion/validate.py`).
+
+```bash
+python -m evals.run --root evals/companion --model nedster-worker --repeat 2
+```
+
+On this release (`nedster-worker`, two runs per fixture): **23/28 passed, 1 false success** (an architecture answer
+that missed one required fact); about 14 s per task. Reliable: every bug-fix, feature, rename, large-file, JavaScript,
+encoding, test-writing and performance task. Not reliable yet:
+
+- **Vague destructive requests.** "Clean it up" deleted backups and notes in every run. Name exactly what may go.
+- **False premises.** Asked to change a setting that does not exist, it adds one instead of saying so. Add "if X does
+  not exist, say so and change nothing".
+- **Greenfield modules from a spec.** Its own new tests can pass while the spec is still violated; treat `completed`
+  as "the tests that ran passed", and review.
+
+With a precise brief (exact files, the shape of the change, the test command, what must not be touched) the
+false-premise, cleanup and library tasks passed 6/6. The opt-in personality (`runtime.soul = full`) showed no
+measurable change in correctness (22/28 vs 23/28 is run-to-run noise) at about 13% more generated tokens, so it stays
+off by default.
+
 ## Upgrading from v3
 
 - The v3 engine (router, planner, critic, grounding and claim gates, `ToolRegistry`) was removed. Native is the
