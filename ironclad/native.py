@@ -149,6 +149,7 @@ class NativeSession:
         root = str(self.project_root)
         name = normalize_title(title)
         self._admit = admit
+        self._role_override = role  # an explicit trusted role (CLI --role) wins over a saved one
         self._pending_title = ""  # stored when a lazily-created session is finally written
         self.started_new = False
         rename = ""  # an explicit --name for a resumed session, written only after admission
@@ -188,7 +189,8 @@ class NativeSession:
         self.checkpoints.on_undone.append(self.tools.invalidate_after_undo)
         self.transport = OllamaTransport(config.models.ollama_url)
         soul_mode = str(getattr(config.runtime, "soul", "off") or "off")
-        role_name = role or self._saved_role() or str(getattr(config.runtime, "role", "code") or "code")
+        self._default_role = str(getattr(config.runtime, "role", "code") or "code")
+        role_name = role or self._saved_role() or self._default_role
         self.engine = Engine(
             self.transport,
             self.tools,
@@ -287,22 +289,32 @@ class NativeSession:
             self._pending_title = ""
         return str(self.session_id)
 
-    def switch_session(self, session_id: str | None) -> None:
+    def switch_session(self, session_id: str | None, *, started_new: bool | None = None) -> None:
         """Make ``session_id`` the one conversation this session runs, records and checkpoints
         (None: a fresh lazily-created one). The TUI's /resume and /new go through here so the
-        adapter, the lock and the engine can never disagree about the current conversation."""
-        if session_id != self.session_id:
-            self._pending_title = ""
-            self.started_new = session_id is None
+        adapter, the lock and the engine can never disagree about the current conversation.
+
+        The destination's identity includes its role (S2): a resumed session gets back the role it
+        last ran under (and that role's runtime gate) before any submission; a new one gets the
+        configured default; an explicit ``role=`` override still wins."""
+        if session_id == self.session_id and started_new is None:
+            return
+        self._pending_title = ""
+        self.started_new = (session_id is None) if started_new is None else started_new
         self.session_id = session_id
+        self._restore_role()
+
+    def _restore_role(self) -> None:
+        wanted = self._role_override or self._saved_role() or self._default_role
+        if wanted != self.engine.role_name:
+            self.engine.set_role(wanted)  # refused while a turn runs: switching is idle-only
 
     def new_session(self, title: str = "") -> str:
         """Start (and persist) a new conversation and make it current."""
         created = self.store.create(str(self.project_root), normalize_title(title))
         if self._admit is not None:
             self._admit(self.store, created)
-        self.switch_session(created)
-        self.started_new = True
+        self.switch_session(created, started_new=True)
         return created
 
     def _auto_title(self, text: str) -> None:

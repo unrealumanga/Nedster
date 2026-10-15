@@ -256,3 +256,125 @@ async def test_resume_into_a_locked_session_keeps_the_current_one_and_its_lock(t
         _ids_agree(app, a)
     assert "still-a" in _contents(config, a)
     assert "still-a" not in _contents(config, b)
+
+
+# --- re-review B3: an expired lock taken over by another owner -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_expired_lock_taken_over_refuses_the_next_turn_and_persists_nothing(tmp_path):
+    import time
+
+    config = _config(tmp_path)
+    (a,) = _seed(config, "alpha")
+    factory = _Factory([Turn("must not run")], session_id=a, lazy=False)
+    app = _app(config, factory)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await ready(pilot, app)
+        _ids_agree(app, a)
+        connection = sqlite3.connect(Path(config.runtime.state_dir) / "sessions.sqlite3")
+        try:  # our heartbeat is 61 s old: the store now treats the lock as expired
+            connection.execute(
+                "UPDATE session_locks SET heartbeat_ns = ? WHERE session_id = ?",
+                (time.time_ns() - 61 * 1_000_000_000, a),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        other_store = _store(config)
+        other = make_owner("tui")
+        try:
+            assert other_store.acquire_lock(a, other)  # a second real owner takes the expired lock
+        finally:
+            other_store.close()
+        before = _dump(config)
+
+        app.submit_text("takeover-marker")  # before our next heartbeat
+        await pilot.pause()
+        await pilot.pause()
+
+        assert not app.busy
+        assert app._locked is None
+        assert app.query_one("#prompt").text == "takeover-marker"
+        assert "taken over by another Nedster" in app.transcript.plain_text()
+        assert factory.transport.requests == []
+        assert _dump(config) == before
+        assert app.session.store.lock_info(a)["owner"] == other
+    assert _contents(config, a) == ["alpha", "reply to alpha"]
+
+
+# --- re-review S2: in-app resume restores the destination session's saved role ------------------
+
+
+def _role_of(config: NedsterConfig, session_id: str) -> Any:
+    store = _store(config)
+    try:
+        return store.get_state(session_id, "role")
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_plan_session_from_code_session_restores_plan_and_its_gate(tmp_path):
+    config = _config(tmp_path)
+    a, p = _seed(config, "alpha", "planning")
+    store = _store(config)
+    store.set_state(a, "role", "code")
+    store.set_state(p, "role", "plan")
+    store.close()
+    target = Path(config.runtime.project_root) / "rng.py"
+    target.write_bytes(b"x = 1\n")
+    sha = hashlib.sha256(b"x = 1\n").hexdigest()[:16]
+    factory = _Factory(
+        [
+            Turn(calls=[call("edit_file", "e1", path="rng.py", old="x = 1", new="x = 2", expected_sha=sha)]),
+            Turn("Here is the plan."),
+            Turn("extra"),
+            Turn("extra"),
+        ],
+        session_id=a,
+        lazy=False,
+    )
+    app = _app(config, factory)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await ready(pilot, app)
+        assert app.session.info()["role"] == "code"
+
+        app._command(f"/resume {p}")
+        await pilot.pause()
+        _ids_agree(app, p)
+        assert app.session.info()["role"] == "plan"  # restored before any submission
+        await _turn(pilot, app, "change x to 2")
+        assert target.read_bytes() == b"x = 1\n"  # the write was denied by the plan gate
+        assert _role_of(config, p) == "plan"  # and the saved role stayed plan
+
+        app._command("/new")
+        await pilot.pause()
+        assert app.session.info()["role"] == "code"  # a new session gets the configured default
+        app._command(f"/resume {a}")
+        await pilot.pause()
+        assert app.session.info()["role"] == "code"
+
+        app.action_toggle_role()  # idle role changes persist immediately
+        await pilot.pause()
+        assert app.session.info()["role"] == "plan"
+        assert _role_of(config, a) == "plan"
+    assert _role_of(config, p) == "plan"
+
+
+def test_explicit_role_override_wins_over_the_saved_role_on_switch(tmp_path):
+    from ironclad.native import NativeSession as CoreSession
+
+    config = _config(tmp_path)
+    a, p = _seed(config, "alpha", "planning")
+    store = _store(config)
+    store.set_state(p, "role", "plan")
+    store.close()
+    core = CoreSession(config, session_id=a, role="code")
+    try:
+        core.switch_session(p)
+        assert core.engine.role_name == "code"
+    finally:
+        import asyncio
+
+        asyncio.run(core.aclose())

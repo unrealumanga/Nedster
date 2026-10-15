@@ -818,6 +818,17 @@ class _SessionHeartbeat:
             if not renewed:
                 return
 
+    def verify(self) -> None:
+        """Re-validate ownership in the store right before writing; ``SessionActive`` when lost."""
+        try:
+            owned = bool(self._store.refresh_lock(self._session_id, self._owner))
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            raise SessionActive(f"Could not verify the lock of session {self._session_id[:SHORT_ID]}: {exc}") from exc
+        if not owned:
+            raise SessionActive(
+                f"Session {self._session_id[:SHORT_ID]} was taken over by another Nedster. Nothing more was written."
+            )
+
     def close(self) -> None:
         self._stop.set()
         self._thread.join(timeout=5)
@@ -912,13 +923,15 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str, bri
     except SessionActive:
         await session.aclose()
         raise
-    if brief_path is not None:
-        path = Path(brief_path)
-        data = path.read_bytes()
-        session.note_brief(str(path), sha256(data).hexdigest())
     try:
         from ironclad.engine.intent import parse_expect
 
+        if heartbeat is not None:
+            heartbeat.verify()  # B3: ownership is re-checked in the store before the first write
+        if brief_path is not None:
+            path = Path(brief_path)
+            data = path.read_bytes()
+            session.note_brief(str(path), sha256(data).hexdigest())
         result = await session.run(objective, intent=parse_expect(getattr(args, "expect", None)))
     finally:
         prog.close()

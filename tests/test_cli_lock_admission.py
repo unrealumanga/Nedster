@@ -129,3 +129,33 @@ def test_run_refused_at_admission_exits_1_and_writes_nothing(clean_env, capsys, 
     assert code == EXIT_RUNTIME
     assert "is active in another Nedster" in capsys.readouterr().err
     assert _dump(clean_env) == before
+
+
+def test_run_heartbeat_verify_refuses_after_an_expired_lock_is_taken_over(clean_env):
+    import time
+
+    sid = _seed(clean_env)
+    store = _store(clean_env)
+    try:
+        heartbeat = _lock_run_session(store, sid)
+        assert heartbeat is not None
+        heartbeat.verify()  # still ours
+        connection = sqlite3.connect(clean_env / "data" / "sessions.sqlite3")
+        try:
+            connection.execute(
+                "UPDATE session_locks SET heartbeat_ns = ? WHERE session_id = ?",
+                (time.time_ns() - 61 * 1_000_000_000, sid),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        other_store = _store(clean_env)
+        try:
+            assert other_store.acquire_lock(sid, make_owner("tui"))
+        finally:
+            other_store.close()
+        with pytest.raises(SessionActive, match="taken over"):
+            heartbeat.verify()
+        heartbeat.close()
+    finally:
+        store.close()

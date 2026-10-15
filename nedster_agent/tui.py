@@ -143,6 +143,13 @@ class _WiredNativeSession(NativeSession):
     def undo_last(self) -> Any:
         return self.core.undo_last()
 
+    def set_role(self, name: str) -> None:
+        # Through the core: the accepted role is persisted with the session immediately (S2).
+        if self.core is None:
+            super().set_role(name)
+            return
+        self.core.set_role(name)
+
     def set_model(self, name: str) -> None:
         super().set_model(name)
         if self.core is None:
@@ -660,7 +667,20 @@ class NedsterApp(App[None]):
             self._line("No session to lock; the turn was not sent.", "warn")
             return False
         if self._locked is not None and self._locked[1] == session_id:
-            return True
+            # Never trust the cached lock: re-validate ownership in the store, atomically (an expired
+            # heartbeat may have let another Nedster take the session over since our last refresh).
+            refresh = getattr(store, "refresh_lock", None)
+            try:
+                owned = bool(refresh(session_id, self._lock_owner)) if callable(refresh) else True
+            except Exception as exc:  # noqa: BLE001 - shown; the turn is refused
+                self._line(f"Could not verify the session lock: {exc}", "warn")
+                return False
+            if owned:
+                self._last_lock_refresh = time.monotonic()
+                return True
+            self._locked = None  # ours no longer: never release (that would delete the new owner's lock)
+            self._line("This conversation was taken over by another Nedster.", "warn")
+            return False
         self._release_lock()  # held for another id: never let a turn run under a stale lock
         return self._acquire_lock(session_id)
 
@@ -1656,7 +1676,11 @@ class NedsterApp(App[None]):
         role = get_role(name)
         setter = getattr(self.session, "set_role", None) if self.session else None
         if setter is not None:
-            setter(name)
+            try:
+                setter(name)
+            except Exception as exc:  # noqa: BLE001 - e.g. the engine refuses while busy
+                self._line(f"Could not switch role: {exc}", "warn")
+                return
         info = self.session.info() if self.session else {}
         self.status_bar.set_info(info)
         self._line(f"Mode: {role.label} · read-only" if role.read_only else f"Mode: {role.label}", "accent")
