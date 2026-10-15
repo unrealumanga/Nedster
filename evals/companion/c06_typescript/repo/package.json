@@ -1,0 +1,9 @@
+{
+  "name": "mini-cart",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/cart.js",
+  "scripts": {
+    "test": "node --test"
+  }
+}

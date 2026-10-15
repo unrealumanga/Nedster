@@ -115,11 +115,17 @@ class CompositeToolRuntime:
         resolve_argv: Any = None,
         journal: Any = None,
         fingerprint: Callable[[], Snapshot] | None = None,
+        role: str = "",
+        allowed_tools: Iterable[str] | None = None,
     ):
         self._journal = journal
         self._sync_groups = tuple(sync_tools := tuple(sync_tools))
         self._policy = policy
         self._resolve_argv = resolve_argv
+        self._role_name = role
+        self._allowed_tools: frozenset[str] | None = (
+            frozenset(allowed_tools) if allowed_tools is not None else None
+        )
         self._owners: dict[str, tuple[str, Any]] = {}
         self._specs: dict[str, ToolSpec] = {}
         for kind, group in (("sync", sync_tools), ("job", job_tools)):
@@ -141,6 +147,22 @@ class CompositeToolRuntime:
 
     def revision(self) -> WorkspaceRevision:
         return self._revision
+
+    def set_role(self, name: str, allowed_tools: Iterable[str] | None) -> None:
+        """Restrict dispatch to ``allowed_tools`` for role ``name`` (``None`` = no role restriction).
+
+        Only ever removes tools: the policy gate still runs afterwards, so a role can never widen permissions.
+        """
+        self._role_name = name
+        self._allowed_tools = frozenset(allowed_tools) if allowed_tools is not None else None
+
+    def set_commit_guard(self, guard: Callable[[], bool] | None) -> None:
+        """Forward the session-ownership guard to every tool group with a single commit point (file
+        writes/edits). Execution jobs have no such point: losing the lock cancels (kills) them instead."""
+        for tools in self._sync_groups:
+            setter = getattr(tools, "set_commit_guard", None)
+            if callable(setter):
+                setter(guard)
 
     def invalidate_after_undo(self, paths: Iterable[str] = ()) -> None:
         """Call after a successful undo (CheckpointStore.on_undone): forgets read-before-edit hashes and bumps
@@ -194,6 +216,9 @@ class CompositeToolRuntime:
         self._revision = self._revision.bump(tuple(paths))
 
     def _authorize(self, call: ToolCall) -> tuple[ToolStatus, str] | None:
+        if self._allowed_tools is not None and call.name not in self._allowed_tools:
+            # Enforced at dispatch, not only in the prompt: a role can only remove tools.
+            return ToolStatus.DENIED, f"{call.name} is not allowed in {self._role_name} mode"
         policy = self._policy
         if policy is None:
             return None

@@ -56,7 +56,15 @@ from ironclad.engine.context import (
     tool_message,
 )
 from ironclad.engine.intent import Intent, classify
-from ironclad.engine.prompt import build_system_prompt, project_facts
+from ironclad.engine.prompt import (
+    ProjectInstructions,
+    SoulText,
+    build_system_prompt,
+    project_facts,
+    session_instructions,
+    session_soul,
+)
+from ironclad.engine.roles import Role, get_role
 from ironclad.engine.state import Budget, TaskState, ToolRecord
 
 REPEAT_LIMIT = 3
@@ -66,6 +74,7 @@ EVENT_DATA_KEYS = ("exit_code", "tests_run", "tests_failed", "diff", "backend", 
 VALIDATABLE_TOOLS = acceptance.FLAGGABLE_TOOLS
 TRUNCATED = ("length", "error")  # done reasons whose tool calls may be cut off: never executed
 COMPACTION_STATE = "compaction_state"  # session state: {"compactions": n, "summary": SummaryData.to_dict()}
+ROLE_STATE = "role"  # session state: the role the session last ran under (restored on resume)
 CONTEXT_EXHAUSTED = "context budget exhausted: the request cannot fit the model window even after compaction"
 COMPACTED: EventKind = cast(EventKind, "context.compacted")  # proposed addition to contracts.EventKind
 JOB_STOP_TIMEOUT_S = 10.0
@@ -84,6 +93,9 @@ class _Session:
     state: TaskState
     vault: OutputVault
     context: ContextManager
+    facts: dict[str, str] = field(default_factory=dict)  # kept so a role switch can re-render the prefix
+    instructions: ProjectInstructions = field(default_factory=ProjectInstructions)
+    soul: SoulText = field(default_factory=SoulText)
     records: list[ToolRecord] = field(default_factory=list)  # all runs, for task state
     compactions: int = 0  # every compaction (mask or whole-group), persisted so a restart keeps counting
 
@@ -138,6 +150,19 @@ def _groups(calls: Sequence[ToolCall], mutating: Callable[[ToolCall], bool]) -> 
 
 
 INTERRUPTED = "[cancelled] not completed: session was interrupted"
+LOCK_LOST = "session lock lost"
+
+
+class OwnershipLost(Exception):
+    """The session's activity lock is no longer ours: nothing more may be dispatched or persisted."""
+
+
+def _ownership_lost(exc: BaseException) -> bool:
+    if isinstance(exc, OwnershipLost):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_ownership_lost(inner) for inner in exc.exceptions)
+    return False
 
 
 def repair_history(history: Sequence[ChatMessage]) -> list[ChatMessage]:
@@ -184,6 +209,8 @@ class Engine:
         temperature: float | None = None,
         completion_reserve_tokens: int | None = None,
         auto_verify: int = 2,
+        soul: str = "off",
+        role: str = "code",
     ) -> None:
         self.transport = transport
         self.tools = tools
@@ -197,12 +224,22 @@ class Engine:
         self.temperature = temperature
         self.completion_reserve_tokens = completion_reserve_tokens
         self.auto_verify = max(0, auto_verify)  # max engine-run validations per run when the model skips them
+        self.soul_mode = soul
+        self._role: Role = get_role(role)
+        self._apply_role()
         self.last_answer = ""
+        self.instructions: ProjectInstructions = ProjectInstructions()
+        self.soul: SoulText = SoulText()
         self._sessions: dict[str, _Session] = {}
         self._running: set[JobHandle] = set()
         self._task: asyncio.Task[Stop] | None = None
+        self._in_turn = False  # True for the whole of run(): the role is frozen while it is set
         self._augmented: set[str] = set()
         self._validating: set[str] = set()
+        # ``owner_guard(session_id)``: False once this process no longer owns the session's lock. Checked
+        # before every tool dispatch and every persisted message; a lost lock ends the run as cancelled.
+        self.owner_guard: Callable[[str], bool] | None = None
+        self._late: dict[str, ToolResult] = {}  # call id -> result of a job that finished while being cancelled
 
     # ------------------------------------------------------------------ public API
 
@@ -215,23 +252,77 @@ class Engine:
         """Current active context (system, pinned state, history) of a session."""
         return list(self._session(session_id).messages)
 
+    @property
+    def role(self) -> Role:
+        return self._role
+
+    @property
+    def role_name(self) -> str:
+        return self._role.name
+
+    @property
+    def role_label(self) -> str:
+        return self._role.status_label()
+
+    @property
+    def busy(self) -> bool:
+        """True while a turn runs or a tool job is still active."""
+        return self._in_turn or bool(self._running) or (self._task is not None and not self._task.done())
+
+    def set_role(self, name: str) -> None:
+        """Switch the active role: re-gate the runtime (remove-only) and re-render each session's prefix.
+
+        Only allowed while idle (raises ``RuntimeError`` during a turn or tool job), so a turn's role is
+        frozen from start to finish. The step budget and recorded history are never reset, so a switch
+        cannot launder work already done.
+        """
+        if self.busy:
+            raise RuntimeError("cannot change the role while a turn or tool job is active; stop or finish it first")
+        self._role = get_role(name)
+        self._apply_role()
+        for session in self._sessions.values():
+            session.messages[0] = ChatMessage(
+                role="system",
+                content=build_system_prompt(
+                    session.facts, session.instructions, session.soul, self._role.prompt
+                ),
+            )
+
     async def run(self, session_id: str, user_text: str, *, intent: Intent | None = None) -> AcceptanceResult:
         """Run one user message. ``intent`` (e.g. from ``--expect``) overrides the deterministic classifier."""
         session = self._session(session_id)
+        if self.store is not None:  # the role this session runs under, restored on resume (see native.py)
+            self.store.set_state(session_id, ROLE_STATE, self._role.name)
         run = _Run(uuid.uuid4().hex[:12], time.monotonic(), intent=classify(user_text, intent))
+        if self._role.read_only:  # a read-only role can only inspect/answer; never a change request
+            run.intent = Intent.QUESTION
         session.state.intent = run.intent.value
-        self._event("turn.started", session, run, {"user_text": user_text})
-        self._task = asyncio.create_task(self._drive(session, run, user_text))
+        set_commit_guard = getattr(self.tools, "set_commit_guard", None)
+        if callable(set_commit_guard):  # file commits re-check ownership right before writing
+            set_commit_guard((lambda: self._owns(session)) if self.owner_guard is not None else None)
+        self._in_turn = True
         try:
-            stop, detail = await self._task
-        except asyncio.CancelledError:
-            current = asyncio.current_task()
-            if current is not None and current.cancelling():
-                raise
-            stop, detail = "cancelled", ""
+            self._event("turn.started", session, run, {"user_text": user_text})
+            self._task = asyncio.create_task(self._drive(session, run, user_text))
+            persist = True
+            try:
+                stop, detail = await self._task
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                stop, detail = "cancelled", ""
+            except Exception as exc:
+                if not _ownership_lost(exc):
+                    raise
+                stop, detail, persist = "cancelled", LOCK_LOST, False
+            finally:
+                self._task = None
+            if persist and not self._owns(session):
+                stop, detail, persist = "cancelled", LOCK_LOST, False
+            return self._finish(session, run, stop, detail, persist=persist)
         finally:
-            self._task = None
-        return self._finish(session, run, stop, detail)
+            self._in_turn = False
 
     # ------------------------------------------------------------------ session setup
 
@@ -246,9 +337,13 @@ class Engine:
             facts = project_facts(self.project_root)
             if store:
                 store.set_state(session_id, "project_facts", facts)
+        instructions = session_instructions(store, session_id, self.project_root)
+        self.instructions = instructions
+        soul = session_soul(store, session_id, self.soul_mode)
+        self.soul = soul
         vault = OutputVault(session_id, store)
         messages = [
-            ChatMessage(role="system", content=build_system_prompt(facts)),
+            ChatMessage(role="system", content=build_system_prompt(facts, instructions, soul, self._role.prompt)),
             ChatMessage(role="system", content=state.render()),
             *history,
         ]
@@ -258,7 +353,17 @@ class Engine:
         context = ContextManager(self.budget.context_tokens, vault, self.estimator, reserve_tokens=reserve)
         saved = (store.get_state(session_id, COMPACTION_STATE) if store else None) or {}
         context.summary = SummaryData.from_dict(saved.get("summary"))
-        session = _Session(session_id, messages, state, vault, context, compactions=int(saved.get("compactions", 0)))
+        session = _Session(
+            session_id,
+            messages,
+            state,
+            vault,
+            context,
+            facts=dict(facts),
+            instructions=instructions,
+            soul=soul,
+            compactions=int(saved.get("compactions", 0)),
+        )
         self._sessions[session_id] = session
         return session
 
@@ -279,21 +384,37 @@ class Engine:
                 replace_messages(session_id, repaired)
         return repaired
 
+    def _role_allows(self, name: str) -> bool:
+        return self._role.tools is None or name in self._role.tools
+
+    def _apply_role(self) -> None:
+        setter = getattr(self.tools, "set_role", None)
+        if callable(setter):
+            setter(self._role.name, self._role.tools)
+
+    def _effective_steps(self) -> int | None:
+        limits = [n for n in (self.budget.max_steps, self._role.step_budget) if n is not None]
+        return min(limits) if limits else None
+
     def _specs(self) -> list[ToolSpec]:
+        allowed = self._role.tools
         specs: list[ToolSpec] = []
         for spec in self.tools.specs():
+            if allowed is not None and spec.name not in allowed:
+                continue
             props = dict(spec.parameters.get("properties", {}))
             if spec.name in VALIDATABLE_TOOLS and VALIDATION_ARG not in props:
                 props[VALIDATION_ARG] = {
                     "type": "boolean",
-                    "description": "true when this command validates your change (tests, build, lint)",
+                    "description": "true only when this command runs the project's tests with a known runner "
+                    "(pytest, unittest, npm test, node --test, cargo test, go test); other commands never validate",
                 }
                 spec = replace(spec, parameters={**spec.parameters, "properties": props})
                 self._augmented.add(spec.name)
             specs.append(spec)
-        if all(s.name != SHOW_OUTPUT for s in specs):
+        if all(s.name != SHOW_OUTPUT for s in specs) and (allowed is None or SHOW_OUTPUT in allowed):
             specs.append(SHOW_OUTPUT_SPEC)
-        if all(s.name != DECLARE_NO_CHANGE for s in specs):
+        if all(s.name != DECLARE_NO_CHANGE for s in specs) and (allowed is None or DECLARE_NO_CHANGE in allowed):
             specs.append(DECLARE_NO_CHANGE_SPEC)
         self._validating = {s.name for s in specs if s.validates}
         return specs
@@ -319,9 +440,10 @@ class Engine:
     async def _loop(self, session: _Session, run: _Run, specs: list[ToolSpec]) -> Stop:
         by_name = {spec.name: spec for spec in specs}
         budget = self.budget
+        step_limit = self._effective_steps()
         while True:
-            if budget.max_steps is not None and run.steps >= budget.max_steps:
-                return "budget", f"step budget exhausted ({budget.max_steps} model calls)"
+            if step_limit is not None and run.steps >= step_limit:
+                return "budget", f"step budget exhausted ({step_limit} model calls)"
             if budget.max_tokens is not None and run.tokens >= budget.max_tokens:
                 return "budget", f"token budget exhausted ({run.tokens}/{budget.max_tokens})"
             self._maybe_compact(session, run, specs)
@@ -486,14 +608,31 @@ class Engine:
         validation = call.name in self._validating or (
             call.name in self._augmented and call.arguments.get(VALIDATION_ARG) is True
         )
+        self._require_owner(session)  # dispatch nothing once the session lock is lost
         self._event("tool.started", session, run, {"call_id": call.id, "tool": call.name, "arguments": dict(call.arguments)})
         before = self.tools.revision()
-        if call.name == SHOW_OUTPUT:
+        if not self._role_allows(call.name):  # enforced here too, so a fake/loose runtime cannot bypass the role
+            result = ToolResult(
+                call.id, call.name, ToolStatus.DENIED, f"{call.name} is not allowed in {self._role.name} mode"
+            )
+            mutating, validation = False, False
+        elif call.name == SHOW_OUTPUT:
             result = run_show_output(session.vault, call, self.budget.max_output_chars)
         elif call.name == DECLARE_NO_CHANGE:
             result = declare_no_change_result(call.arguments, call.id)
         else:
-            result = await self._start_and_wait(self._runtime_call(call))
+            try:
+                result = await self._start_and_wait(self._runtime_call(call))
+            except asyncio.CancelledError:
+                # A mutation that completed while being cancelled is still a change: record it so
+                # changed_paths and "Changed files:" stay truthful (the record is in memory only).
+                late = self._late.pop(call.id, None)
+                if late is not None and late.status is ToolStatus.OK and late.mutated_paths:
+                    record = ToolRecord(call, late, before, self.tools.revision(), mutating, False)
+                    run.records.append(record)
+                    session.records.append(record)
+                    session.state.note_record(record)
+                raise
         record = ToolRecord(call, result, before, self.tools.revision(), mutating, validation)
         run.records.append(record)
         session.records.append(record)
@@ -501,6 +640,9 @@ class Engine:
         if result.status in (ToolStatus.INVALID, ToolStatus.DENIED):
             sig = _signature(call)
             run.invalid[sig] = run.invalid.get(sig, 0) + 1
+        # The event carries only a bounded preview, but the *full* text is kept durably for the UI
+        # whenever it is bigger than the preview — even below the model-facing truncation budget.
+        output_handle = session.vault.put(result.tool, result.call_id, result.output) if len(result.output) > EVENT_OUTPUT_CHARS else 0
         self._event(
             "tool.finished",
             session,
@@ -513,6 +655,7 @@ class Engine:
                 "mutated_paths": list(result.mutated_paths),
                 "elapsed_ms": result.elapsed_ms,
                 "output": result.output[:EVENT_OUTPUT_CHARS],
+                "output_handle": output_handle,
                 **{key: result.data[key] for key in EVENT_DATA_KEYS if key in result.data},
             },
         )
@@ -533,7 +676,9 @@ class Engine:
         try:
             return await handle.wait()
         except asyncio.CancelledError:
-            await self._stop_job(handle)
+            late = await self._stop_job(handle)
+            if late is not None:
+                self._late[call.id] = late
             raise
         except Exception as exc:
             return ToolResult(call.id, call.name, ToolStatus.FAILED, f"tool runtime error: {exc}")
@@ -541,13 +686,15 @@ class Engine:
             self._running.discard(handle)
 
     @staticmethod
-    async def _stop_job(handle: JobHandle) -> None:
-        """Cancel and wait until the job has really stopped (bounded so a broken job cannot hang us)."""
+    async def _stop_job(handle: JobHandle) -> ToolResult | None:
+        """Cancel and wait until the job has really stopped (bounded so a broken job cannot hang us).
+
+        Returns the job's own result when it still finished (e.g. a file write already in progress)."""
         try:
             await asyncio.wait_for(handle.cancel(), JOB_STOP_TIMEOUT_S)
-            await asyncio.wait_for(handle.wait(), JOB_STOP_TIMEOUT_S)
+            return await asyncio.wait_for(handle.wait(), JOB_STOP_TIMEOUT_S)
         except Exception:  # best effort; the job reports its own failure
-            pass
+            return None
 
     # ------------------------------------------------------------------ context + persistence
 
@@ -598,7 +745,21 @@ class Engine:
                 return {record.call.id} if verdict == "fail" else set()
         return set()
 
+    def _owns(self, session: _Session) -> bool:
+        guard = self.owner_guard
+        if guard is None:
+            return True
+        try:
+            return bool(guard(session.session_id))
+        except Exception:  # noqa: BLE001 - an unverifiable lock is a lost lock (fail closed)
+            return False
+
+    def _require_owner(self, session: _Session) -> None:
+        if not self._owns(session):
+            raise OwnershipLost(LOCK_LOST)
+
     def _append(self, session: _Session, message: ChatMessage) -> None:
+        self._require_owner(session)  # never persist a message under someone else's lock
         session.messages.append(message)
         if self.store is not None:
             self.store.append_message(session.session_id, message)
@@ -623,16 +784,18 @@ class Engine:
             text = _first_line(text)
         append(session.session_id, message.role, text[:TRANSCRIPT_TEXT_CHARS], meta)
 
-    def _finish(self, session: _Session, run: _Run, stop: StopReason, detail: str) -> AcceptanceResult:
+    def _finish(
+        self, session: _Session, run: _Run, stop: StopReason, detail: str, *, persist: bool = True
+    ) -> AcceptanceResult:
         result = acceptance.evaluate(run.records, stop, detail, intent=run.intent)
         session.state.validation = acceptance.validation_status(session.records)
         session.state.obligations = acceptance.obligations(run.records, result)
-        if self.store is not None:
+        if self.store is not None and persist:
             self.store.set_state(session.session_id, "task_state", session.state.to_dict())
         prose = run.prose.strip()
         summary = acceptance.render_summary(run.records, result)
         self.last_answer = f"{prose}\n\n{summary}" if prose else summary
-        append = getattr(self.store, "append_transcript", None) if self.store is not None else None
+        append = getattr(self.store, "append_transcript", None) if self.store is not None and persist else None
         if callable(append):
             append(session.session_id, "assistant", summary[:TRANSCRIPT_TEXT_CHARS], {"outcome": result.outcome.value})
         self._event(

@@ -254,7 +254,7 @@ def evaluate(
 ) -> AcceptanceResult:
     changed = changed_paths(records)
     if stop == "cancelled":
-        return AcceptanceResult(Outcome.CANCELLED, ("cancelled by user",), changed)
+        return AcceptanceResult(Outcome.CANCELLED, (detail or "cancelled by user",), changed)
     if stop == "transport_error":
         return AcceptanceResult(Outcome.FAILED, (detail or "model transport failed",), changed)
     if stop != "final":

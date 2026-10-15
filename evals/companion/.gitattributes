@@ -1,0 +1,2 @@
+*.py text eol=lf
+c12_crlf_unicode/repo/** -text

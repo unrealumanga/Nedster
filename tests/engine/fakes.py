@@ -164,6 +164,10 @@ class FakeRuntime:
         self.calls.append(c)
         if c.name not in self.handlers:
             return InstantJob(ToolResult(c.id, c.name, ToolStatus.INVALID, f"unknown tool {c.name}"))
+        if hasattr(self, "_role_name") and self._role_name is not None:
+            allowed = getattr(self, "_allowed_tools", None)
+            if allowed is not None and c.name not in allowed:
+                return InstantJob(ToolResult(c.id, c.name, ToolStatus.DENIED, f"{c.name} is not allowed in {self._role_name} mode"))
         check = self.validators.get(c.name)
         problem = check(c) if check else None
         if problem:
@@ -171,6 +175,11 @@ class FakeRuntime:
         job = FakeJob(self, c, self.delays.get(c.name, 0.0))
         self.jobs.append(job)
         return job
+
+    def set_role(self, name: str, allowed_tools) -> None:
+        """Restrict dispatch to ``allowed_tools`` for role ``name`` (``None`` = no restriction)."""
+        self._role_name = name
+        self._allowed_tools = frozenset(allowed_tools) if allowed_tools is not None else None
 
     def revision(self) -> WorkspaceRevision:
         return self.rev
@@ -183,6 +192,7 @@ class MemoryStore:
         self.msgs: dict[str, list[ChatMessage]] = {}
         self.state: dict[tuple[str, str], Any] = {}
         self.outputs: dict[tuple[str, int], str] = {}
+        self.output_calls: dict[tuple[str, int], str] = {}
         self.replaced = 0
 
     def create(self, project_root: str, title: str = "") -> str:
@@ -208,10 +218,19 @@ class MemoryStore:
     def put_output(self, session_id: str, tool: str, call_id: str, text: str) -> int:
         handle = 1 + sum(1 for sid, _ in self.outputs if sid == session_id)
         self.outputs[(session_id, handle)] = text
+        self.output_calls[(session_id, handle)] = call_id
         return handle
 
     def get_output(self, session_id: str, handle: int) -> str:
         return self.outputs[(session_id, handle)]
+
+    def output_for_call(self, session_id: str, call_id: str) -> str | None:
+        if not call_id:
+            return None
+        for (sid, handle), cid in self.output_calls.items():
+            if sid == session_id and cid == call_id:
+                return self.outputs[(session_id, handle)]
+        return None
 
     def replace_messages(self, session_id: str, messages: list[ChatMessage]) -> None:
         self.replaced += 1

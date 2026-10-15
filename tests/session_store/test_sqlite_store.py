@@ -49,6 +49,26 @@ def test_output_handles_increase_per_session(tmp_path: Path):
             store.get_output(other, 2)
 
 
+def test_output_for_call_returns_the_full_text_and_is_session_scoped(tmp_path: Path):
+    with SqliteSessionStore(tmp_path / "sessions.sqlite3") as store:
+        session = store.create(str(tmp_path))
+        store.put_output(session, "bash", "c1", "first")
+        store.put_output(session, "bash", "c2", "second")
+        assert store.output_for_call(session, "c1") == "first"
+        assert store.output_for_call(session, "missing") is None
+        assert store.output_for_call(session, "") is None
+        other = store.create(str(tmp_path))
+        assert store.output_for_call(other, "c1") is None  # never leaks across sessions
+
+
+def test_output_for_call_prefers_the_newest_handle(tmp_path: Path):
+    with SqliteSessionStore(tmp_path / "sessions.sqlite3") as store:
+        session = store.create(str(tmp_path))
+        store.put_output(session, "bash", "c1", "older")
+        store.put_output(session, "bash", "c1", "newer")
+        assert store.output_for_call(session, "c1") == "newer"
+
+
 def test_list_sessions_filters_by_normalized_root(tmp_path: Path):
     root_a = tmp_path / "proj_a"
     root_b = tmp_path / "proj_b"
@@ -138,3 +158,49 @@ def test_concurrent_appends_do_not_collide_on_seq(tmp_path: Path):
             thread.join()
         messages = store.messages(session)
     assert len(messages) == 200
+
+
+def test_search_sessions_reports_counts_and_first_last_text(tmp_path: Path):
+    with SqliteSessionStore(tmp_path / "sessions.sqlite3") as store:
+        session = store.create(str(tmp_path), title="Fix the range")
+        store.append_message(session, ChatMessage(role="user", content="  fix   the range  "))
+        store.append_message(session, ChatMessage(role="assistant", content="done"))
+        store.append_message(session, ChatMessage(role="user", content="and the boundary"))
+        rows = store.search_sessions(str(tmp_path), "range")
+        assert [row["id"] for row in rows] == [session]
+        assert rows[0]["message_count"] == 3
+        assert rows[0]["first_user_text"] == "  fix   the range  "
+        assert rows[0]["last_user_text"] == "and the boundary"
+
+
+def test_search_sessions_matches_id_prefix_title_and_first_message(tmp_path: Path):
+    with SqliteSessionStore(tmp_path / "sessions.sqlite3") as store:
+        titled = store.create(str(tmp_path), title="Write docs")
+        store.append_message(titled, ChatMessage(role="user", content="anything"))
+        blank = store.create(str(tmp_path))
+        store.append_message(blank, ChatMessage(role="user", content="explain the widget"))
+        assert {row["id"] for row in store.search_sessions(str(tmp_path), "write")} == {titled}
+        assert {row["id"] for row in store.search_sessions(str(tmp_path), "widget")} == {blank}
+        assert {row["id"] for row in store.search_sessions(str(tmp_path), titled[:6])} == {titled}
+        assert {row["id"] for row in store.search_sessions(str(tmp_path), "")} == {titled, blank}
+
+
+def test_search_sessions_excludes_empty_and_respects_the_limit(tmp_path: Path):
+    with SqliteSessionStore(tmp_path / "sessions.sqlite3") as store:
+        empty = store.create(str(tmp_path), title="no messages")
+        full = store.create(str(tmp_path), title="has messages")
+        store.append_message(full, ChatMessage(role="user", content="hi"))
+        assert [row["id"] for row in store.search_sessions(str(tmp_path))] == [full]
+        assert [row["id"] for row in store.search_sessions(str(tmp_path), exclude_empty=False)] == [full, empty]
+        assert len(store.search_sessions(str(tmp_path), limit=1)) == 1
+
+
+def test_latest_non_empty_skips_the_newest_empty_session(tmp_path: Path):
+    with SqliteSessionStore(tmp_path / "sessions.sqlite3") as store:
+        older = store.create(str(tmp_path))
+        store.append_message(older, ChatMessage(role="user", content="older work"))
+        store.create(str(tmp_path))  # newer, empty
+        assert store.latest_session(str(tmp_path)) != older  # the raw latest is the empty one
+        assert store.latest_non_empty(str(tmp_path)) == older
+        assert store.latest_non_empty(str(tmp_path / "missing")) is None
+

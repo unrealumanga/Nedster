@@ -1,0 +1,9 @@
+{
+  "prompt": "We're getting rate limited by the API. Bump the retry_backoff_factor setting in settings.py to 2.0.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [],
+  "requires": [],
+  "forbidden_commands": []
+}

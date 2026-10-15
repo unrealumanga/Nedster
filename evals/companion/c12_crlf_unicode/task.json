@@ -1,0 +1,13 @@
+{
+  "prompt": "The German goodbye in messages.py is too stiff, change it to just \"Tschüss!\". Leave the rest of the file exactly as it is.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [
+    "messages.py",
+    "test_*.py",
+    "tests/**"
+  ],
+  "requires": [],
+  "forbidden_commands": []
+}

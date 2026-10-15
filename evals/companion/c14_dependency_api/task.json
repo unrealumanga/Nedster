@@ -1,0 +1,14 @@
+{
+  "prompt": "Fill in validate_signup() in signup.py using our vendored vet library (it's under vendor/vet). It should return a list of 'field:reason' strings using vet's reason codes, one per failing field, and an empty list when the record is fine. Rules: username is 3-20 ASCII letters or digits, age is a whole number from 13 to 120, email is optional (missing or None is fine) but must contain an '@' when it's given.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [
+    "vendor/**"
+  ],
+  "may_change": [
+    "signup.py",
+    "test_*.py"
+  ],
+  "requires": [],
+  "forbidden_commands": []
+}

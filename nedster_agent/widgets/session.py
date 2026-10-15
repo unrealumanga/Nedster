@@ -118,6 +118,7 @@ class NativeSession:
         self.store = store
         self.project_root = project_root
         self.sandbox, self.isolation, self.endpoint = sandbox, isolation, endpoint
+        self.instructions: Mapping[str, Any] | None = None
         self.context_used = 0
         self.session_id = self._create()
 
@@ -147,9 +148,25 @@ class NativeSession:
             "isolation": self.isolation,
             "context_used": self.context_used,
             "context_max": int(getattr(budget, "context_tokens", 0) or 0),
+            "max_steps": getattr(budget, "max_steps", None),  # None = no limit
             "session_id": self.session_id,
             "engine": "native",
+            "instructions": self.instructions,
+            # The real Engine exposes role_name/role_label; the private fields are a fallback for fakes.
+            "role": getattr(self.engine, "role_name", None) or getattr(self.engine, "_role_name", "") or "",
+            "role_label": getattr(self.engine, "role_label", None) or getattr(self.engine, "_role_label", "") or "",
         }
+
+    def set_role(self, name: str) -> None:
+        """Switch the engine to a named role preset."""
+        if hasattr(self.engine, "set_role"):
+            self.engine.set_role(name)
+        # Track role locally for info() in case the engine doesn't expose it
+        from ironclad.engine.roles import get_role
+
+        role = get_role(name)
+        self.engine._role_name = role.name
+        self.engine._role_label = role.status_label()
 
     def new(self) -> str:
         self.session_id = self._create()
@@ -168,10 +185,15 @@ class NativeSession:
         if session_id is None:
             chosen = sessions[0]
         else:
-            matches = [s for s in sessions if str(s.get("id", "")).startswith(session_id)]
-            if len(matches) != 1:
-                raise LookupError(f"no unique session matches {session_id!r}")
-            chosen = matches[0]
+            resolver = getattr(self.store, "resolve_session", None)
+            if callable(resolver):
+                # id, unique prefix or exact title, over every session (not just a list page)
+                chosen = resolver(str(self.project_root), session_id)
+            else:
+                matches = [s for s in sessions if str(s.get("id", "")).startswith(session_id)]
+                if len(matches) != 1:
+                    raise LookupError(f"no unique session matches {session_id!r}")
+                chosen = matches[0]
         self.session_id = str(chosen["id"])
         return self.session_id
 

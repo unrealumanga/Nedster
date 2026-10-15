@@ -24,6 +24,7 @@ from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import psutil
 
@@ -237,6 +238,44 @@ class CheckpointStore:
                 self._connection.execute("ROLLBACK")
                 raise
             self._connection.execute("COMMIT")
+
+    # -- session deletion --------------------------------------------------------------
+
+    def checkpoint_count(self, session_id: str) -> int:
+        """How many journaled turns (checkpoint sets) ``session_id`` has."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) FROM ckpt_turns WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def delete_session(self, session_id: str, *, connection: sqlite3.Connection | None = None) -> int:
+        """Delete every checkpoint row of ``session_id`` (turns, pre-images, pending undos).
+
+        With ``connection`` (the sessions DB already inside its own transaction) the deletes join
+        that transaction, so session and checkpoint rows go together; otherwise a dedicated
+        transaction is used. Returns how many turns were removed.
+        """
+        def purge(db: sqlite3.Connection) -> int:
+            turns = [
+                int(row[0])
+                for row in db.execute("SELECT turn_id FROM ckpt_turns WHERE session_id = ?", (session_id,))
+            ]
+            for turn_id in turns:
+                db.execute("DELETE FROM ckpt_files WHERE turn_id = ?", (turn_id,))
+                db.execute(
+                    "DELETE FROM ckpt_undo_files WHERE undo_id IN"
+                    " (SELECT undo_id FROM ckpt_undo WHERE turn_id = ?)",
+                    (turn_id,),
+                )
+                db.execute("DELETE FROM ckpt_undo WHERE turn_id = ?", (turn_id,))
+            db.execute("DELETE FROM ckpt_turns WHERE session_id = ?", (session_id,))
+            return len(turns)
+
+        if connection is not None:
+            return purge(connection)
+        with self._lock, self._tx() as db:
+            return purge(db)
 
     # -- journal -----------------------------------------------------------------------
 
@@ -531,4 +570,24 @@ class CheckpointStore:
             target.unlink()
 
 
-__all__ = ["CheckpointStore", "UndoConflict", "UndoReport", "digest_path", "path_key"]
+def delete_session_cascade(store: Any, checkpoints: CheckpointStore, session_id: str) -> bool:
+    """Delete a session and its checkpoint rows, atomically when both share one SQLite file.
+
+    Same file: the checkpoint rows are purged inside the session delete's transaction, so a
+    refusal (live lock) or failure leaves both sides untouched. Separate files: the checkpoint
+    rows go first, so a failed session delete leaves the conversation intact.
+    """
+    if Path(store.path) == Path(checkpoints.path):
+        return bool(
+            store.delete_session(
+                session_id,
+                extra=lambda connection: checkpoints.delete_session(session_id, connection=connection),
+            )
+        )
+    if store.is_active(session_id):
+        return False
+    checkpoints.delete_session(session_id)
+    return bool(store.delete_session(session_id))
+
+
+__all__ = ["CheckpointStore", "UndoConflict", "UndoReport", "delete_session_cascade", "digest_path", "path_key"]

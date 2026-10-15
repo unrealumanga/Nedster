@@ -14,6 +14,7 @@ from rich.text import Text
 from textual import events
 from textual.binding import Binding
 from textual.containers import VerticalScroll
+from textual.message import Message
 from textual.widget import Widget
 
 from .glyphs import Glyphs
@@ -22,6 +23,8 @@ from .session import failure_reason
 MAX_OUTPUT_LINES = 40
 MAX_OUTPUT_CHARS = 4_000
 MAX_DIFF_LINES = 400
+#: The full-output modal renders at most this much of a stored output (keeps the UI responsive).
+FULL_OUTPUT_MAX_CHARS = 200_000
 EDIT_TOOLS = {"write_file", "edit_file", "apply_patch", "replace_in_file", "write", "edit", "patch"}
 
 BADGES: dict[str, tuple[str, str]] = {
@@ -40,6 +43,14 @@ def bounded(text: str, max_lines: int = MAX_OUTPUT_LINES, max_chars: int = MAX_O
     clipped = len(text) > max_chars or len(lines) > max_lines
     body = "\n".join(lines[:max_lines])
     return f"{body}\n[… {len(text) - len(body)} more characters]" if clipped else body
+
+
+def render_full_output(text: str, max_chars: int = FULL_OUTPUT_MAX_CHARS) -> str:
+    """The complete stored output, capped at ``max_chars`` with a byte-count truncation note."""
+    if len(text) <= max_chars:
+        return text
+    total = len(text.encode("utf-8", "replace"))
+    return f"{text[:max_chars]}\n\n[truncated, {total} bytes total]"
 
 
 def short_args(arguments: Mapping[str, Any], limit: int = 48) -> str:
@@ -135,14 +146,27 @@ class AssistantMessage(Widget):
 
 
 class ToolRow(Widget):
-    """One compact line per tool call; Enter/click expands argv, path, bounded output and diff."""
+    """One compact line per tool call; Enter/click expands argv, path, bounded output and diff.
+
+    Press ``o`` for the full stored output (a scrollable modal), loaded lazily via ``output_loader``.
+    """
 
     DEFAULT_CSS = """
     ToolRow { height: auto; padding: 0 0 0 2; }
     ToolRow:focus { background: $boost; }
     """
     can_focus = True
-    BINDINGS = [Binding("enter", "toggle", "Expand", show=False)]
+    BINDINGS = [
+        Binding("enter", "toggle", "Expand", show=False),
+        Binding("o", "full_output", "Full output", show=False),
+    ]
+
+    class FullOutput(Message):
+        """Ask the app to open the full stored output for this row."""
+
+        def __init__(self, row: ToolRow) -> None:
+            super().__init__()
+            self.row = row
 
     def __init__(
         self,
@@ -152,6 +176,9 @@ class ToolRow(Widget):
         arguments: Mapping[str, Any],
         *,
         diff_loader: Callable[[Sequence[str]], str] | None = None,
+        output_loader: Callable[[], str] | None = None,
+        historical: bool = False,
+        expanded: bool = False,
     ) -> None:
         super().__init__()
         self.glyphs = glyphs
@@ -160,8 +187,10 @@ class ToolRow(Widget):
         self.arguments = dict(arguments)
         self.started = time.monotonic()
         self.finished: dict[str, Any] | None = None
-        self.expanded = False
+        self.expanded = expanded
         self.diff_loader = diff_loader
+        self.output_loader = output_loader
+        self.historical = historical
         self._diff: str | None = None
 
     @property
@@ -184,9 +213,16 @@ class ToolRow(Widget):
         self.expanded = not self.expanded
         self.refresh(layout=True)
 
+    def action_full_output(self) -> None:
+        self.post_message(self.FullOutput(self))
+
     def on_click(self, event: events.Click) -> None:
         self.focus()
         self.action_toggle()
+
+    def event_output(self) -> str:
+        """The bounded output carried on the finish event (empty until the call finishes)."""
+        return str((self.finished or {}).get("output") or "")
 
     @property
     def mutated_paths(self) -> list[str]:
@@ -328,11 +364,17 @@ REPLAY_MAX_CHARS = 40_000
 TOOL_REPLAY_NOTE = "earlier tool result - not replayed"
 
 
-def replay_widgets(glyphs: Glyphs, entries: Sequence[Mapping[str, Any]]) -> list[Widget]:
+def replay_widgets(
+    glyphs: Glyphs,
+    entries: Sequence[Mapping[str, Any]],
+    *,
+    output_loader: Callable[[str], Callable[[], str] | None] | None = None,
+) -> list[Widget]:
     """Display-only reconstruction of a stored transcript for ``/resume``.
 
-    Nothing is ever re-executed: tool entries become a muted marker and their stored output text
-    is dropped on purpose, so an old tool result can never be mistaken for current evidence.
+    Nothing is ever re-executed: tool entries become a marker row and their stored output text is
+    dropped on purpose, so an old tool result can never be mistaken for current evidence. The full
+    stored output is still reachable on demand (press ``o``) and is labelled "historical output".
     """
     widgets: list[Widget] = []
     for entry in entries:
@@ -341,14 +383,13 @@ def replay_widgets(glyphs: Glyphs, entries: Sequence[Mapping[str, Any]]) -> list
         text = bounded(str(entry.get("text") or ""), REPLAY_MAX_LINES, REPLAY_MAX_CHARS)
         if role == "tool":
             tool = str(meta.get("tool") or meta.get("name") or "tool")
-            status = str(meta.get("status") or "")
-            label = f"{tool} {status}".strip()
-            widgets.append(
-                Line(
-                    glyphs.text(f"{glyphs.icon('dash')} {label}{glyphs.sep}{TOOL_REPLAY_NOTE}"),
-                    glyphs.style("muted"),
-                )
+            call_id = str(meta.get("call_id") or "")
+            loader = output_loader(call_id) if output_loader is not None and call_id else None
+            row = ToolRow(
+                glyphs, call_id, tool, {}, historical=True, output_loader=loader,
             )
+            row.finish({"status": "ok", "summary": TOOL_REPLAY_NOTE})
+            widgets.append(row)
             continue
         if not text.strip():
             calls = [call for call in (meta.get("tool_calls") or []) if isinstance(call, Mapping)]
@@ -375,15 +416,51 @@ def replay_widgets(glyphs: Glyphs, entries: Sequence[Mapping[str, Any]]) -> list
 
 
 class Transcript(VerticalScroll):
-    """The central conversation; focusable rows inside, keeps scrolled to the end."""
+    """The central conversation; focusable rows inside.
+
+    New output auto-scrolls only while the user is following the tail; after scrolling up the view
+    stays put and ``new_output`` flags the pending text so the app can show an "End to follow" hint.
+    """
 
     DEFAULT_CSS = "Transcript { height: 1fr; padding: 0 2; }"
     can_focus = False
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.following = True  # user intent: are we pinned to the newest text?
+        self.new_output = False
+        self.on_follow_change: Callable[[bool], None] | None = None
+
     def add(self, widget: Widget) -> Widget:
         self.mount(widget)
-        self.call_after_refresh(self.scroll_end, animate=False)
+        self.follow_output()
         return widget
+
+    def follow_output(self) -> None:
+        """Called whenever content grows: pin the tail only when the user is following it."""
+        if not self.following:
+            self.new_output = True
+            self._signal_follow()
+            return
+        self.new_output = False
+        self.call_after_refresh(self._pin_to_end)
+
+    def _pin_to_end(self) -> None:
+        self.scroll_end(animate=False)
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        at_end = self.is_vertical_scroll_end
+        if at_end and not self.following:
+            self.following = True
+            self.new_output = False
+            self._signal_follow()
+        elif not at_end and self.following:
+            self.following = False
+
+    def _signal_follow(self) -> None:
+        if self.on_follow_change is not None:
+            self.on_follow_change(self.new_output)
 
     def plain_text(self) -> str:
         """Everything currently shown, as plain text (used by tests and /export-like features)."""

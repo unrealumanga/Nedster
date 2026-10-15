@@ -7,7 +7,6 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -22,10 +21,16 @@ from textual.widgets import Footer, OptionList, RichLog, Static
 
 from ironclad.config import NedsterConfig
 from ironclad.contracts import EngineEvent
-from ironclad.session_store.sqlite_store import make_owner
+from ironclad.session_store.sqlite_store import SHORT_ID, make_owner
+from ironclad.session_store.titles import display_title, normalize_title, relative_age
 
+from .notify import notification
+from .personality import moment_for_outcome
+from .personality import pick as personality_line
 from .widgets.composer import Composer, History, project_files
+from .widgets.delete_confirm import DeleteConfirm
 from .widgets.glyphs import Glyphs
+from .widgets.output_viewer import OutputViewer
 from .widgets.session import (
     EngineSession,
     EventCallback,
@@ -34,6 +39,7 @@ from .widgets.session import (
     SessionNote,
     failure_reason,
 )
+from .widgets.session_picker import SessionOption, SessionPicker
 from .widgets.status import StatusBar, isolation_label
 from .widgets.transcript import (
     RESUME_BANNER,
@@ -51,24 +57,40 @@ COMMANDS: dict[str, str] = {
     "/help": "show commands and keys",
     "/new": "start a new conversation",
     "/clear": "clear the display (conversation is kept)",
-    "/sessions": "list saved sessions for this project",
-    "/resume": "resume a session: /resume [id]",
+    "/init": "write a starter AGENTS.md from repository facts (/init --print to preview)",
+    "/sessions": "browse saved sessions (Ctrl+S)",
+    "/resume": "resume a session: /resume [id] (no id opens the picker)",
     "/model": "show or switch the model: /model [name]",
     "/status": "model, context, sandbox, session",
+    "/rename": "rename this session: /rename <name>",
+    "/delete": "delete a conversation and its checkpoints: /delete [id]",
     "/diff": "diff of files changed in this session",
     "/undo": "undo the last edit (when the engine supports it)",
     "/doctor": "readiness check (inference / read-only / execution)",
-    "/models": "list the active model fleet",
+    "/models": "browse and switch installed models",
     "/permissions": "show the autonomy policy",
+    "/soul": "show or edit the opt-in personality (soul.md)",
+    "/role": "switch role: /role [name] | /role list roles",
+    "/act": "execute plan: switch to code mode and submit 'Execute the plan above.'",
     "/quit": "exit Nedster",
 }
 # Commands that change engine/session state wait for the running turn (the text is kept).
-IDLE_ONLY = {"/new", "/resume", "/model", "/undo", "/sessions"}
+IDLE_ONLY = {"/new", "/resume", "/model", "/models", "/undo", "/sessions", "/rename", "/delete", "/soul", "/role"}
+# Commands that take no argument: extra text is rejected with a usage hint instead of being ignored.
+# /init, /soul and /role take arguments, so they are not listed here.
+NO_ARG_COMMANDS = frozenset({
+    "/help", "/new", "/clear", "/sessions", "/models", "/status",
+    "/diff", "/undo", "/doctor", "/permissions", "/act", "/quit", "/exit",
+})
 
 #: How much stored history /resume replays into the view (display only, never re-executed).
 RESUME_REPLAY_LIMIT = 200
 #: Activity-lock heartbeat period; well below the store's 60 s lock TTL.
 LOCK_REFRESH_S = 5.0
+#: Longest the @file inventory may stay stale when no turn changed files.
+FILE_REFRESH_S = 30.0
+#: Acceptance outcomes that count as a failed turn for the completion notice.
+FAILURE_OUTCOMES = frozenset({"failed", "incomplete", "unvalidated"})
 
 DoctorProvider = Callable[[NedsterConfig], Mapping[str, Mapping[str, Any]]]
 SessionFactoryFor = Callable[[NedsterConfig, EventCallback], EngineSession]
@@ -78,42 +100,107 @@ class _WiredNativeSession(NativeSession):
     """TUI adapter over ``ironclad.native.NativeSession``: shares its store/session and closes its resources."""
 
     core: Any = None
+    _own_session_id: str | None = None
+
+    # One authoritative session id (B2): with a core attached, the adapter's id *is* the core's, so
+    # /resume, /new, the lazy first-turn row, the lock, the engine's transcript and the checkpoint
+    # turn can never point at different conversations.
+    @property  # type: ignore[override]
+    def session_id(self) -> str | None:
+        if self.core is not None:
+            return self.core.session_id
+        return self._own_session_id
+
+    @session_id.setter
+    def session_id(self, value: str | None) -> None:
+        if self.core is not None:
+            self.core.switch_session(value)
+        else:
+            self._own_session_id = value
+
+    def ensure_session(self) -> str:
+        """Persist the (lazy) session row so the activity lock can be taken before the turn runs.
+
+        Only fills an absent id; a chosen (resumed / new) session is never replaced."""
+        if self.core is None:
+            return str(self.session_id)
+        return str(self.core.ensure_session_id())
+
+    def new(self) -> str:
+        if self.core is None:
+            return super().new()
+        self.context_used = 0
+        return str(self.core.new_session())
 
     async def submit(self, text: str) -> None:
         # Through the core session, not the bare engine: it opens the checkpoint turn that file mutations need
-        # (and that /undo restores). /resume may have switched session_id, so the core follows it.
+        # (and that /undo restores).
         if self.core is None:
             await super().submit(text)
             return
-        self.core.session_id = self.session_id
         await self.core.run(text)
 
     def undo_last(self) -> Any:
-        self.core.session_id = self.session_id
         return self.core.undo_last()
+
+    def set_owner_guard(self, guard: Callable[[str], bool] | None) -> None:
+        if self.core is not None:
+            self.core.set_owner_guard(guard)
+
+    def set_role(self, name: str) -> None:
+        # Through the core: the accepted role is persisted with the session immediately (S2).
+        if self.core is None:
+            super().set_role(name)
+            return
+        self.core.set_role(name)
+
+    def set_model(self, name: str) -> None:
+        super().set_model(name)
+        if self.core is None:
+            return
+        from ironclad.native import context_budget
+
+        self.core.model = name
+        budget = getattr(self.core.engine, "budget", None)
+        if budget is not None:  # a switch must rebuild the compaction budget for the new window
+            budget.context_tokens = context_budget(self.core.config, name)
 
     async def close(self) -> None:
         if self.core is not None:
             await self.core.aclose()
 
 
-def native_session(config: NedsterConfig, emit: EventCallback) -> EngineSession:
+def native_session(
+    config: NedsterConfig,
+    emit: EventCallback,
+    *,
+    session_id: str | None = None,
+    resume_latest: bool = False,
+    lazy: bool = True,
+) -> EngineSession:
     from ironclad.native import NativeSession as CoreSession
 
     holder: dict[str, CoreSession] = {}
 
     def build(engine_emit: Callable[[Any], None]) -> Any:
-        holder["core"] = CoreSession(config, emit=engine_emit, resume_latest=False)
+        holder["core"] = CoreSession(
+            config,
+            emit=engine_emit,
+            session_id=session_id,
+            resume_latest=resume_latest,
+            lazy=lazy,
+        )
         return holder["core"].engine
 
     session = _WiredNativeSession(build, emit, endpoint=config.models.ollama_url)
     core = holder["core"]
     info = core.info()
-    session.core = core
+    session.core = core  # from here on session.session_id reads and writes core.session_id
     session.store = core.store
-    session.session_id = core.session_id
+    session.started_new = core.started_new
     session.project_root = info["project_root"]
     session.sandbox, session.isolation = info["sandbox"], info["isolation"]
+    session.instructions = info.get("instructions")
     return session
 
 
@@ -169,6 +256,8 @@ class NedsterApp(App[None]):
     #work { height: 1fr; padding: 0 2; background: #0b0d10; color: #e6edf3; scrollbar-color: #394150; scrollbar-color-hover: #596579; scrollbar-size-vertical: 1; }
     #details { height: 1fr; padding: 0 2; display: none; background: #0b0d10; color: #e6edf3; }
     #completions { height: auto; max-height: 8; margin: 0 2; display: none; background: #11151b; border: round #394150; }
+    #search-hint { height: 1; padding: 0 2; display: none; background: #0b0d10; color: #d29922; }
+    #follow-hint { height: 1; padding: 0 2; display: none; background: #0b0d10; color: #58a6ff; }
     #prompt { height: auto; min-height: 3; max-height: 8; margin: 0 2; background: #11151b; color: #f0f6fc; border: round #394150; }
     #prompt:focus { border: round #7aa2f7; }
     #status { height: 1; padding: 0 2; background: #0b0d10; color: #c9d1d9; }
@@ -177,7 +266,7 @@ class NedsterApp(App[None]):
     #too-small { display: none; height: 1fr; content-align: center middle; text-align: center; }
     .queued { color: #d29922; }
     .no-color, .no-color #identity, .no-color #work, .no-color #details, .no-color #message, .no-color #status,
-    .no-color Footer, .no-color #prompt, .no-color #completions { color: ansi_default; background: ansi_default; }
+    .no-color Footer, .no-color #prompt, .no-color #completions, .no-color #search-hint, .no-color #follow-hint { color: ansi_default; background: ansi_default; }
     .no-color #prompt, .no-color #completions { border: round ansi_default; }
     .no-color #prompt:focus { border: round ansi_default; }
     .no-color .queued { color: ansi_default; text-style: italic; }
@@ -186,10 +275,16 @@ class NedsterApp(App[None]):
     """
 
     BINDINGS = [
-        Binding("escape", "escape", "Stop", priority=True),
-        Binding("ctrl+c", "interrupt", "Quit (x2)", priority=True),
-        Binding("f2", "details", "Events"),
-        Binding("ctrl+l", "clear", "Clear"),
+        Binding("f1", "help", "help"),
+        Binding("f4", "models", "models"),
+        Binding("ctrl+s", "session_picker", "sessions"),
+        Binding("ctrl+r", "history", "history"),
+        Binding("escape", "escape", "stop", priority=True),
+        Binding("shift+tab", "toggle_role", "role plan/code", priority=True),
+        Binding("f2", "details", "events", show=False),
+        Binding("ctrl+c", "interrupt", "quit x2", priority=True, show=False),
+        Binding("ctrl+l", "clear", "clear", show=False),
+        Binding("ctrl+o", "verbose", "verbose", show=False),
     ]
 
     def __init__(
@@ -201,6 +296,10 @@ class NedsterApp(App[None]):
         session_factory: SessionFactoryFor | None = None,
         doctor: DoctorProvider | None = None,
         files: Callable[[], Sequence[str]] | None = None,
+        session_ref: str | None = None,
+        resume_latest: bool = False,
+        open_picker_on_start: bool = False,
+        model_source: Callable[[str], Sequence[Any]] | None = None,
     ):
         super().__init__()
         self.config = config
@@ -209,8 +308,15 @@ class NedsterApp(App[None]):
         self.glyphs = Glyphs(ascii_only=ascii_only, no_color=no_color)
         self.session_factory = session_factory
         self.doctor = doctor or _default_doctor
+        self.session_ref = session_ref
+        self.resume_latest = resume_latest
+        self.open_picker_on_start = open_picker_on_start
         root = Path(config.runtime.project_root)
-        self.files_source = files or (lambda: project_files(root))
+        self._files_fetch = files or (lambda: project_files(root))
+        self._files_cache: list[str] = []  # refreshed by a worker; read from the UI thread without blocking
+        self._files_at = 0.0
+        self._files_refreshing = False
+        self.model_source = model_source or self._default_model_source
         self.history = History.for_project(Path(config.runtime.state_dir), root)
         self.session: EngineSession | None = None
         self.busy = False
@@ -221,15 +327,26 @@ class NedsterApp(App[None]):
         self.event_buffer: list[str] = []
         self.tool_rows: dict[str, ToolRow] = {}
         self.changed_paths: list[str] = []
+        self._turn_changed = False  # did the current turn touch any file (drives @file inventory refresh)?
         self.current_reply: AssistantMessage | None = None
         self.turn_replies: list[AssistantMessage] = []
         self.pending_badge: OutcomeBadge | None = None
         self.turn_closed = True
         self.last_interrupt = 0.0
+        self.verbose = False  # Ctrl+O: auto-expand every tool row (in-memory, per session)
+        self._output_handles: dict[str, str] = {}  # call_id -> stored-output handle (for the full-output modal)
+        self._turn_started = 0.0  # wall-clock start of the running turn (drives the completion notice)
+        self._turn_outcome = ""  # acceptance outcome reported by the engine for this turn
+        self._notify_writer: Callable[[str], None] = self._default_notify_writer
+        self._model_started: float | None = None  # wall-clock start of the model call in flight (speed fallback)
         self._loop_thread = threading.get_ident()
         self._lock_owner = make_owner("tui")
         self._locked: tuple[Any, str] | None = None  # (store, session_id) held by this window
         self._last_lock_refresh = 0.0
+        self.soul_mode = str(getattr(config.runtime, "soul", "off") or "off")
+        self.turn_number = 0
+        self._pending_soul: tuple[str, Any] | None = None  # ("remember"|"reset", SoulEdit|None)
+        self._plan_hint_shown = False  # whether we've shown the "Plan ready" hint after a plan turn
 
     # ------------------------------------------------------------------ layout
 
@@ -240,12 +357,16 @@ class NedsterApp(App[None]):
         yield Transcript(id="work")
         yield RichLog(id="details", markup=False, wrap=False, auto_scroll=True)
         yield OptionList(id="completions")
+        yield Static("", id="search-hint")
+        yield Static("", id="follow-hint")
         yield Composer(
             id="prompt",
             history=self.history,
             commands=list(COMMANDS),
-            files=self.files_source,
+            command_descriptions=COMMANDS,
+            files=lambda: self._files_cache,
             menu=lambda: self.query_one("#completions", OptionList),
+            hint=self._search_hint,
         )
         yield StatusBar(g, id="status")
         yield Static("", id="message")
@@ -254,6 +375,13 @@ class NedsterApp(App[None]):
     def _project_name(self) -> str:
         return Path(self.config.runtime.project_root).name or str(self.config.runtime.project_root)
 
+    def _default_model_source(self, current: str) -> Sequence[Any]:
+        """Installed Ollama models; runs in a worker thread so the UI never blocks on the network."""
+        from .model_manager import OllamaManager, list_installed_models
+
+        manager = OllamaManager(self.config.models.ollama_url)
+        return list_installed_models(manager, current)
+
     async def on_mount(self) -> None:
         self._loop_thread = threading.get_ident()
         if self.no_color_mode:
@@ -261,6 +389,7 @@ class NedsterApp(App[None]):
         if self.ascii_only:
             self.screen.add_class("ascii")
         self._apply_size(self.size.width, self.size.height)
+        self.transcript.on_follow_change = self._show_follow_hint
         prompt = self.query_one("#prompt", Composer)
         prompt.cursor_blink = False
         prompt.focus()
@@ -272,6 +401,7 @@ class NedsterApp(App[None]):
             "@ mentions a file, / lists commands, Esc stops a running turn."
         ), g.style("muted")))
         self.set_interval(0.5, self._tick)
+        self.run_worker(self._refresh_files(), group="files", exclusive=True)
         self.run_worker(self._initialize(), group="startup", exclusive=True)
 
     @property
@@ -290,6 +420,8 @@ class NedsterApp(App[None]):
         self.query_one("#details").display = not too_small and self.details_visible
         if too_small:
             self.query_one("#completions").display = False
+            self.query_one("#search-hint").display = False
+            self.query_one("#follow-hint").display = False
         for selector in ("#prompt", "#status", "#message", "Footer"):
             self.query_one(selector).display = not too_small
 
@@ -307,13 +439,26 @@ class NedsterApp(App[None]):
             for row in self.tool_rows.values():
                 if row.finished is None:
                     row.refresh()
+        elif (
+            not self._files_refreshing
+            and self._files_at
+            and time.monotonic() - self._files_at >= FILE_REFRESH_S
+        ):
+            # keep the @file inventory from going stale even when no turn has run for a while
+            self.run_worker(self._refresh_files(), group="files", exclusive=True)
 
     # ------------------------------------------------------------------ startup
 
     def _make_session(self) -> EngineSession:
         if self.session_factory is not None:
             return self.session_factory(self.config, self.handle_event)
-        return native_session(self.config, self.handle_event)
+        return native_session(
+            self.config,
+            self.handle_event,
+            session_id=self.session_ref,
+            resume_latest=self.resume_latest,
+            lazy=self.session_ref is None and not self.resume_latest,
+        )
 
     async def _initialize(self) -> None:
         g = self.glyphs
@@ -331,9 +476,34 @@ class NedsterApp(App[None]):
             self.status_bar.set_state("setup needed")
             return
         self._refresh_info()
-        self._acquire_lock(str(getattr(self.session, "session_id", "")))
+        guard = getattr(self.session, "set_owner_guard", None)
+        if callable(guard) and callable(getattr(self._session_store(), "acquire_lock", None)):
+            guard(self._owns_session)  # B3: a turn stops writing the moment this window loses the lock
+        session_id = str(getattr(self.session, "session_id", "") or "")
+        if session_id:  # a lazily-created session has no id yet and needs no lock
+            if not self._acquire_lock(session_id):  # B3: shown, and every turn is refused until it is free
+                self._line("Turns are not sent while another window holds this conversation.", "warn")
+            if not bool(getattr(self.session, "started_new", True)):
+                self._replay_session(session_id)  # opened straight on an existing conversation
         self._set_state("idle")
         self._message("Ready")
+        self._say("idle")
+        self._announce_instructions()
+        if self.open_picker_on_start:
+            self._open_session_picker()
+
+    def _announce_instructions(self) -> None:
+        """One-line notice about the project instruction file that was loaded for this session."""
+        info = self.session.info() if self.session is not None else {}
+        warning = info.get("instructions_warning")
+        if warning:
+            self._line(str(warning), "warn")
+        loaded = info.get("instructions")
+        if not isinstance(loaded, Mapping) or not loaded.get("name"):
+            return
+        size = int(loaded.get("size") or 0)
+        note = " [truncated]" if loaded.get("truncated") else ""
+        self._line(f"Loaded {loaded['name']} ({size / 1024:.1f} KB){note}", "muted")
 
     def _refresh_info(self) -> None:
         if self.session is None:
@@ -342,10 +512,10 @@ class NedsterApp(App[None]):
         self.status_bar.set_info(info)
         g = self.glyphs
         provider = str(info.get("provider") or "LOCAL")
-        oracle = str(info.get("cloud_oracle") or "")
-        where = f"{provider} + CLOUD oracle ({oracle})" if oracle else provider
+        where = provider
+        title = self._current_title()
         self.query_one("#identity", Static).update(
-            g.text(f"Nedster / {self._project_name()}{g.sep}{where}{g.sep}{info.get('model') or 'no model'}")
+            g.text(f"Nedster / {self._project_name()}{g.sep}{title}{g.sep}{where}{g.sep}{info.get('model') or 'no model'}")
         )
 
     # ------------------------------------------------------------------ helpers
@@ -361,6 +531,39 @@ class NedsterApp(App[None]):
     def _message(self, text: str) -> None:
         self.query_one("#message", Static).update(Text(self._text(text)))
 
+    def _search_hint(self, text: str | None) -> None:
+        """Composer callback: show/hide the one-line reverse-search hint above the prompt."""
+        hint = self.query_one("#search-hint", Static)
+        hint.display = text is not None
+        hint.update(Text(self._text(text or "")))
+
+    async def _refresh_files(self, *, force: bool = False) -> None:
+        """Refresh the @file inventory in a worker thread; a changed turn forces it, otherwise 30 s TTL."""
+        if not force and self._files_cache and time.monotonic() - self._files_at < FILE_REFRESH_S:
+            return
+        self._files_refreshing = True
+        try:
+            files = await asyncio.to_thread(self._files_fetch)
+        except Exception:  # noqa: BLE001 - a failed scan keeps the last inventory rather than crashing
+            return
+        finally:
+            self._files_refreshing = False
+        self._files_cache = list(files)
+        self._files_at = time.monotonic()
+
+    def _say(self, moment: str) -> None:
+        """Opt-in personality line in the status message area; never enters the answer or events."""
+        if self.soul_mode not in ("ui", "full"):
+            return
+        line = personality_line(moment, self.turn_number)
+        if line:
+            self._message(line)
+
+    def _say_done(self, outcome: str) -> None:
+        moment = moment_for_outcome(outcome)
+        if moment:
+            self._say(moment)
+
     def _set_state(self, state: str, detail: str = "", *, force: bool = False) -> None:
         if self.cancelling and not force:
             return  # "cancelling…" persists until the engine confirms
@@ -370,6 +573,26 @@ class NedsterApp(App[None]):
 
     def _session_store(self) -> Any:
         return getattr(self.session, "store", None) if self.session is not None else None
+
+    def _title_of(self, session_id: str, title: str = "") -> str:
+        """Display name for a session: stored title, else its first message, else "Untitled conversation"."""
+        store = self._session_store()
+        if store is None:
+            return display_title(title)
+        if not str(title or "").strip():
+            getter = getattr(store, "get_session", None)
+            record = getter(session_id) if callable(getter) else None
+            title = str(record.get("title") or "") if record else title
+        if str(title or "").strip():
+            return display_title(title)
+        first = getattr(store, "first_user_text", None)
+        fallback = first(session_id) if callable(first) else ""
+        return display_title("", fallback)
+
+    def _current_title(self) -> str:
+        if self.session is None:
+            return ""
+        return self._title_of(str(getattr(self.session, "session_id", "")))
 
     def _acquire_lock(self, session_id: str, *, warn: bool = True) -> bool:
         """Mark this window as the holder of ``session_id``; False when another live Nedster has it."""
@@ -393,8 +616,11 @@ class NedsterApp(App[None]):
     def _release_lock(self) -> None:
         if self._locked is None:
             return
-        store, session_id = self._locked
-        self._locked = None
+        entry, self._locked = self._locked, None
+        self._release_entry(entry)
+
+    def _release_entry(self, entry: tuple[Any, str]) -> None:
+        store, session_id = entry
         release = getattr(store, "release_lock", None)
         if callable(release):
             with suppress(Exception):
@@ -423,25 +649,84 @@ class NedsterApp(App[None]):
             recovered = bool(acquire(session_id, self._lock_owner)) if callable(acquire) else False
         except Exception:  # noqa: BLE001
             recovered = False
+        if not recovered:
+            self._locked = None  # B3: the next turn must re-acquire (or be refused), never write unowned
+            if self.busy:  # ... and the running one stops now (the engine guard blocks its writes meanwhile)
+                self._line("This conversation was taken over by another Nedster; the running turn was stopped.", "warn")
+                self.cancel_turn()
         self._message("" if recovered else "Session lock lost - another Nedster may have taken over")
 
+    def _owns_session(self, session_id: str) -> bool:
+        """Engine ownership guard: this window holds the lock of exactly ``session_id`` (checked in the
+        store, atomically, before every tool dispatch and persisted message)."""
+        if self._locked is None or self._locked[1] != str(session_id):
+            return False
+        store, held = self._locked
+        refresh = getattr(store, "refresh_lock", None)
+        if not callable(refresh):
+            return True
+        try:
+            return bool(refresh(held, self._lock_owner))
+        except Exception:  # noqa: BLE001 - an unverifiable lock is a lost lock
+            return False
+
+    def _activate_session(self) -> bool:
+        """Create the lazily-held session row and hold its activity lock before a turn runs.
+
+        True only when this window holds the lock of exactly the current session id (or the
+        session has no lock layer at all); False refuses the turn (B3: admission fails closed).
+        """
+        if self.session is None:
+            return False
+        ensure = getattr(self.session, "ensure_session", None)
+        try:
+            session_id = str((ensure() if callable(ensure) else getattr(self.session, "session_id", "")) or "")
+        except Exception as exc:  # noqa: BLE001 - shown; the turn is refused
+            self._line(f"Could not prepare the session: {exc}", "warn")
+            return False
+        store = self._session_store()
+        if not callable(getattr(store, "acquire_lock", None)):
+            return True  # an engine without session locks (nothing to own)
+        if not session_id:
+            self._line("No session to lock; the turn was not sent.", "warn")
+            return False
+        if self._locked is not None and self._locked[1] == session_id:
+            # Never trust the cached lock: re-validate ownership in the store, atomically (an expired
+            # heartbeat may have let another Nedster take the session over since our last refresh).
+            refresh = getattr(store, "refresh_lock", None)
+            try:
+                owned = bool(refresh(session_id, self._lock_owner)) if callable(refresh) else True
+            except Exception as exc:  # noqa: BLE001 - shown; the turn is refused
+                self._line(f"Could not verify the session lock: {exc}", "warn")
+                return False
+            if owned:
+                self._last_lock_refresh = time.monotonic()
+                return True
+            self._locked = None  # ours no longer: never release (that would delete the new owner's lock)
+            self._line("This conversation was taken over by another Nedster.", "warn")
+            return False
+        self._release_lock()  # held for another id: never let a turn run under a stale lock
+        return self._acquire_lock(session_id)
+
     def _resolve_session_id(self, wanted: str | None) -> str:
-        """Mirror of ``NativeSession.resume`` resolution, so the lock is taken *before* switching."""
+        """Resolve ``/resume`` so the lock is taken *before* switching.
+
+        An explicit ref goes through the store's one resolver (full id, unique prefix or exact
+        title, over every session); a bare ``/resume`` keeps the newest-session behaviour.
+        """
+        store = self._session_store()
+        resolver = getattr(store, "resolve_session", None)
+        if wanted is not None and callable(resolver):
+            return str(resolver(str(self.config.runtime.project_root), wanted)["id"])
         lister = getattr(self.session, "list_sessions", None)
         if lister is not None:
             sessions = list(lister())
         else:
-            store = self._session_store()
             store_lister = getattr(store, "list_sessions", None)
             sessions = list(store_lister(str(self.config.runtime.project_root))) if callable(store_lister) else []
         if not sessions:
             raise LookupError("no saved sessions for this project")
-        if wanted is None:
-            return str(sessions[0]["id"])
-        matches = [item for item in sessions if str(item.get("id", "")).startswith(wanted)]
-        if len(matches) != 1:
-            raise LookupError(f"no unique session matches {wanted!r}")
-        return str(matches[0]["id"])
+        return str(sessions[0]["id"])
 
     def _replay_session(self, session_id: str) -> None:
         """Rebuild the view from the stored display transcript, then warn that it is history."""
@@ -465,13 +750,126 @@ class NedsterApp(App[None]):
                     entries = list(read(session_id, RESUME_REPLAY_LIMIT))
                 except Exception as exc:  # noqa: BLE001
                     self._line(f"Could not read the transcript: {exc}", "warn")
-        self._line(f"Resumed session {session_id[:12]}", "accent")
-        for widget in replay_widgets(self.glyphs, entries):
+        self._line(f"Resumed session {session_id[:SHORT_ID]}", "accent")
+        for widget in replay_widgets(self.glyphs, entries, output_loader=self._output_loader_for):
             self.transcript.add(widget)
         if not entries:
             self._line("No saved transcript for this session.", "muted")
         self.transcript.add(Banner(self.glyphs, RESUME_BANNER))
         self._refresh_info()
+        self.status_bar.reset_usage()  # the resumed session's context usage is unknown until the next call
+
+    # ------------------------------------------------------------------ picker
+
+    def _picker_options(self, store: Any) -> list[SessionOption]:
+        """Every non-empty conversation of the project (never a capped page), annotated for the picker."""
+        root = str(self.config.runtime.project_root)
+        searcher = getattr(store, "search_sessions", None)
+        if callable(searcher):
+            rows = list(searcher(root, exclude_empty=True))
+        else:  # a store double without search_sessions: fall back to the list page
+            rows = [row for row in store.list_sessions(root) if int(row.get("message_count", 1)) > 0]
+        current = str(getattr(self.session, "session_id", "") or "")
+        held = self._locked[1] if self._locked is not None else ""
+        is_active = getattr(store, "is_active", None)
+        options: list[SessionOption] = []
+        for row in rows:
+            session_id = str(row["id"])
+            active = bool(is_active(session_id)) if callable(is_active) else False
+            options.append(
+                SessionOption(
+                    id=session_id,
+                    title=str(row.get("title") or ""),
+                    message_count=int(row.get("message_count") or 0),
+                    updated_ns=int(row.get("updated_ns") or 0),
+                    first_user_text=str(row.get("first_user_text") or ""),
+                    last_user_text=str(row.get("last_user_text") or ""),
+                    current=session_id == current,
+                    locked=active and session_id != held,
+                )
+            )
+        return options
+
+    def _open_session_picker(self) -> None:
+        """Open the conversation picker (``/sessions``, bare ``/resume``, Ctrl+S and ``--continue``)."""
+        if self.session is None:
+            self._line("Saved sessions are not available with this session.", "warn")
+            return
+        store = self._session_store()
+        if store is None or not callable(getattr(store, "list_sessions", None)):
+            self._line("Saved sessions are not available with this session.", "warn")
+            return
+        options = self._picker_options(store)
+        if not options:
+            self._line("No saved conversations for this project.")
+            return
+        self.push_screen(
+            SessionPicker(
+                options, busy=self.busy, ascii_only=self.ascii_only, on_delete=self._delete_from_picker
+            ),
+            self._picker_chosen,
+        )
+
+    def _picker_chosen(self, session_id: str | None) -> None:
+        if session_id is None:  # Esc: the composer draft is untouched
+            return
+        self._cmd_resume([session_id])
+
+    # ------------------------------------------------------------------ delete
+
+    def _checkpoints(self) -> Any:
+        return getattr(getattr(self.session, "core", None), "checkpoints", None)
+
+    def _delete_preview(self, store: Any, session_id: str) -> str:
+        record = store.get_session(session_id) or {}
+        counter = getattr(self._checkpoints(), "checkpoint_count", None)
+        count = counter(session_id) if callable(counter) else 0
+        title = self._title_of(session_id, str(record.get("title") or ""))
+        updated = relative_age(int(record.get("updated_ns") or 0)) or "unknown"
+        messages = len(store.messages(session_id))
+        return (
+            f"{session_id[:SHORT_ID]}  {title}\n"
+            f"updated {updated}{self.glyphs.sep}{messages} message(s){self.glyphs.sep}{count} checkpoint(s)"
+        )
+
+    def _confirm_delete(self, session_id: str, *, after: Any = None) -> None:
+        current = str(getattr(self.session, "session_id", "") or "") if self.session is not None else ""
+        if session_id == current:
+            self._line("Can't delete the current session; switch to another session first.", "warn")
+            return
+        store = self._session_store()
+        if store is None or not callable(getattr(store, "delete_session", None)):
+            self._line("Deleting is not available with this session.", "warn")
+            return
+        preview = self._delete_preview(store, session_id)
+
+        def chosen(confirmed: bool | None) -> None:
+            if confirmed:
+                self._perform_delete(store, session_id, after)
+
+        self.push_screen(DeleteConfirm(preview), chosen)
+
+    def _delete_from_picker(self, session_id: str) -> None:
+        self._confirm_delete(session_id, after=self._close_picker)
+
+    def _close_picker(self) -> None:
+        if isinstance(self.screen, SessionPicker):
+            self.pop_screen()
+
+    def _perform_delete(self, store: Any, session_id: str, after: Any = None) -> None:
+        from ironclad.session_store.checkpoints import delete_session_cascade
+
+        checkpoints = self._checkpoints()
+        if checkpoints is None:
+            deleted = bool(store.delete_session(session_id))
+        else:
+            deleted = delete_session_cascade(store, checkpoints, session_id)
+        if after is not None:  # pop the picker before writing to the transcript behind it
+            after()
+        if not deleted:
+            self._line("That session is active in another Nedster window; close it there first.", "warn")
+            return
+        self._line(f"Deleted session {session_id[:SHORT_ID]}.", "accent")
 
     # ------------------------------------------------------------------ events
 
@@ -505,28 +903,42 @@ class NedsterApp(App[None]):
 
     def _on_turn_started(self, event: EngineEvent) -> None:
         self.turn_closed = False
+        self._model_started = None
         self._set_state("thinking")
 
     def _on_model_delta(self, event: EngineEvent) -> None:
+        if self._model_started is None:
+            self._model_started = time.monotonic()
         if self.current_reply is None:
             self.current_reply = AssistantMessage(self.glyphs)
             self.turn_replies.append(self.current_reply)
             self.transcript.add(self.current_reply)
         self.current_reply.append(str(event.data.get("text") or ""), str(event.data.get("kind") or "content"))
-        self.transcript.call_after_refresh(self.transcript.scroll_end, animate=False)
+        self.transcript.follow_output()
         self._set_state("thinking")
 
     def _on_model_usage(self, event: EngineEvent) -> None:
-        used = int(event.data.get("prompt_tokens") or 0) + int(event.data.get("completion_tokens") or 0)
-        info = dict(self.status_bar.info)
-        info["context_used"] = used
-        self.status_bar.set_info(info)
+        data = event.data
+        wall = time.monotonic() - self._model_started if self._model_started is not None else None
+        self._model_started = None
+        self.status_bar.note_usage(
+            int(data.get("prompt_tokens") or 0),
+            int(data.get("completion_tokens") or 0),
+            decode_ms=float(data.get("decode_ms") or 0.0),
+            wall_s=wall,
+        )
+        self.status_bar.advance_step()
 
     def _on_tool_started(self, event: EngineEvent) -> None:
         self.current_reply = None
         call_id = str(event.data.get("call_id") or f"call-{len(self.tool_rows)}")
         tool = str(event.data.get("tool") or "tool")
-        row = ToolRow(self.glyphs, call_id, tool, dict(event.data.get("arguments") or {}), diff_loader=self._diff_loader)
+        row = ToolRow(
+            self.glyphs, call_id, tool, dict(event.data.get("arguments") or {}),
+            diff_loader=self._diff_loader,
+            output_loader=lambda cid=call_id: self._load_full_output(cid),
+            expanded=self.verbose,
+        )
         self.tool_rows[call_id] = row
         self.transcript.add(row)
         self._set_state("running tool", tool)
@@ -534,9 +946,17 @@ class NedsterApp(App[None]):
     def _on_tool_finished(self, event: EngineEvent) -> None:
         data = dict(event.data)
         call_id = str(data.get("call_id") or "")
+        handle = str(data.get("output_handle") or "")
+        if handle:
+            self._output_handles[call_id] = handle
         row = self.tool_rows.get(call_id)
         if row is None:
-            row = ToolRow(self.glyphs, call_id, str(data.get("tool") or "tool"), {}, diff_loader=self._diff_loader)
+            row = ToolRow(
+                self.glyphs, call_id, str(data.get("tool") or "tool"), {},
+                diff_loader=self._diff_loader,
+                output_loader=lambda cid=call_id: self._load_full_output(cid),
+                expanded=self.verbose,
+            )
             self.tool_rows[call_id or f"call-{len(self.tool_rows)}"] = row
             self.transcript.add(row)
         row.finish(data)
@@ -558,6 +978,7 @@ class NedsterApp(App[None]):
 
     def _on_turn_finished(self, event: EngineEvent) -> None:
         answer = str(event.data.get("answer") or "").strip()
+        self._turn_outcome = str(event.data.get("outcome") or "")
         self._show_answer(answer)
         if self.pending_badge is None and event.data.get("outcome"):
             self.pending_badge = OutcomeBadge(self.glyphs, str(event.data["outcome"]))
@@ -565,7 +986,17 @@ class NedsterApp(App[None]):
         if self.cancelling:
             self.cancelling = False
             self._message("Cancelled")
+        else:
+            self._say_done(str(event.data.get("outcome") or ""))
         self._set_state("idle")
+        # Show plan-ready hint after a completed plan turn
+        if not self.busy and not self._plan_hint_shown:
+            info = self.session.info() if self.session else {}
+            role = str(info.get("role", "")).lower()
+            outcome = str(event.data.get("outcome") or "")
+            if role == "plan" and outcome in ("completed", "answered", "no_change_needed"):
+                self._line("Plan ready. /act to execute it in code mode.", "accent")
+                self._plan_hint_shown = True
 
     def _on_error(self, event: EngineEvent) -> None:
         message = str(event.data.get("message") or "error")
@@ -602,18 +1033,91 @@ class NedsterApp(App[None]):
         for path in paths:
             if str(path) not in self.changed_paths:
                 self.changed_paths.append(str(path))
+                self._turn_changed = True
 
     def _diff_loader(self, paths: Sequence[str]) -> str:
         return session_diff(Path(self.config.runtime.project_root), paths)
+
+    # ------------------------------------------------------------------ completion notice
+
+    def _turn_outcome_word(self) -> str:
+        """One word for the completion notice: cancelled / failed / completed."""
+        if self.cancelling:
+            return "cancelled"
+        return "failed" if self._turn_outcome in FAILURE_OUTCOMES else "completed"
+
+    def _notify_turn(self, outcome: str, seconds: float) -> None:
+        """Emit the configured completion notice; silent in machine modes (the TUI never runs there)."""
+        mode = str(getattr(self.config.runtime, "notify", "bell") or "off")
+        threshold = float(getattr(self.config.runtime, "notify_after_s", 15.0) or 0.0)
+        data = notification(mode, outcome, seconds, threshold=threshold, interactive=True)
+        if data is not None:
+            self._notify_writer(data)
+
+    def _default_notify_writer(self, data: str) -> None:
+        """Write an escape sequence straight to the terminal (bypasses the screen buffer)."""
+        file = getattr(self.console, "file", None)
+        if file is None:
+            return
+        with suppress(Exception):
+            file.write(data)
+            file.flush()
+
+    # ------------------------------------------------------------------ full output + follow hint
+
+    def _load_full_output(self, call_id: str) -> str:
+        """Read a tool call's complete stored output (blocking; call from a worker)."""
+        store = self._session_store()
+        session_id = str(getattr(self.session, "session_id", "")) if self.session is not None else ""
+        reader = getattr(store, "output_for_call", None)
+        if callable(reader) and session_id and call_id:
+            try:
+                return str(reader(session_id, call_id) or "")
+            except Exception:  # noqa: BLE001 - fall back to whatever the row already has
+                return ""
+        return ""
+
+    @on(ToolRow.FullOutput)
+    def _open_full_output(self, message: ToolRow.FullOutput) -> None:
+        row = message.row
+        loader = row.output_loader
+        if loader is None and not row.event_output():
+            self._message("No stored output to show for this tool call")
+            return
+        name = self.glyphs.text(row.tool)
+        self.push_screen(
+            OutputViewer(
+                self.glyphs,
+                title=name,
+                loader=loader,
+                fallback=row.event_output(),
+                historical=row.historical,
+            )
+        )
+
+    def _output_loader_for(self, call_id: str) -> Callable[[], str]:
+        return lambda: self._load_full_output(call_id)
+
+    def _show_follow_hint(self, pending: bool) -> None:
+        hint = self.query_one("#follow-hint", Static)
+        if pending and self.size.width >= 80 and self.size.height >= 24:
+            hint.update(Text(self._text("New output - End to follow")))
+            hint.display = True
+        else:
+            hint.display = False
 
     # ------------------------------------------------------------------ input
 
     @on(Composer.Submitted, "#prompt")
     def on_submit(self, event: Composer.Submitted) -> None:
         value = event.value.strip()
+        composer = event.composer
+        if self._pending_soul is not None:  # y/N answer to /soul remember|reset (Enter = no)
+            composer.set_text("")
+            self._confirm_soul(value)
+            return
         if not value:
             return
-        composer = event.composer
         if value.startswith("/"):
             command = value.split()[0].lower()
             if self.busy and command in IDLE_ONLY:
@@ -628,6 +1132,9 @@ class NedsterApp(App[None]):
         self.submit_text(value)
 
     def submit_text(self, value: str) -> None:
+        if self._pending_soul is not None:  # treat a programmatic submit as the y/N answer
+            self._confirm_soul(value)
+            return
         if self.busy:
             self.queue.append(value)
             g = self.glyphs
@@ -644,8 +1151,18 @@ class NedsterApp(App[None]):
         self._start_turn(value)
 
     def _start_turn(self, value: str) -> None:
+        if not self._activate_session():
+            composer = self.query_one("#prompt", Composer)
+            draft = composer.text
+            composer.set_text(f"{value}\n{draft}" if draft.strip() else value)
+            self._message("Not sent: this conversation is not available here (your text was kept)")
+            return
         self.busy = True
         self.turn_closed = False
+        self._turn_started = time.monotonic()
+        self._turn_outcome = ""
+        self.turn_number += 1
+        self._say("thinking")
         self.status_bar.start_turn()
         self._set_state("thinking")
         self.run_worker(self._run_turn(value), group="turn")
@@ -662,6 +1179,7 @@ class NedsterApp(App[None]):
         except Exception as exc:  # noqa: BLE001 - shown in the transcript
             self._line(f"{g.icon('fail')} Turn failed: {exc}", "fail")
         self._close_turn()
+        self._notify_turn(self._turn_outcome_word(), time.monotonic() - self._turn_started)
         self.busy = False
         if self.cancelling:
             self.cancelling = False
@@ -669,6 +1187,8 @@ class NedsterApp(App[None]):
         self.status_bar.end_turn()
         self._set_state("idle")
         self._refresh_info()
+        self.run_worker(self._refresh_files(force=self._turn_changed), group="files", exclusive=True)
+        self._turn_changed = False
         self._dequeue()
 
     def _dequeue(self) -> None:
@@ -684,7 +1204,17 @@ class NedsterApp(App[None]):
     # ------------------------------------------------------------------ actions
 
     def action_escape(self) -> None:
+        from textual.screen import ModalScreen
+
+        if isinstance(self.screen, ModalScreen):  # app-level Esc has priority; let the modal handle it
+            cancel = getattr(self.screen, "action_cancel", None)
+            if cancel is not None:
+                cancel()
+            return
         composer = self.query_one("#prompt", Composer)
+        if composer.search_active:
+            composer.cancel_search()  # Esc restores the draft that was in the composer
+            return
         if composer.completion is not None:
             composer.close_completion()
             return
@@ -723,6 +1253,9 @@ class NedsterApp(App[None]):
     def action_help(self) -> None:
         self._command("/help")
 
+    def action_history(self) -> None:
+        self.query_one("#prompt", Composer).cycle_search()
+
     def action_details(self) -> None:
         self.details_visible = not self.details_visible
         self.query_one("#work").display = not self.details_visible
@@ -737,20 +1270,42 @@ class NedsterApp(App[None]):
     def action_clear(self) -> None:
         self.transcript.remove_children()
         self.tool_rows = {k: v for k, v in self.tool_rows.items() if v.finished is None}
+        self.transcript.following = True
+        self.transcript.new_output = False
+        self._show_follow_hint(False)
+
+    def action_verbose(self) -> None:
+        """Ctrl+O: expand every tool row in this session (in-memory; not persisted)."""
+        self.verbose = not self.verbose
+        for row in self.tool_rows.values():
+            row.expanded = self.verbose
+            row.refresh(layout=True)
+        self._message("Verbose transcript · tool rows expanded" if self.verbose else "")
+
+    def action_models(self) -> None:
+        self._open_model_picker()
+
+    def action_session_picker(self) -> None:
+        self._open_session_picker()
 
     # ------------------------------------------------------------------ commands
 
     def _command(self, value: str) -> None:
-        parts = value.split()
-        command, args = parts[0].lower(), parts[1:]
+        head = value.split(None, 1)
+        command = head[0].lower()
+        args = head[1].split() if len(head) > 1 else []
+        rest = head[1] if len(head) > 1 else ""  # spaces kept for /rename
         handlers: dict[str, Callable[[list[str]], Any]] = {
             "/quit": lambda _a: self.exit(),
             "/exit": lambda _a: self.exit(),
             "/help": self._cmd_help,
             "/clear": lambda _a: self.action_clear(),
+            "/init": self._cmd_init,
             "/new": self._cmd_new,
             "/sessions": self._cmd_sessions,
             "/resume": self._cmd_resume,
+            "/rename": lambda _a: self._cmd_rename(rest),
+            "/delete": self._cmd_delete,
             "/model": self._cmd_model,
             "/models": self._cmd_models,
             "/status": self._cmd_status,
@@ -758,10 +1313,16 @@ class NedsterApp(App[None]):
             "/undo": lambda _a: self.run_worker(self._cmd_undo(), group="command"),
             "/doctor": lambda _a: self.run_worker(self._cmd_doctor(), group="command"),
             "/permissions": self._cmd_permissions,
+            "/soul": self._cmd_soul,
+            "/role": self._cmd_role,
+            "/act": lambda _a: self._cmd_act(_a),
         }
         handler = handlers.get(command)
         if handler is None:
             self._line(f"Unknown command {command}. /help lists commands.", "warn")
+            return
+        if command in NO_ARG_COMMANDS and args:
+            self._line(f"{command} takes no arguments · usage: {command}", "warn")
             return
         handler(args)
 
@@ -770,9 +1331,36 @@ class NedsterApp(App[None]):
         for name, text in COMMANDS.items():
             self._line(f"  {name:<13}{text}")
         self._line("Keys", "accent")
-        self._line("  Enter send · Shift+Enter/Ctrl+J newline · Up/Down history · @ file · / command")
-        self._line("  Esc stop the running turn · Ctrl+C twice exit · F2 raw events · Ctrl+L clear")
+        self._line("  Enter send · Shift+Enter/Ctrl+J newline · Up/Down history · Ctrl+R search history")
+        self._line("  @ file · / command · Esc stop the running turn · Ctrl+C twice exit")
+        self._line("  F1 help · F4 models · Ctrl+S switch conversation · F2 raw events · Ctrl+L clear · Ctrl+O verbose")
         self._line("  Tool rows: focus with Tab/click, Enter expands argv, output and diff")
+        self._line("  On a tool row, press o for the full stored output (Esc closes)")
+        self._line("  Shift+Tab toggle role between plan/code (idle only)")
+
+    def _cmd_init(self, args: list[str]) -> None:
+        from ironclad.scaffold import AGENTS_FILENAME, line_count, starter_agents_md, write_agents_md
+
+        root = Path(self.config.runtime.project_root)
+        preview = bool(args) and args[0] in ("--print", "-p", "print")
+        try:
+            content = starter_agents_md(root, self.config)
+        except Exception as exc:  # noqa: BLE001 - shown in the transcript, never fatal
+            self._line(f"init failed: {exc}", "fail")
+            return
+        if preview:
+            self.transcript.add(Static(self._text(content)))
+            self._line(f"{AGENTS_FILENAME} preview ({line_count(content)} lines, nothing written)", "accent")
+            return
+        try:
+            path = write_agents_md(root, content)
+        except FileExistsError:
+            self._line(f"{AGENTS_FILENAME} already exists in {root}; not overwritten.", "warn")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._line(f"init failed: {exc}", "fail")
+            return
+        self._line(f"Wrote {path.name} ({line_count(content)} lines). Edit it to describe this project.", "accent")
 
     def _cmd_new(self, _args: list[str]) -> None:
         new = getattr(self.session, "new", None)
@@ -784,33 +1372,59 @@ class NedsterApp(App[None]):
         self._acquire_lock(str(session_id))
         self.action_clear()
         self.changed_paths.clear()
-        self._line(f"New conversation {str(session_id)[:12]}", "accent")
+        self._line(f"New conversation {str(session_id)[:SHORT_ID]}", "accent")
         self._refresh_info()
+        self.status_bar.reset_usage()
 
     def _cmd_sessions(self, _args: list[str]) -> None:
-        lister = getattr(self.session, "list_sessions", None)
-        if lister is None:
-            self._line("Saved sessions are not available with this session.", "warn")
+        self._open_session_picker()
+
+    def _cmd_rename(self, name: str) -> None:
+        store = self._session_store()
+        setter = getattr(store, "set_title", None)
+        if self.session is None or not callable(setter):
+            self._line("Renaming is not available with this session.", "warn")
             return
-        sessions = list(lister())
-        if not sessions:
-            self._line("No saved sessions for this project.")
+        clean = normalize_title(name)
+        if not clean:
+            self._line("Usage: /rename <name>", "warn")
             return
-        current = self.status_bar.info.get("session_id")
-        self._line("Sessions (newest first) · /resume <id>", "accent")
-        for item in sessions:
-            sid = str(item.get("id", ""))
-            updated = item.get("updated_ns")
-            when = datetime.fromtimestamp(int(updated) / 1e9).strftime("%Y-%m-%d %H:%M") if updated else ""
-            marker = "*" if sid == current else " "
-            self._line(f" {marker} {sid[:12]}  {when}  {item.get('title') or ''}")
+        setter(str(self.session.session_id), clean)
+        self._line(f"Renamed session {str(self.session.session_id)[:SHORT_ID]} to {clean}", "accent")
+        self._refresh_info()
+
+    def _cmd_delete(self, args: list[str]) -> None:
+        """``/delete [ref]``: confirm, then remove the conversation and its checkpoints.
+
+        Without a reference it opens the picker, where Del (or ``/delete`` on a row) runs the
+        same flow against the highlighted conversation.
+        """
+        if not args:
+            self._open_session_picker()
+            return
+        store = self._session_store()
+        wanted = " ".join(args)
+        if store is None or not callable(getattr(store, "resolve_session", None)):
+            self._line("Deleting is not available with this session.", "warn")
+            return
+        from ironclad.session_store.sqlite_store import SessionResolutionError
+
+        try:
+            session_id = str(store.resolve_session(str(self.config.runtime.project_root), wanted)["id"])
+        except SessionResolutionError as exc:
+            self._line(str(exc), "warn")
+            return
+        self._confirm_delete(session_id)
 
     def _cmd_resume(self, args: list[str]) -> None:
+        if not args:  # bare /resume: choose from the picker
+            self._open_session_picker()
+            return
         resume = getattr(self.session, "resume", None)
         if resume is None:
             self._line("Resuming a saved session is not available with this session.", "warn")
             return
-        wanted = args[0] if args else None
+        wanted = " ".join(args) if args else None  # join so an exact title may contain spaces
         store = self._session_store()
         target: str | None = None
         if callable(getattr(store, "transcript", None)):
@@ -819,40 +1433,113 @@ class NedsterApp(App[None]):
             except LookupError as exc:
                 self._line(str(exc), "warn")
                 return
+        previous = self._locked
+        if target is not None:
+            self._locked = None  # take the target's lock first; the current one is released on success
             if not self._acquire_lock(target):  # active elsewhere: keep the current conversation
+                self._locked = previous
                 return
         try:
             session_id = str(resume(wanted if target is None else target))
-        except LookupError as exc:
-            self._line(str(exc), "warn")
-            return
         except Exception as exc:  # noqa: BLE001 - shown in the transcript, never fatal
-            self._line(f"Resume failed: {exc}", "fail")
+            if target is not None and (previous is None or previous[1] != target):
+                self._release_lock()  # the switch did not happen: drop the target's lock, keep ours
+            self._locked = previous
+            if isinstance(exc, LookupError):
+                self._line(str(exc), "warn")
+            else:
+                self._line(f"Resume failed: {exc}", "fail")
             return
+        if previous is not None and target is not None and previous[1] != target:
+            self._release_entry(previous)  # switched: the old conversation is free for other windows
         if target is not None and session_id != target:
             self._release_lock()
             self._acquire_lock(session_id, warn=False)
         self._replay_session(session_id)
 
+    def _cmd_models(self, _args: list[str]) -> None:
+        self._open_model_picker()
+
     def _cmd_model(self, args: list[str]) -> None:
-        info = self.session.info() if self.session else {}
         if not args:
-            self._line(f"Model: {info.get('model') or 'none'} ({info.get('provider') or 'LOCAL'})")
+            self._open_model_picker()
             return
+        self.run_worker(self._switch_model(args[0]), group="command")
+
+    def _current_model(self) -> str:
+        return str(self.session.info().get("model") or "") if self.session is not None else ""
+
+    def _open_model_picker(self) -> None:
+        if self.session is None:
+            self._line("Runtime unavailable · run nedster setup", "warn")
+            return
+        if self.busy:
+            self._message(f"Models waits for the running turn {self.glyphs.sep} Esc stops it")
+            return
+        self.run_worker(self._load_models_and_pick(), group="command")
+
+    async def _load_models_and_pick(self) -> None:
+        from .widgets.model_picker import ModelPicker
+
+        current = self._current_model()
+        try:
+            models = await asyncio.to_thread(self.model_source, current)
+        except Exception:  # noqa: BLE001 - a dead endpoint is explained, never a crash
+            self._line(self._models_unreachable(), "warn")
+            return
+        if not models:
+            self._line("No models are installed. Add one with: ollama pull <model>", "warn")
+            return
+        self.push_screen(ModelPicker(models, current=current, glyphs=self.glyphs), self._on_model_picked)
+
+    def _on_model_picked(self, name: str | None) -> None:
+        self._message("")
+        if not name or self.session is None:
+            return
+        if name == self._current_model():
+            self._message(f"{name} is already the active model")
+            return
+        self._apply_model(name)
+
+    async def _switch_model(self, name: str) -> None:
+        if self.session is None:
+            self._line("Runtime unavailable · run nedster setup", "warn")
+            return
+        from .model_manager import match_installed_model, model_not_installed_message
+
+        current = self._current_model()
+        try:
+            models = await asyncio.to_thread(self.model_source, current)
+        except Exception:  # noqa: BLE001 - cannot validate offline; keep the previous model
+            self._line(self._models_unreachable(), "warn")
+            return
+        installed = [model.name for model in models]
+        canonical = match_installed_model(name, installed)
+        if canonical is None:
+            self._line(model_not_installed_message(name, installed), "warn")
+            return
+        self._apply_model(canonical)
+
+    def _apply_model(self, name: str) -> None:
         setter = getattr(self.session, "set_model", None)
         if setter is None:
             self._line("This engine picks models from the fleet; change models.coder in config.toml.", "warn")
             return
-        setter(args[0])
-        self._line(f"Model set to {args[0]}", "accent")
+        try:
+            setter(name)
+        except Exception as exc:  # noqa: BLE001 - shown, never fatal
+            self._line(f"Could not switch model: {exc}", "fail")
+            return
+        self._line(f"Model set to {name}", "accent")
         self._refresh_info()
+        self.status_bar.reset_usage()  # a different model's measured context/speed does not apply
 
-    def _cmd_models(self, _args: list[str]) -> None:
-        rows = getattr(self.session, "models", lambda: [])()
-        if not rows:
-            self._line("No model fleet is active. Run `nedster setup`.")
-        for role, model, backend in rows:
-            self._line(f"{role}: {model} ({backend})")
+    def _models_unreachable(self) -> str:
+        g = self.glyphs
+        return (
+            f"{g.icon('fail')} Ollama is not reachable at {self.config.models.ollama_url}. "
+            "Start it (`ollama serve`), then retry."
+        )
 
     def _cmd_status(self, _args: list[str]) -> None:
         if self.session is None:
@@ -866,7 +1553,8 @@ class NedsterApp(App[None]):
             ("model", f"{info.get('model', '')} ({info.get('provider', 'LOCAL')})"),
             ("context", f"{info.get('context_used', 0)}/{info.get('context_max', 0) or 'n/a'} tokens"),
             ("sandbox", label),
-            ("session", info.get("session_id", "")),
+            ("session", str(info.get("session_id", ""))[:SHORT_ID]),
+            ("title", self._current_title()),
             ("changed", f"{len(self.changed_paths)} file(s)"),
             ("queued", str(len(self.queue))),
             ("state", self.status_bar.state),
@@ -930,8 +1618,142 @@ class NedsterApp(App[None]):
         policy = self.config.policy
         self._line(f"Autonomous: {policy.autonomous} · automatic risk ceiling: {policy.max_auto_risk}")
 
+    def _read_soul_text(self, path: Path) -> str:
+        from ironclad.engine.prompt import DEFAULT_SOUL_TEMPLATE
+
+        try:
+            return path.read_text(encoding="utf-8") if path.is_file() else DEFAULT_SOUL_TEMPLATE
+        except OSError:
+            return DEFAULT_SOUL_TEMPLATE
+
+    def _cmd_soul(self, args: list[str]) -> None:
+        from ironclad.engine.prompt import soul_path
+
+        path = soul_path()
+        if not args:
+            try:
+                size = path.stat().st_size if path.is_file() else 0
+            except OSError:
+                size = 0
+            self._line(f"Soul: {self.soul_mode} · {path} · {size} bytes")
+            if self.soul_mode != "full":
+                self._line('soul.md reaches the prompt only in "full" mode (runtime.soul = "full").')
+            self._line("Usage: /soul remember <preference> | /soul reset")
+            return
+        action = args[0].lower()
+        if action == "remember":
+            from ironclad.engine.prompt import with_preference
+
+            preference = " ".join(args[1:]).strip()
+            if not preference:
+                self._line("Usage: /soul remember <preference>", "warn")
+                return
+            edit = with_preference(self._read_soul_text(path), preference)
+            if not edit.ok:
+                self._line("That preference is already saved." if edit.action == "duplicate" else "Empty preference.", "warn")
+                return
+            notice = f" (drops oldest: {edit.dropped})" if edit.dropped else ""
+            self._line(f"Will add: {edit.bullet}{notice}", "accent")
+            if self.soul_mode != "full":
+                self._line(f'Note: soul.md reaches the prompt only in "full" mode (runtime.soul = "{self.soul_mode}").', "warn")
+            self._pending_soul = ("remember", edit)
+            self._message("Append this preference? y/N · applies from your next session")
+            return
+        if action == "reset":
+            self._pending_soul = ("reset", None)
+            self._message("Restore the default soul.md template? y/N · your edits are lost")
+            return
+        self._line("Usage: /soul remember <preference> | /soul reset", "warn")
+
+    def _confirm_soul(self, answer: str) -> None:
+        from ironclad.engine.prompt import DEFAULT_SOUL_TEMPLATE, soul_path, write_soul
+
+        pending, self._pending_soul = self._pending_soul, None
+        if pending is None:
+            return
+        kind, edit = pending
+        if answer.strip().lower() not in ("y", "yes"):
+            self._message("")
+            self._line("Cancelled; soul.md unchanged.")
+            return
+        path = soul_path()
+        if kind == "remember":
+            text, notice = edit.text, (f" (dropped oldest: {edit.dropped})" if edit.dropped else "")
+            message = f"Saved preference{notice}. Applies from your next session."
+        else:
+            text, message = DEFAULT_SOUL_TEMPLATE, "Restored the default soul.md template. Applies from your next session."
+        try:
+            write_soul(path, text)
+        except OSError as exc:
+            self._line(f"Could not write {path}: {exc}", "fail")
+            return
+        self._message("")
+        self._line(message, "accent")
+
+    def _set_role(self, name: str) -> None:
+        """Switch to a named role and update the status bar."""
+        from ironclad.engine.roles import get_role
+
+        if self.busy:
+            self._line("Finish or stop the current turn first.", "warn")
+            return
+        role = get_role(name)
+        setter = getattr(self.session, "set_role", None) if self.session else None
+        if setter is not None:
+            try:
+                setter(name)
+            except Exception as exc:  # noqa: BLE001 - e.g. the engine refuses while busy
+                self._line(f"Could not switch role: {exc}", "warn")
+                return
+        info = self.session.info() if self.session else {}
+        self.status_bar.set_info(info)
+        self._line(f"Mode: {role.label} · read-only" if role.read_only else f"Mode: {role.label}", "accent")
+        self._plan_hint_shown = False
+
+    def _cmd_role(self, args: list[str]) -> None:
+        from ironclad.engine.roles import list_roles, role_names
+
+        if not args or args[0] == "list":
+            current = self.session.info().get("role", "") if self.session else ""
+            for role in list_roles():
+                marker = "*" if role.name == current else " "
+                label = f"{role.label} · read-only" if role.read_only else role.label
+                self._line(f"  {marker} /role {role.name:<8}{label} — {role.description}")
+            return
+        name = args[0].lower()
+        names = role_names()
+        if name not in set(n.lower() for n in names):
+            self._line(f"Unknown role '{name}'. Valid roles: {', '.join(names)}", "warn")
+            return
+        self._set_role(name)
+
+    def action_toggle_role(self) -> None:
+        """Shift+Tab: toggle between code and plan while idle."""
+        if self.busy:
+            self._line("Finish or stop the current turn first.", "warn")
+            return
+        if self.session is None:
+            self._line("Runtime unavailable.", "warn")
+            return
+        info = self.session.info()
+        current = str(info.get("role", "")).lower()
+        target = "plan" if current != "plan" else "code"
+        self._set_role(target)
+
+    def _cmd_act(self, _args: list[str]) -> None:
+        """Switch to code mode then submit 'Execute the plan above.'"""
+        if self.busy:
+            self._line("Finish or stop the current turn first.", "warn")
+            return
+
+        self._set_role("code")
+        # Switch to code mode, then submit the plan execution text
+        composer = self.query_one("#prompt", Composer)
+        composer.set_text("Execute the plan above.")
+        # Trigger submission programmatically
+        self.submit_text("Execute the plan above.")
+
     async def on_unmount(self) -> None:
-        self._release_lock()
         close = getattr(self.session, "close", None)
         if close is not None:
             with suppress(Exception):
@@ -946,5 +1768,16 @@ def run_tui(
     ascii_only: bool = False,
     no_color: bool = False,
     session_factory: SessionFactoryFor | None = None,
+    session_ref: str | None = None,
+    resume_latest: bool = False,
+    open_picker_on_start: bool = False,
 ) -> None:
-    NedsterApp(config, ascii_only=ascii_only, no_color=no_color, session_factory=session_factory).run()
+    NedsterApp(
+        config,
+        ascii_only=ascii_only,
+        no_color=no_color,
+        session_factory=session_factory,
+        session_ref=session_ref,
+        resume_latest=resume_latest,
+        open_picker_on_start=open_picker_on_start,
+    ).run()

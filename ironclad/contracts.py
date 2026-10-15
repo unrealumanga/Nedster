@@ -210,7 +210,7 @@ EventKind = Literal[
     "model.delta",  # data: {"text", "kind"}
     "model.usage",  # data: Usage fields
     "tool.started",  # data: {"call_id", "tool", "arguments"}
-    "tool.finished",  # data: {"call_id", "tool", "status", "summary", "mutated_paths", "elapsed_ms"}
+    "tool.finished",  # data: {"call_id", "tool", "status", "summary", "mutated_paths", "elapsed_ms", "output_handle"}
     "context.compacted",  # data: {"elided", "handles", "tokens_before", "tokens_after"}
     "acceptance",  # data: AcceptanceResult fields
     "turn.finished",  # data: {"answer", "outcome"}
@@ -244,5 +244,7 @@ class SessionStore(Protocol):
     def put_output(self, session_id: str, tool: str, call_id: str, text: str) -> int: ...
 
     def get_output(self, session_id: str, handle: int) -> str: ...
+
+    def output_for_call(self, session_id: str, call_id: str) -> str | None: ...
 
     def replace_messages(self, session_id: str, messages: list[ChatMessage]) -> None: ...

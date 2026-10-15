@@ -1,0 +1,9 @@
+{
+  "prompt": "Implement TTLCache in ttlcache.py following SPEC.md. Stick to the spec, there will be tests written against it.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": ["SPEC.md"],
+  "may_change": ["ttlcache.py", "test_*.py"],
+  "requires": [],
+  "forbidden_commands": []
+}

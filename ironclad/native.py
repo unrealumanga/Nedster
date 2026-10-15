@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import AcceptanceResult, EngineEvent
+from .session_store.titles import normalize_title
 
 DEFAULT_WORKER = "nedster-worker"
 FALLBACK_CONTEXT_TOKENS = 32_768
@@ -41,6 +42,19 @@ def context_budget(config: Any, model: str) -> int:
     except (httpx.HTTPError, ValueError, AttributeError):
         pass
     return FALLBACK_CONTEXT_TOKENS
+
+
+def engine_budget(config: Any, model: str) -> Any:
+    """Run limits from ``runtime.max_steps`` / ``runtime.max_tool_calls`` (0 = no limit)."""
+    from .engine.state import Budget
+
+    steps = int(getattr(config.runtime, "max_steps", 40))
+    tool_calls = int(getattr(config.runtime, "max_tool_calls", 120))
+    return Budget(
+        max_steps=steps if steps > 0 else None,
+        max_tool_calls=tool_calls if tool_calls > 0 else None,
+        context_tokens=context_budget(config, model),
+    )
 
 
 def git_inventory(git: Any) -> Callable[[Path], list[str]]:
@@ -111,9 +125,15 @@ class NativeSession:
         session_id: str | None = None,
         resume_latest: bool = False,
         title: str = "",
+        lazy: bool = False,
+        role: str | None = None,
+        admit: Callable[[Any, str], Any] | None = None,
     ) -> None:
+        """``admit(store, session_id)`` takes ownership of the chosen session (the CLI's activity lock).
+        It runs before any constructor-side write to that session (title, instruction/soul snapshots)
+        and refuses by raising; the store is then closed and the error propagates, so a refused run
+        leaves the session untouched. A lazy session is admitted when its row is first created."""
         from .engine.loop import Engine
-        from .engine.state import Budget
         from .session_store.checkpoints import CheckpointStore
         from .session_store.sqlite_store import SqliteSessionStore
         from .transport.ollama import OllamaTransport
@@ -127,22 +147,68 @@ class NativeSession:
         self.checkpoints = CheckpointStore(db_path)
         self.recovery_notes = self.checkpoints.recover()
         root = str(self.project_root)
-        if session_id is None and resume_latest:
-            session_id = self.store.latest_session(root)
-        self.session_id = session_id or self.store.create(root, title)
+        name = normalize_title(title)
+        self._admit = admit
+        self._role_override = role  # an explicit trusted role (CLI --role) wins over a saved one
+        self._pending_title = ""  # stored when a lazily-created session is finally written
+        self.started_new = False
+        rename = ""  # an explicit --name for a resumed session, written only after admission
+        try:
+            if session_id is not None:
+                # A full id, a unique prefix or an exact title, scoped to this project (F01/F02/F07).
+                self.session_id = str(self.store.resolve_session(root, session_id)["id"])
+                rename = name  # an explicit --name renames the session it resumes
+            elif resume_latest:
+                latest = self.store.latest_non_empty(root)  # never continue an empty launch artifact (F06)
+                if latest is None:
+                    self.started_new = True
+                    self.session_id = None if lazy else self.store.create(root, name)
+                    self._pending_title = name
+                else:
+                    self.session_id = latest
+                    rename = name
+            elif lazy:
+                # No session row until the first submitted prompt (F06): opening and closing the UI
+                # leaves nothing behind.
+                self.started_new = True
+                self.session_id = None
+                self._pending_title = name
+            else:
+                self.started_new = True
+                self.session_id = self.store.create(root, name)
+            if self.session_id and admit is not None:
+                admit(self.store, str(self.session_id))
+        except BaseException:
+            self.checkpoints.close()
+            self.store.close()
+            raise
+        if rename:
+            self.store.set_title(str(self.session_id), rename)
         self.model = worker_model(config, model)
         self.tools, self.executor = build_tools(self.project_root, config, self.checkpoints)
         self.checkpoints.on_undone.append(self.tools.invalidate_after_undo)
         self.transport = OllamaTransport(config.models.ollama_url)
+        soul_mode = str(getattr(config.runtime, "soul", "off") or "off")
+        self._default_role = str(getattr(config.runtime, "role", "code") or "code")
+        role_name = role or self._saved_role() or self._default_role
         self.engine = Engine(
             self.transport,
             self.tools,
             model=self.model,
             store=self.store,
-            budget=Budget(context_tokens=context_budget(config, self.model)),
+            budget=engine_budget(config, self.model),
             emit=emit,
             project_root=self.project_root,
+            soul=soul_mode,
+            role=role_name,
         )
+        from .engine.prompt import session_instructions, session_soul
+
+        # A lazily-created session has no row yet: preview without storing; the engine snapshots both
+        # for the real id at the first turn.
+        snapshot_store = self.store if self.session_id else None
+        self.instructions = session_instructions(snapshot_store, self.session_id, self.project_root)
+        self.soul = session_soul(snapshot_store, self.session_id, soul_mode)
 
     def info(self) -> dict[str, Any]:
         status = self.executor.backend_status()
@@ -153,15 +219,120 @@ class NativeSession:
             "project_root": str(self.project_root),
             "sandbox": status.name if status else "none",
             "isolation": status.isolation if status else "none",
+            "instructions": (
+                {
+                    "name": self.instructions.name,
+                    "size": self.instructions.size,
+                    "truncated": self.instructions.truncated,
+                }
+                if self.instructions.present
+                else None
+            ),
+            "instructions_warning": self.instructions.warning,
+            "soul": self.soul.mode,
+            "role": self.engine.role_name,
+            "role_label": self.engine.role_label,
         }
+
+    def _saved_role(self) -> str | None:
+        """The role a resumed session last ran under (an explicit ``role=`` still wins).
+
+        Sessions saved before roles were persisted have no entry and keep the configured role.
+        """
+        if self.started_new or not self.session_id:
+            return None
+        from .engine.loop import ROLE_STATE
+        from .engine.roles import role_names
+
+        saved = self.store.get_state(self.session_id, ROLE_STATE)
+        text = str(saved).strip().lower() if saved else ""
+        return text if text in role_names() else None
+
+    def set_role(self, name: str) -> None:
+        """Switch the active role (see ``engine.roles``); the tool gate and session prefix are updated in place.
+
+        Refused by the engine while a turn runs; the accepted role is recorded with the session.
+        """
+        self.engine.set_role(name)
+        if self.session_id:
+            from .engine.loop import ROLE_STATE
+
+            self.store.set_state(self.session_id, ROLE_STATE, self.engine.role_name)
+
+    def set_owner_guard(self, guard: Callable[[str], bool] | None) -> None:
+        """``guard(session_id)`` is False once this process no longer owns the session's lock: the engine
+        then dispatches no further tool and persists nothing more, and the run ends as cancelled."""
+        self.engine.owner_guard = guard
+
+    def note_brief(self, path: str, digest: str) -> None:
+        """Record a ``--brief`` file's provenance in the session transcript (display history, not model history)."""
+        append = getattr(self.store, "append_transcript", None)
+        if callable(append):
+            append(self.ensure_session_id(), "user", f"brief: {path} (sha256 {digest[:12]})")
 
     async def run(self, text: str, *, intent: Any = None) -> AcceptanceResult:
         """``intent``: an ``engine.intent.Intent`` that overrides the classifier (``nedster run --expect``)."""
+        self.ensure_session_id()
+        self._auto_title(text)
         self.checkpoints.begin_turn(self.session_id, self.project_root)
         try:
             return await self.engine.run(self.session_id, text, intent=intent)
         finally:
             self.checkpoints.end_turn()  # also on cancel/error: stores post-images of partial writes
+
+    def ensure_session_id(self) -> str:
+        """Persist the session row if lazy creation still owes one; always return the id.
+
+        Called at the first submitted prompt (and by the TUI, so it can take the activity lock
+        *before* the turn runs). Idempotent.
+        """
+        if not self.session_id:
+            created = self.store.create(str(self.project_root), self._pending_title)
+            if self._admit is not None:
+                self._admit(self.store, created)
+            self.session_id = created
+            self._pending_title = ""
+        return str(self.session_id)
+
+    def switch_session(self, session_id: str | None, *, started_new: bool | None = None) -> None:
+        """Make ``session_id`` the one conversation this session runs, records and checkpoints
+        (None: a fresh lazily-created one). The TUI's /resume and /new go through here so the
+        adapter, the lock and the engine can never disagree about the current conversation.
+
+        The destination's identity includes its role (S2): a resumed session gets back the role it
+        last ran under (and that role's runtime gate) before any submission; a new one gets the
+        configured default; an explicit ``role=`` override still wins."""
+        if session_id == self.session_id and started_new is None:
+            return
+        self._pending_title = ""
+        self.started_new = (session_id is None) if started_new is None else started_new
+        self.session_id = session_id
+        self._restore_role()
+
+    def _restore_role(self) -> None:
+        wanted = self._role_override or self._saved_role() or self._default_role
+        if wanted != self.engine.role_name:
+            self.engine.set_role(wanted)  # refused while a turn runs: switching is idle-only
+
+    def new_session(self, title: str = "") -> str:
+        """Start (and persist) a new conversation and make it current."""
+        created = self.store.create(str(self.project_root), normalize_title(title))
+        if self._admit is not None:
+            self._admit(self.store, created)
+        self.switch_session(created, started_new=True)
+        return created
+
+    def _auto_title(self, text: str) -> None:
+        """Name a still-unnamed session from its first user turn (one place for CLI and TUI).
+
+        Never overwrites a name; for an old blank-title session the first stored message wins.
+        """
+        session = self.store.get_session(self.session_id)
+        if session is None or str(session.get("title") or "").strip():
+            return
+        name = normalize_title(self.store.first_user_text(self.session_id) or text)
+        if name:
+            self.store.set_title(self.session_id, name)
 
     def undo_last(self) -> Any:
         """Undo the last turn's file-tool changes (UndoReport; ``str()`` is the user message). Command side

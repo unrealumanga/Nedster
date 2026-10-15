@@ -7,7 +7,7 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,7 +19,9 @@ HISTORY_LIMIT = 500
 FILE_LIMIT = 20_000
 SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache",
              ".pytest_cache", ".ruff_cache", "dist", "build", ".tox", ".idea"}
-_MENTION = re.compile(r"(?:^|\s)@([^\s@]*)$")
+# A bare mention ("@src/ma") or a quoted one (@"my file"). Quoted form keeps spaces usable mid-typing.
+_MENTION_BARE = re.compile(r'(?:^|\s)@([^\s@"]*)$')
+_MENTION_QUOTED = re.compile(r'(?:^|\s)@"([^"]*)$')
 
 
 class History:
@@ -80,6 +82,11 @@ class History:
             return self.draft
         return self.entries[self.index]
 
+    def matches(self, query: str) -> list[str]:
+        """Entries containing ``query`` (case-insensitive), most recent first."""
+        needle = query.lower()
+        return [entry for entry in reversed(self.entries) if needle in entry.lower()]
+
 
 def project_files(root: Path) -> list[str]:
     """Tracked + untracked-not-ignored files via git; os.walk fallback outside a repository."""
@@ -116,6 +123,7 @@ class Completion:
     kind: str  # "file" | "command"
     start: int  # column in the cursor's line where the replaced token begins
     items: tuple[str, ...]
+    quoted: bool = False  # a @"…" mention: the inserted path keeps its quotes
 
 
 class Composer(TextArea):
@@ -140,21 +148,39 @@ class Composer(TextArea):
         commands: Sequence[str],
         files: Callable[[], Sequence[str]],
         menu: Callable[[], OptionList],
+        command_descriptions: Mapping[str, str] | None = None,
+        hint: Callable[[str | None], None] | None = None,
         id: str | None = None,
     ) -> None:
         super().__init__(id=id, soft_wrap=True, tab_behavior="focus", show_line_numbers=False)
         self.prompt_history = history
         self.commands = list(commands)
+        self.command_descriptions = dict(command_descriptions or {})
         self._files_source = files
-        self._files: Sequence[str] | None = None
         self._menu = menu
+        self._hint = hint
         self.completion: Completion | None = None
         self._suppress_completion = False
+        self._search = False
+        self._search_query = ""
+        self._search_draft = ""
+        self._search_matches: list[str] = []
+        self._search_pos = 0
 
     # ------------------------------------------------------------------ keys
 
     async def _on_key(self, event: events.Key) -> None:
         key = event.key
+        if key == "ctrl+r":  # reverse-search the persisted prompt history
+            event.stop()
+            event.prevent_default()
+            self.cycle_search()
+            return
+        if self._search:  # search owns the keyboard until Enter/Esc
+            event.stop()
+            event.prevent_default()
+            self._search_key(event)
+            return
         if event.character == "?" and not self.text:
             event.stop()
             event.prevent_default()
@@ -212,12 +238,74 @@ class Composer(TextArea):
     def set_text(self, text: str) -> None:
         self._replace_all(text)
 
+    # ------------------------------------------------------------------ reverse history search
+
+    @property
+    def search_active(self) -> bool:
+        return self._search
+
+    def cycle_search(self) -> None:
+        """Ctrl+R: start searching, or step to the next older match while searching."""
+        if not self._search:
+            self._search = True
+            self._search_draft = self.text
+            self._search_query = ""
+            self._search_matches = self.prompt_history.matches("")
+            self._search_pos = 0
+        elif self._search_pos + 1 < len(self._search_matches):
+            self._search_pos += 1
+        self._apply_search()
+
+    def cancel_search(self) -> None:
+        """Esc: leave the search and restore the draft that was in the composer."""
+        if self._search:
+            self._end_search(restore=True)
+
+    def _search_key(self, event: events.Key) -> None:
+        if event.key == "escape":
+            self._end_search(restore=True)
+        elif event.key == "enter":
+            self._end_search(restore=False)  # put the match in the composer; never send it
+        elif event.key == "backspace":
+            self._search_query = self._search_query[:-1]
+            self._refresh_search()
+        elif event.character and event.character.isprintable():
+            self._search_query += event.character
+            self._refresh_search()
+
+    def _refresh_search(self) -> None:
+        self._search_matches = self.prompt_history.matches(self._search_query)
+        self._search_pos = 0
+        self._apply_search()
+
+    def _apply_search(self) -> None:
+        if self._search_matches:
+            self._replace_all(self._search_matches[self._search_pos])
+        self._notify_hint(self._hint_text())
+
+    def _end_search(self, *, restore: bool) -> None:
+        self._search = False
+        if restore:
+            text = self._search_draft
+        else:
+            text = self._search_matches[self._search_pos] if self._search_matches else self._search_draft
+        self._replace_all(text)
+        self._notify_hint(None)
+
+    def _hint_text(self) -> str:
+        if not self._search_matches:
+            return f"(reverse-i-search)`{self._search_query}': no match · Esc cancel"
+        match = self._search_matches[self._search_pos].splitlines()[0]
+        return f"(reverse-i-search)`{self._search_query}': {match} · Enter accept · Ctrl+R older · Esc cancel"
+
+    def _notify_hint(self, text: str | None) -> None:
+        if self._hint is not None:
+            self._hint(text)
+
     # ------------------------------------------------------------------ completion
 
     def files(self) -> Sequence[str]:
-        if self._files is None:
-            self._files = self._files_source()
-        return self._files
+        return self._files_source()  # the app owns the (worker-refreshed) inventory; never scan here
 
     def _on_text_area_changed(self, event: TextArea.Changed) -> None:
         if self._suppress_completion:
@@ -234,20 +322,30 @@ class Composer(TextArea):
             if items and items != (before,):
                 found = Completion("command", 0, items)
         else:
-            mention = _MENTION.search(before)
-            if mention:
-                items = tuple(match_files(self.files(), mention.group(1)))
-                if items:
-                    found = Completion("file", mention.start(1) - 1, items)
+            found = self._file_completion(before)
         self.completion = found
         menu = self._menu()
         if found is None:
             menu.display = False
             return
         menu.clear_options()
-        menu.add_options(list(found.items))
+        if found.kind == "command":
+            menu.add_options([f"{name:<13}{self.command_descriptions.get(name, '')}".rstrip() for name in found.items])
+        else:
+            menu.add_options(list(found.items))
         menu.highlighted = 0
         menu.display = True
+
+    def _file_completion(self, before: str) -> Completion | None:
+        quoted = _MENTION_QUOTED.search(before)
+        mention = quoted or _MENTION_BARE.search(before)
+        if mention is None:
+            return None
+        items = tuple(match_files(self.files(), mention.group(1)))
+        if not items:
+            return None
+        at = mention.start(1) - (2 if quoted else 1)
+        return Completion("file", at, items, quoted=quoted is not None)
 
     def close_completion(self) -> None:
         self.completion = None
@@ -260,6 +358,10 @@ class Composer(TextArea):
         menu = self._menu()
         chosen = completion.items[index if index is not None else (menu.highlighted or 0)]
         row, column = self.cursor_location
-        replacement = f"@{chosen} " if completion.kind == "file" else f"{chosen} "
+        if completion.kind == "file":
+            quoted = completion.quoted or " " in chosen
+            replacement = f'@"{chosen}" ' if quoted else f"@{chosen} "
+        else:
+            replacement = f"{chosen} "
         self.replace(replacement, (row, completion.start), (row, column))
         self.close_completion()

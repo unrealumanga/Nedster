@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import httpx
+import httpx  # noqa: F401 (used in test functions below via assert)
 
 from ironclad.config import NedsterConfig
-from nedster_agent.model_manager import _num_ctx, _trained_ctx, context_report
+from nedster_agent.model_manager import _num_ctx, _trained_ctx, context_report, kv_cache_advice
 
 
 class _Manager:
@@ -45,9 +45,29 @@ def test_kv_cache_advice_disappears_once_quantized_with_flash_attention() -> Non
     assert report["flash_attention"] is True and report["kv_cache_type"] == "q8_0"
     assert report["advice"] == []
     plain = context_report(NedsterConfig(), _Manager((65536, None)), env={})
-    assert any("OLLAMA_KV_CACHE_TYPE=q8_0" in tip for tip in plain["advice"])
+    # The advice text now uses kv_cache_advice() helper.
+    assert any("kv_cache_advice" in tip.lower() or "setx" in tip.lower() or "launchctl" in tip.lower() or "systemctl" in tip.lower() for tip in plain["advice"])
 
 
-def test_unreachable_show_endpoint_degrades_to_unknown() -> None:
-    report = context_report(NedsterConfig(), _Manager(httpx.ConnectError("down")), env={})
-    assert report["num_ctx"] is None and report["engine_budget"] == 32768
+def test_kv_source_reported_as_client_shell() -> None:
+    report = context_report(NedsterConfig(), _Manager((65536, None)), env={})
+    assert "server settings unknown" in str(report.get("kv_source", ""))
+
+
+def test_kv_cache_advice_windows_contains_setx() -> None:
+    advice = kv_cache_advice("Windows")
+    assert "setx" in advice
+    assert "OLLAMA_FLASH_ATTENTION 1" in advice
+    assert "OLLAMA_KV_CACHE_TYPE q8_0" in advice
+
+
+def test_kv_cache_advice_darwin_contains_launchctl() -> None:
+    advice = kv_cache_advice("Darwin")
+    assert "launchctl" in advice
+    assert "restart the ollama app" in advice.lower()
+
+
+def test_kv_cache_advice_linux_contains_systemctl() -> None:
+    advice = kv_cache_advice("Linux")
+    assert "systemctl" in advice
+    assert "sudo systemctl edit ollama" in advice

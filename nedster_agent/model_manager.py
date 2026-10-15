@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import difflib
 import json
 import os
 import platform
@@ -10,7 +11,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,28 @@ class ModelPlan:
     context_tokens: int
     estimated_download_gb: float
     notes: str
+
+
+@dataclass(frozen=True, slots=True)
+class InstalledModel:
+    """One model present in the local Ollama store, as shown by the picker and `models list`."""
+
+    name: str
+    size_gb: float | None = None
+    parameter_size: str = ""
+    quantization: str = ""
+    context_length: int | None = None
+    current: bool = False
+    embedding: bool = False  # cannot chat (embedding-only): hidden unless `models list --all`
+
+    def size_label(self) -> str:
+        return f"{self.size_gb:.1f} GB" if self.size_gb is not None else "?"
+
+    def context_label(self) -> str:
+        return "unknown" if self.context_length is None else str(self.context_length)
+
+    def kind_label(self) -> str:
+        return "(embedding)" if self.embedding else ""
 
 
 MODEL_PLANS: dict[str, dict[str, ModelPlan]] = {
@@ -209,16 +232,28 @@ class OllamaManager:
         except httpx.HTTPError:
             return False
 
-    def list_models(self) -> list[str]:
+    def list_model_details(self) -> list[dict[str, Any]]:
         response = httpx.get(f"{self.url}/api/tags", timeout=10)
         response.raise_for_status()
-        return [str(item["name"]) for item in response.json().get("models", [])]
+        return [dict(item) for item in response.json().get("models", [])]
+
+    def list_models(self) -> list[str]:
+        return [str(item["name"]) for item in self.list_model_details()]
+
+    def show(self, model: str) -> dict[str, Any]:
+        """The raw ``/api/show`` payload for one model."""
+        response = httpx.post(f"{self.url}/api/show", json={"model": model}, timeout=10)
+        response.raise_for_status()
+        return dict(response.json())
+
+    def capabilities(self, model: str) -> set[str]:
+        """The capability tags Ollama reports for a model (empty when the field is missing)."""
+        caps = self.show(model).get("capabilities")
+        return {str(item) for item in caps} if isinstance(caps, list) else set()
 
     def context_window(self, model: str) -> tuple[int | None, int | None]:
         """(configured num_ctx, trained context length) from /api/show; None when unknown."""
-        response = httpx.post(f"{self.url}/api/show", json={"model": model}, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        data = self.show(model)
         return _num_ctx(str(data.get("parameters") or "")), _trained_ctx(data.get("model_info") or {})
 
     def install(self, *, dry_run: bool = False) -> None:
@@ -494,6 +529,22 @@ def activate_config(config_dir: Path, text: str, *, stamp: str | None = None) ->
     return backup
 
 
+def set_default_worker(config_path: Path, name: str) -> Path | None:
+    """Persist ``models.coder = name`` in ``config.toml``, returning the backup path (None when new).
+
+    Only the worker key changes; every other user value and section is preserved.
+    """
+    existing: dict[str, Any] = {}
+    if config_path.is_file():
+        existing = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    models = existing.get("models")
+    if not isinstance(models, dict):
+        models = {}
+        existing["models"] = models
+    models["coder"] = name
+    return activate_config(config_path.parent, _dump_toml(existing))
+
+
 STAGED_ALIASES = {"nedster-worker": "nedster-worker-next", "nedster-router": "nedster-router-next"}
 
 
@@ -622,6 +673,113 @@ def _trained_ctx(model_info: dict[str, Any]) -> int | None:
     return None
 
 
+def match_installed_model(name: str, installed: Sequence[str]) -> str | None:
+    """The installed name matching ``name`` (exact, or with an implicit ``:latest``), else None."""
+    wanted = name.strip()
+    if not wanted:
+        return None
+    for candidate in installed:
+        if candidate == wanted or candidate == f"{wanted}:latest" or wanted == f"{candidate}:latest":
+            return candidate
+    return None
+
+
+def model_not_installed_message(name: str, installed: Sequence[str], *, suggestions: int = 3) -> str:
+    """The one remedy the TUI and CLI print for a model that is not installed."""
+    message = f"Model '{name}' is not installed. Choose one with /models, or run: ollama pull {name}"
+    closest = difflib.get_close_matches(name, list(installed), n=suggestions, cutoff=0.4)
+    if closest:
+        message += f". Closest installed: {', '.join(closest)}"
+    return message
+
+
+def is_model_missing_error(text: str) -> bool:
+    """True when a transport error looks like Ollama rejecting an unknown model."""
+    lowered = text.lower()
+    return "404" in lowered or "not found" in lowered
+
+
+EMBEDDING_NAME_MARKERS = ("embed",)
+
+
+def is_embedding_model(name: str, capabilities: Collection[str] | None = None) -> bool:
+    """True when a model cannot chat: an obvious name, or Ollama reporting no ``completion`` capability."""
+    if any(marker in name.lower() for marker in EMBEDDING_NAME_MARKERS):
+        return True
+    caps = {str(item).lower() for item in (capabilities or ())}
+    return bool(caps) and "completion" not in caps
+
+
+def list_installed_models(
+    manager: OllamaManager,
+    current: str = "",
+    *,
+    with_context: bool = True,
+    include_embedding: bool = False,
+) -> list[InstalledModel]:
+    """Installed models with size, parameters, quantization and (cheap) context.
+
+    Context and capabilities come from ``/api/show``; a model whose probe fails is reported as
+    ``unknown`` rather than guessed. Models that cannot chat (embeddings) are hidden unless
+    ``include_embedding`` is set. A dead endpoint raises the underlying ``httpx`` error so the
+    caller can explain it.
+    """
+    models: list[InstalledModel] = []
+    probe = getattr(manager, "context_window", None)
+    show = getattr(manager, "show", None)
+    seen: set[str] | None = getattr(manager, "_nedster_show_seen", None)
+    shown_info: dict[str, Any] | None = getattr(manager, "_nedster_shown_info", None)
+    if seen is None:
+        seen = set()
+        manager._nedster_show_seen = seen
+    if shown_info is None:
+        shown_info = {}
+        manager._nedster_shown_info = shown_info
+    for entry in manager.list_model_details():
+        name = str(entry.get("name") or "")
+        if not name:
+            continue
+        details = entry.get("details")
+        details = details if isinstance(details, Mapping) else {}
+        size = entry.get("size")
+        context: int | None = None
+        capabilities: set[str] = set()
+        if with_context and callable(show):  # one /api/show gives both context and capabilities
+            if name in seen:
+                info = shown_info[name]
+            else:
+                try:
+                    info = show(name)
+                except (httpx.HTTPError, ValueError):
+                    info = {}
+                seen.add(name)
+                shown_info[name] = info
+            context = _num_ctx(str(info.get("parameters") or "")) or _trained_ctx(info.get("model_info") or {})
+            caps = info.get("capabilities")
+            capabilities = {str(item) for item in caps} if isinstance(caps, list) else set()
+        elif with_context and callable(probe):
+            try:
+                configured, trained = probe(name)
+            except (httpx.HTTPError, ValueError):
+                configured = trained = None
+            context = configured or trained
+        embedding = is_embedding_model(name, capabilities)
+        if embedding and not include_embedding:
+            continue
+        models.append(
+            InstalledModel(
+                name=name,
+                size_gb=round(float(size) / 1_000_000_000, 1) if isinstance(size, (int, float)) else None,
+                parameter_size=str(details.get("parameter_size") or ""),
+                quantization=str(details.get("quantization_level") or ""),
+                context_length=context,
+                current=match_installed_model(current, [name]) is not None,
+                embedding=embedding,
+            )
+        )
+    return models
+
+
 KV_CACHE_TYPES = ("f16", "q8_0", "q4_0")
 
 
@@ -643,6 +801,9 @@ def context_report(
     flash = env.get("OLLAMA_FLASH_ATTENTION", "").strip().lower() in {"1", "true", "yes", "on"}
     kv_type = env.get("OLLAMA_KV_CACHE_TYPE", "").strip().lower() or "f16"
     report.update(flash_attention=flash, kv_cache_type=kv_type)
+    # Track where we got these values from.
+    report["kv_source"] = "client shell (Ollama server settings unknown)"
+
     advice: list[str] = []
     num_ctx = report["num_ctx"]
     if not budget:
@@ -652,12 +813,35 @@ def context_report(
     if isinstance(num_ctx, int) and budget > num_ctx:
         advice.append(f"engine budget {budget} > model num_ctx {num_ctx}: Ollama will truncate; lower runtime.context_tokens")
     if not flash or kv_type == "f16":
-        advice.append(
-            "set OLLAMA_FLASH_ATTENTION=1 and OLLAMA_KV_CACHE_TYPE=q8_0 for the Ollama server (then restart it): "
-            "halves KV-cache memory, so the same VRAM holds about twice the context"
-        )
+        advice.append(kv_cache_advice())
     report["advice"] = advice
     return report
+
+
+def kv_cache_advice(system: str | None = None) -> str:
+    """Return a platform-specific, copy-pasteable command to set KV-cache env vars for the Ollama server."""
+    import platform
+
+    system = system or platform.system()
+    base = (
+        "To halve KV-cache memory (about 2x context in the same VRAM), "
+        "set these for the Ollama server and restart it (quit Ollama from the tray first):"
+    )
+    if system == "Windows":
+        return (
+            base
+            + ' setx OLLAMA_FLASH_ATTENTION 1 ; setx OLLAMA_KV_CACHE_TYPE q8_0'
+        )
+    elif system == "Darwin":
+        return (
+            base
+            + ' launchctl setenv OLLAMA_FLASH_ATTENTION 1 && launchctl setenv OLLAMA_KV_CACHE_TYPE q8_0 (then restart the Ollama app)'
+        )
+    else:  # Linux / other
+        return (
+            base
+            + ' add Environment="OLLAMA_FLASH_ATTENTION=1" and Environment="OLLAMA_KV_CACHE_TYPE=q8_0" with `sudo systemctl edit ollama`, then `sudo systemctl restart ollama`'
+        )
 
 
 def readiness(config: Any, manager: OllamaManager | None = None) -> dict[str, dict[str, object]]:

@@ -1,0 +1,2 @@
+TODO from March: ask finance whether refunds need their own table.
+Keep the 2026-09-30 backup until the audit is signed off.

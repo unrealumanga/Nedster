@@ -18,9 +18,29 @@ from . import __version__
 
 EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, EXIT_NOT_READY = 0, 1, 2, 3
 
+#: Characters of a session id shown in human output (one length on every surface).
+SHORT_ID = 8
+
 
 class UsageError(Exception):
     """Bad invocation (exit 2)."""
+
+
+class SessionActive(RuntimeError):
+    """Another live Nedster holds the session's activity lock (exit 1)."""
+
+
+# Shared help strings for global flags, used in both root parser and subcommand parsers.
+GLOBAL_HELP: dict[str, str] = {
+    "--project": "Project folder (default: current folder)",
+    "--config": "Nedster TOML configuration path",
+    "--json": "Emit one machine-readable JSON document",
+    "--plain": "Emit stable, one-record-per-line text",
+    "--no-tui": "Never open the full-screen interface",
+    "--color": "Force color when the destination supports it",
+    "--no-color": "Disable color output",
+    "--ascii": "Use ASCII-safe symbols",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,26 +48,21 @@ def build_parser() -> argparse.ArgumentParser:
         prog="nedster",
         description="Nedster — a local-first AI coding and automation agent",
     )
-    parser.add_argument("--project", default=".", help="Project folder (default: current folder)")
-    parser.add_argument("--config", default=None, help="Nedster TOML configuration path")
-    parser.add_argument("--json", action="store_true", help="Emit one machine-readable JSON document")
-    parser.add_argument("--plain", action="store_true", help="Emit stable, one-record-per-line text")
-    parser.add_argument("--no-tui", action="store_true", help="Never open the full-screen interface")
-    parser.add_argument("--color", action="store_true", help="Force color when the destination supports it")
-    parser.add_argument("--no-color", action="store_true", help="Disable color output")
-    parser.add_argument("--ascii", action="store_true", help="Use ASCII-safe symbols")
+    parser.add_argument("--project", default=".", help=GLOBAL_HELP["--project"])
+    parser.add_argument("--config", default=None, help=GLOBAL_HELP["--config"])
+    for flag in list(GLOBAL_HELP)[2:]:
+        parser.add_argument(flag, action="store_true", help=GLOBAL_HELP[flag])
     parser.add_argument("--version", action="version", version=f"Nedster {__version__}")
     subcommands = parser.add_subparsers(dest="command")
 
     def accept_global_options(command_parser: argparse.ArgumentParser) -> None:
-        command_parser.add_argument("--project", default=argparse.SUPPRESS)
-        command_parser.add_argument("--config", default=argparse.SUPPRESS)
-        command_parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
-        command_parser.add_argument("--plain", action="store_true", default=argparse.SUPPRESS)
-        command_parser.add_argument("--no-tui", action="store_true", default=argparse.SUPPRESS)
-        command_parser.add_argument("--color", action="store_true", default=argparse.SUPPRESS)
-        command_parser.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
-        command_parser.add_argument("--ascii", action="store_true", default=argparse.SUPPRESS)
+        for flag, help_text in GLOBAL_HELP.items():
+            if flag == "--project" or flag == "--config":
+                command_parser.add_argument(flag, default=argparse.SUPPRESS, help=help_text)
+            else:
+                command_parser.add_argument(
+                    flag, action="store_true", default=argparse.SUPPRESS, help=help_text
+                )
 
     setup = subcommands.add_parser("setup", help="Install/adopt Ollama and configure recommended models")
     accept_global_options(setup)
@@ -67,13 +82,18 @@ def build_parser() -> argparse.ArgumentParser:
     accept_global_options(doctor)
     models = subcommands.add_parser("models", help="Inspect or install the local model fleet")
     accept_global_options(models)
-    models.add_argument("action", nargs="?", choices=("list", "recommend", "install"), default="list")
+    models.add_argument("action", nargs="?", choices=("list", "recommend", "install", "use"), default="list")
+    models.add_argument("name", nargs="?", help="Model name for `models use`")
     models.add_argument("--profile", choices=("fast", "balanced", "maximum"), default="balanced")
     models.add_argument("--dry-run", action="store_true")
+    models.add_argument("--all", action="store_true", help="Also list models that cannot chat (embeddings)")
 
     run = subcommands.add_parser("run", help="Run one objective and exit")
     accept_global_options(run)
+    run.add_argument("--role", choices=("code", "plan", "review", "explain"), default=None,
+                     help="Role preset for the run (default: use config runtime.role)")
     run.add_argument("objective", nargs="?", help="Objective (default: read from piped stdin)")
+    run.add_argument("--brief", default=None, help="Read the objective from a brief file")
     run.add_argument("--jsonl", action="store_true", help="Emit an event stream, one JSON object per line")
     run.add_argument(
         "--engine",
@@ -83,25 +103,66 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--model", default=None, help="Worker model for the native engine (default: configuration)")
     run.add_argument(
+        "--name",
+        default=None,
+        help="Name the session (sets the title at creation; renames it when resuming)",
+    )
+    run.add_argument(
         "--expect",
         choices=("change", "answer"),
         default=None,
         help="What a successful run must do: change files, or only answer (default: inferred from the objective)",
     )
-    run.add_argument("--continue", dest="resume_latest", action="store_true", help="Continue the latest session here")
-    run.add_argument("--session", default=None, help="Continue a specific session id")
+    resume = run.add_mutually_exclusive_group()
+    resume.add_argument("--continue", dest="resume_latest", action="store_true", help="Continue the latest session here")
+    resume.add_argument(
+        "--session", default=None, help="Continue a session by id, unique id prefix or exact title"
+    )
+    init = subcommands.add_parser("init", help="Write a starter AGENTS.md from repository facts")
+    accept_global_options(init)
+    init.add_argument(
+        "--print", dest="print_only", action="store_true",
+        help="Show the starter file without writing it",
+    )
     tui = subcommands.add_parser("tui", help="Open the interactive terminal interface")
     accept_global_options(tui)
+    tui_open = tui.add_mutually_exclusive_group()
+    tui_open.add_argument("--session", default=None, help="Open on a session by id, unique id prefix or exact title")
+    tui_open.add_argument(
+        "--continue", dest="resume_latest", action="store_true", help="Open the most recent conversation"
+    )
+    resume_command = subcommands.add_parser(
+        "resume", help="Open the interface on a saved conversation (picker when no reference is given)"
+    )
+    accept_global_options(resume_command)
+    resume_choice = resume_command.add_mutually_exclusive_group()
+    resume_choice.add_argument("ref", nargs="?", default=None, help="Session id, unique id prefix or exact title")
+    resume_choice.add_argument(
+        "--last", action="store_true", help="Resume the most recent non-empty conversation here"
+    )
     ledger = subcommands.add_parser("verify-ledger", help="Verify the local event chain")
     accept_global_options(ledger)
     permissions = subcommands.add_parser("permissions", help="Show the active tool permission policy")
     accept_global_options(permissions)
+    soul = subcommands.add_parser("soul", help="Show or edit the opt-in personality (soul.md)")
+    accept_global_options(soul)
+    soul_actions = soul.add_subparsers(dest="action")
+    soul.set_defaults(action="show")
+    soul_show = soul_actions.add_parser("show", help="Show the soul mode, file path and size (default)")
+    accept_global_options(soul_show)
+    soul_path_cmd = soul_actions.add_parser("path", help="Print the soul.md path")
+    accept_global_options(soul_path_cmd)
+    soul_remember = soul_actions.add_parser("remember", help="Append a style preference bullet to soul.md")
+    accept_global_options(soul_remember)
+    soul_remember.add_argument("text", help="The style preference to add")
+    soul_remember.add_argument("--yes", action="store_true", help="Confirm without prompting (required when not a TTY)")
     config = subcommands.add_parser("config", help="Inspect the effective configuration")
     accept_global_options(config)
-    config.add_argument("action", nargs="?", choices=("show",), default="show")
+    config.add_argument("action", nargs="?", choices=("show", "get", "path"), default="show")
+    config.add_argument("key", nargs="?", default=None, help="Dotted key for get, e.g. models.coder")
 
     sessions = subcommands.add_parser(
-        "sessions", help="List, show, delete or prune the saved sessions of this project"
+        "sessions", help="List, show, rename, delete or prune the saved sessions of this project"
     )
     accept_global_options(sessions)
     session_actions = sessions.add_subparsers(dest="action")
@@ -110,12 +171,20 @@ def build_parser() -> argparse.ArgumentParser:
     accept_global_options(sessions_list)
     sessions_show = session_actions.add_parser("show", help="One session: metadata + stored transcript")
     accept_global_options(sessions_show)
-    sessions_show.add_argument("session_id", help="Session id or unique prefix")
+    sessions_show.add_argument("session_id", help="Session id, unique id prefix or exact title")
+    sessions_rename = session_actions.add_parser("rename", help="Give a session a new name")
+    accept_global_options(sessions_rename)
+    sessions_rename.add_argument("session_id", help="Session id, unique prefix or exact title")
+    sessions_rename.add_argument("name", help="New name (1-80 characters)")
     sessions_delete = session_actions.add_parser(
         "delete", help="Delete a session; refused while the session is active (locked)"
     )
     accept_global_options(sessions_delete)
-    sessions_delete.add_argument("session_id", help="Session id or unique prefix")
+    sessions_delete.add_argument("session_id", help="Session id, unique id prefix or exact title")
+    sessions_delete.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+    sessions_delete.add_argument(
+        "--dry-run", action="store_true", help="Show what would be deleted without deleting anything"
+    )
     sessions_prune = session_actions.add_parser(
         "prune", help="Delete tool outputs older than a cutoff that no message or task state references"
     )
@@ -127,6 +196,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar="DAYS",
         help="Only outputs older than DAYS are candidates (required)",
+    )
+    sessions_prune.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be deleted; change nothing",
     )
     return parser
 
@@ -192,10 +266,18 @@ def _config_dict(config: Any) -> dict[str, Any]:
 
 
 def _config_show(args: argparse.Namespace) -> int:
+    from ironclad.engine.prompt import load_project_instructions
+
     config, provenance = _resolve(args)
     data = _config_dict(config)
+    instructions = load_project_instructions(config.runtime.project_root)
     if args.json:
-        _emit_json({"config": data, "provenance": provenance})
+        payload = {
+            "config": data,
+            "provenance": provenance,
+            "project_instructions": instructions.to_dict() if instructions else None,
+        }
+        _emit_json(payload)
         return EXIT_OK
     from ironclad.config import config_dir
 
@@ -206,8 +288,98 @@ def _config_show(args: argparse.Namespace) -> int:
             node = node[part]
         value = json.dumps(node) if not isinstance(node, str) else node
         print(f"{key} = {value}  [{provenance[key]}]")
+    if instructions is None or not instructions.present:
+        print("project instructions: none (no AGENTS.md or NEDSTER.md in the project root)")
+    else:
+        note = " (truncated)" if instructions.truncated else ""
+        print(
+            f"project instructions: {instructions.name} "
+            f"({instructions.size / 1024:.1f} KB, sha256 {instructions.sha256[:12]}){note}"
+        )
+    if instructions is not None and instructions.warning:
+        print(f"# warning: {instructions.warning}")
     for warning in config.warnings:
         print(f"# warning: {warning}")
+    return EXIT_OK
+
+
+def _config(args: argparse.Namespace) -> int:
+    action = getattr(args, "action", None) or "show"
+    if action == "show":
+        return _config_show(args)
+    if action == "get":
+        return _config_get(args)
+    if action == "path":
+        return _config_path(args)
+    raise UsageError(f"unknown config action: {action}")
+
+
+def _config_get(args: argparse.Namespace) -> int:
+    key = getattr(args, "key", None)
+    if not key:
+        raise UsageError("Usage: nedster config get <section.field>, e.g. models.coder")
+    config, provenance = _resolve(args)
+    data = _config_dict(config)
+    node: Any = data
+    for part in key.split("."):
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        else:
+            raise UsageError(f"Unknown config key {key!r}. See: nedster config show")
+    if args.json:
+        source = provenance.get(key, "default")
+        _emit_json({"key": key, "value": node, "source": source})
+    else:
+        if isinstance(node, str):
+            print(node)
+        else:
+            print(json.dumps(node))
+    return EXIT_OK
+
+
+def _config_path(args: argparse.Namespace) -> int:
+    from ironclad.config import config_dir, data_dir
+
+    user_cfg = config_dir() / "config.toml"
+    state_d = data_dir()
+    project_root = Path(args.project or ".").resolve()
+    proj_cfg = project_root / ".nedster" / "config.toml"
+
+    if args.json:
+        _emit_json({
+            "user_config": str(user_cfg),
+            "project_config": str(proj_cfg),
+            "data_dir": str(state_d),
+        })
+        return EXIT_OK
+    user_suffix = " (exists)" if user_cfg.exists() else " (not created yet)"
+    proj_suffix = " (exists)" if proj_cfg.exists() else " (not created yet)"
+    print(f"user config: {user_cfg}{user_suffix}")
+    print(f"project config: {proj_cfg}{proj_suffix}")
+    print(f"data dir: {state_d}")
+    return EXIT_OK
+
+
+def _init(args: argparse.Namespace) -> int:
+    from ironclad.scaffold import AGENTS_FILENAME, line_count, starter_agents_md, write_agents_md
+
+    config, _ = _resolve(args)
+    root = Path(config.runtime.project_root)
+    content = starter_agents_md(root, config)
+    if args.print_only:
+        print(content, end="")
+        return EXIT_OK
+    try:
+        path = write_agents_md(root, content)
+    except FileExistsError:
+        _err(f"nedster: {AGENTS_FILENAME} already exists in {root}; not overwritten.")
+        return EXIT_RUNTIME
+    if args.json:
+        _emit_json({"path": str(path), "lines": line_count(content), "bytes": len(content.encode("utf-8"))})
+    elif args.plain:
+        print(f"path\t{path}")
+    else:
+        print(f"Wrote {path} ({line_count(content)} lines). Review and edit it to describe this project.")
     return EXIT_OK
 
 
@@ -394,7 +566,7 @@ def _doctor(args: argparse.Namespace) -> int:
             mark = "ready" if tier["ready"] else "NOT READY"
             console.print(_ascii(f"{label:<16}{mark} · {tier.get('detail', '')}", args.ascii), highlight=False, markup=False)
         if context:
-            kv = f"KV {context['kv_cache_type']}, flash attention {'on' if context['flash_attention'] else 'off'}"
+            kv = f"KV {context['kv_cache_type']} / flash attention {'on' if context['flash_attention'] else 'off'} (as seen by this shell; server unknown)"
             line = f"{'context':<16}model {context['num_ctx'] or '?'} tokens · engine budget {context['engine_budget']} · {kv}"
             console.print(_ascii(line, args.ascii), highlight=False, markup=False)
             for tip in context["advice"]:  # type: ignore[union-attr]
@@ -408,7 +580,16 @@ def _doctor(args: argparse.Namespace) -> int:
 
 
 def _models(args: argparse.Namespace) -> int:
-    from .model_manager import OllamaManager, install_plan, recommend_plan
+    from .model_manager import (
+        OllamaManager,
+        install_plan,
+        list_installed_models,
+        match_installed_model,
+        model_not_installed_message,
+        recommend_plan,
+        set_default_worker,
+        state_dir,
+    )
 
     config, _ = _resolve(args)
     manager = OllamaManager(config.models.ollama_url)
@@ -423,20 +604,73 @@ def _models(args: argparse.Namespace) -> int:
     if args.action == "install":
         install_plan(plan, ollama_url=config.models.ollama_url, dry_run=args.dry_run, progress=_err)
         return EXIT_OK
+    if args.action == "use":
+        name = (getattr(args, "name", None) or "").strip()
+        if not name:
+            raise UsageError("models use needs a model name: nedster models use <name>")
+        if not manager.api_available():
+            _err(f"Ollama is not reachable at {manager.url}, so '{name}' cannot be checked. Start it and retry.")
+            return EXIT_NOT_READY
+        installed = manager.list_models()
+        canonical = match_installed_model(name, installed)
+        if canonical is None:
+            _err(model_not_installed_message(name, installed))
+            return EXIT_USAGE
+        path = state_dir() / "config.toml"
+        backup = set_default_worker(path, canonical)
+        if args.json:
+            _emit_json({"default_worker": canonical, "config": str(path), "backup": str(backup) if backup else None})
+        else:
+            print(f"Default worker model set to {canonical}")
+            print(f"Config: {path}" + (f" (previous saved to {backup})" if backup else ""))
+        return EXIT_OK
     if not manager.api_available():
         _err(f"Ollama is not reachable at {manager.url}. Run `nedster setup`.")
         return EXIT_NOT_READY
-    models = manager.list_models()
+    worker = config.models.coder if config.models.coder != "auto" else "nedster-worker"
+    show_all = bool(getattr(args, "all", False))
+    rows = list_installed_models(manager, worker, include_embedding=show_all)
     if args.json:
-        _emit_json({"models": models})
+        # `models` stays a list of names (machine contract); `installed` adds the details.
+        _emit_json({"models": [row.name for row in rows], "current": worker, "installed": [asdict(row) for row in rows]})
+    elif args.plain:
+        for row in rows:
+            print(f"{row.name}{'  (embedding)' if row.embedding else ''}")
     else:
-        for model in models:
-            print(model)
+        print(f"{'':2}{'model':<30}{'size':>9}  {'params':>7}  {'quant':>8}  {'context':>8}")
+        for row in rows:
+            mark = "*" if row.current else " "
+            tag = "  (embedding)" if row.embedding else ""
+            print(
+                f"{mark:2}{row.name:<30}{row.size_label():>9}  {row.parameter_size or '?':>7}  "
+                f"{row.quantization or '?':>8}  {row.context_label():>8}{tag}"
+            )
+        print(f"{len(rows)} model(s) installed · current: {worker}")
+        if not show_all:
+            print("Embedding models are hidden; `nedster models list --all` shows them.")
+        print("Switch this session with /models, or persist with: nedster models use <name>")
     return EXIT_OK
 
 
 def _read_objective(args: argparse.Namespace) -> str:
     objective = args.objective
+    brief_path = args.brief
+
+    # Validate mutual exclusivity: use either an objective or --brief, not both
+    if objective and brief_path is not None:
+        raise UsageError("Use either an objective or --brief, not both.")
+
+    if brief_path is not None:
+        path = Path(brief_path)
+        if not path.exists():
+            raise UsageError(f"brief file not found: {brief_path}")
+        data = path.read_text(encoding="utf-8")
+        if len(data) > 32768:
+            raise UsageError(f"brief file is too large ({len(data)} bytes, max 32768)")
+        objective = data.strip()
+        if not objective:
+            raise UsageError(f"brief file is empty: {brief_path}")
+
     if not objective and not sys.stdin.isatty():
         objective = sys.stdin.read()
     objective = (objective or "").strip()
@@ -445,9 +679,119 @@ def _read_objective(args: argparse.Namespace) -> str:
     return objective
 
 
+def _resolve_run_session(config: Any, ref: str) -> str:
+    """Resolve ``--session`` to one project session before any engine/store write.
+
+    Unknown, ambiguous and foreign references raise :class:`UsageError` (exit 2); a session
+    another live Nedster is using raises :class:`SessionActive` (exit 1). Nothing is written.
+    """
+    from ironclad.session_store.sqlite_store import SessionResolutionError, SqliteSessionStore
+
+    store = SqliteSessionStore(Path(config.runtime.state_dir) / "sessions.sqlite3")
+    try:
+        try:
+            session_id = str(store.resolve_session(str(config.runtime.project_root), ref)["id"])
+        except SessionResolutionError as exc:
+            raise UsageError(str(exc)) from exc
+        if store.is_active(session_id):
+            raise SessionActive(
+                f"Session {session_id[:SHORT_ID]} is active in another Nedster. Close it there and retry."
+            )
+        return session_id
+    finally:
+        store.close()
+
+
 async def _run_objective(args: argparse.Namespace, objective: str) -> int:
+    from ironclad.session_store.titles import normalize_title
+
     config, _ = _resolve(args)
-    return await _run_native(args, config, objective)
+    if getattr(args, "name", None) is not None:
+        name = normalize_title(args.name)
+        if not name:
+            raise UsageError("--name needs at least one visible character.")
+        args.name = name
+    if args.session is not None:
+        args.session = _resolve_run_session(config, args.session)
+    return await _run_native(args, config, objective, args.brief)
+
+
+class ProgressLine:
+    """Render one live progress line on the stream using \\r and \\x1b[K.
+
+    When ``enabled`` is False nothing is written to the stream at all.
+    Events are fed via ``on_event()``; the final teardown happens in ``close()``.
+    """
+
+    _THROTTLE = 0.25  # seconds between redraws
+
+    def __init__(self, stream, *, enabled: bool, ascii_only: bool = False, clock=time.monotonic):
+        self._stream = stream
+        self._enabled = enabled
+        self._ascii = ascii_only
+        self._clock = clock
+        self._start = clock()
+        self._last_redraw = 0.0
+        self._step = 1
+        self._tool: str | None = None
+
+    # -- public API ---------------------------------------------------------
+
+    def on_event(self, event) -> None:
+        if not self._enabled:
+            return
+        kind = event.kind
+        data = event.data
+        if kind == "model.usage":
+            self._step += 1
+        elif kind == "tool.started":
+            self._tool = str(data.get("tool", ""))
+        elif kind == "tool.finished":
+            self._tool = None
+        # throttled redraw
+        now = self._clock()
+        if now - self._last_redraw >= self._THROTTLE:
+            self._redraw(now)
+            self._last_redraw = now
+
+    def _sep(self) -> str:
+        return " · " if not self._ascii else " - "
+
+    def _text(self, elapsed: float) -> str:
+        parts: list[str] = ["thinking"]
+        total_s = int(elapsed)
+        parts.append(f"{total_s}s")
+        parts.append(f"step {self._step}")
+        if self._tool:
+            parts.append(self._tool)
+        return self._sep().join(parts)
+
+    def _redraw(self, now: float) -> None:
+        if not self._enabled:
+            return
+        text = self._text(now - self._start)
+        self._stream.write("\r" + text + "\x1b[K")
+        self._stream.flush()
+
+    def tool_line(self, text: str) -> None:
+        """Clear the progress line, emit *text* on its own line, then redraw."""
+        if not self._enabled:
+            return
+        # clear current progress line first
+        self._stream.write("\r\x1b[K")
+        self._stream.write(text + "\n")
+        self._stream.flush()
+        # redraw remaining progress below
+        now = self._clock()
+        if now - self._last_redraw >= self._THROTTLE:
+            self._redraw(now)
+            self._last_redraw = now
+
+    def close(self) -> None:
+        if not self._enabled:
+            return
+        self._stream.write("\r\x1b[K")
+        self._stream.flush()
 
 
 class _SessionHeartbeat:
@@ -459,6 +803,7 @@ class _SessionHeartbeat:
 
     def __init__(self, store: Any, session_id: str, owner: str, interval_s: float = 10.0) -> None:
         self._store, self._session_id, self._owner, self._interval = store, session_id, owner, interval_s
+        self.lost = False  # set once ownership could not be renewed; the engine guard then stops the run
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="nedster-session-lock", daemon=True)
         self._thread.start()
@@ -469,10 +814,36 @@ class _SessionHeartbeat:
                 renewed = bool(self._store.refresh_lock(self._session_id, self._owner))
                 if not renewed:
                     renewed = bool(self._store.acquire_lock(self._session_id, self._owner))
-            except Exception:  # noqa: BLE001 - a dead store ends the heartbeat, never the run
+            except Exception:  # noqa: BLE001 - a dead store ends the heartbeat; the guard then fails closed
+                self.lost = True
                 return
             if not renewed:
+                self.lost = True
                 return
+
+    def owns(self, session_id: str) -> bool:
+        """Engine ownership guard (B3): checked atomically in the store before every tool dispatch and
+        every persisted message. Never re-acquires: a lock another owner took stays theirs."""
+        if self.lost or str(session_id) != self._session_id:
+            return False
+        try:
+            owned = bool(self._store.refresh_lock(self._session_id, self._owner))
+        except Exception:  # noqa: BLE001 - an unverifiable lock is a lost lock
+            owned = False
+        if not owned:
+            self.lost = True
+        return owned
+
+    def verify(self) -> None:
+        """Re-validate ownership in the store right before writing; ``SessionActive`` when lost."""
+        try:
+            owned = bool(self._store.refresh_lock(self._session_id, self._owner))
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            raise SessionActive(f"Could not verify the lock of session {self._session_id[:SHORT_ID]}: {exc}") from exc
+        if not owned:
+            raise SessionActive(
+                f"Session {self._session_id[:SHORT_ID]} was taken over by another Nedster. Nothing more was written."
+            )
 
     def close(self) -> None:
         self._stop.set()
@@ -481,50 +852,112 @@ class _SessionHeartbeat:
             self._store.release_lock(self._session_id, self._owner)
 
 
-def _lock_run_session(session: Any) -> _SessionHeartbeat | None:
-    """Take the activity lock for a CLI run; None (with a stderr note) when it cannot be held."""
+def _lock_run_session(store: Any, session_id: str) -> _SessionHeartbeat | None:
+    """Take the activity lock for a CLI run, failing closed (B3).
+
+    ``SessionActive`` (exit 1) when another live Nedster holds it, when the session no longer
+    exists, or when the lock layer itself fails: a run is never admitted without ownership.
+    ``None`` only for a store with no lock layer at all.
+    """
     from ironclad.session_store.sqlite_store import make_owner
 
-    store = getattr(session, "store", None)
     acquire = getattr(store, "acquire_lock", None)
-    session_id = str(getattr(session, "session_id", ""))
-    if not callable(acquire) or not session_id:
+    if not callable(acquire):
         return None
+    session_id = str(session_id or "")
+    if not session_id:
+        raise SessionActive("No session to run in; nothing was written.")
     owner = make_owner("run")
     try:
         acquired = bool(acquire(session_id, owner))
-    except Exception:  # noqa: BLE001 - never block a run on the lock layer
-        return None
+    except KeyError as exc:
+        raise SessionActive(
+            f"Session {session_id[:SHORT_ID]} no longer exists (deleted?). Nothing was written."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - mapped to one refusal line, never a silent run
+        raise SessionActive(f"Could not lock session {session_id[:SHORT_ID]}: {exc}") from exc
     if not acquired:
-        _err(f"[warning] session {session_id[:8]} is active in another Nedster; continuing anyway")
-        return None
+        raise SessionActive(
+            f"Session {session_id[:SHORT_ID]} is active in another Nedster. Close it there and retry."
+        )
     return _SessionHeartbeat(store, session_id, owner)
 
 
-async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> int:
+async def _run_native(args: argparse.Namespace, config: Any, objective: str, brief_path: str | None) -> int:
     from dataclasses import asdict
+    from hashlib import sha256
 
     from ironclad.native import NativeSession
 
+    # Live progress line on interactive terminals.
+    prog = ProgressLine(
+        sys.stderr,
+        enabled=sys.stderr.isatty() and not (args.json or args.jsonl or getattr(args, "plain", False)),
+        ascii_only=getattr(args, "ascii", False),
+    )
+
     def emit(event: Any) -> None:
+        prog.on_event(event)  # always; ProgressLine handles disabled state
         if args.jsonl:
             _emit_json({"kind": event.kind, "session_id": event.session_id, "run_id": event.run_id, "data": dict(event.data)})
         elif event.kind == "tool.finished" and not args.json:
             data = event.data
-            _err(f"  {data.get('tool')} -> {data.get('status')} ({data.get('elapsed_ms', 0):.0f} ms)")
+            msg = f"  {data.get('tool')} -> {data.get('status')} ({data.get('elapsed_ms', 0):.0f} ms)"
+            if prog._enabled:
+                prog.tool_line(msg)
+            else:
+                _err(msg)
 
-    session = NativeSession(
-        config, emit=emit, model=args.model, session_id=args.session, resume_latest=args.resume_latest
-    )
-    heartbeat = _lock_run_session(session)
+    model = _validate_requested_model(args.model, config)
+    admitted: list[_SessionHeartbeat | None] = []
+
+    def admit(store: Any, session_id: str) -> None:
+        # Ownership before any constructor-side write (title, snapshots): a refused run writes nothing.
+        admitted.append(_lock_run_session(store, session_id))
+
+    try:
+        session = NativeSession(
+            config,
+            emit=emit,
+            model=model,
+            session_id=args.session,
+            resume_latest=args.resume_latest,
+            title=getattr(args, "name", "") or "",
+            role=args.role,
+            admit=admit,
+        )
+    except BaseException:
+        for held in admitted:
+            if held is not None:
+                held.close()
+        raise
+    if args.resume_latest and getattr(session, "started_new", False):
+        _err("No previous conversation here; starting a new one.")  # F06: never silently continue an empty launch
+    try:
+        # A session class that did not call ``admit`` (a lazy row, or a test double) is admitted here.
+        heartbeat = admitted[0] if admitted else _lock_run_session(getattr(session, "store", None), session.session_id)
+    except SessionActive:
+        await session.aclose()
+        raise
     try:
         from ironclad.engine.intent import parse_expect
 
+        if heartbeat is not None:
+            heartbeat.verify()  # B3: ownership is re-checked in the store before the first write
+            guard = getattr(session, "set_owner_guard", None)
+            if callable(guard):
+                guard(heartbeat.owns)  # ... and before every tool dispatch / persisted message
+        if brief_path is not None:
+            path = Path(brief_path)
+            data = path.read_bytes()
+            session.note_brief(str(path), sha256(data).hexdigest())
         result = await session.run(objective, intent=parse_expect(getattr(args, "expect", None)))
     finally:
+        prog.close()
         if heartbeat is not None:
             heartbeat.close()  # releases the lock; before aclose() closes the store
         await session.aclose()
+    _report_model_transport_error(result, model)
     if args.json:
         payload = asdict(result)
         payload["outcome"] = result.outcome.value
@@ -533,8 +966,46 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> 
         _emit_json(payload)
     elif not args.jsonl:
         print(result.answer)
-        _err(f"[{result.outcome.value} · session {session.session_id[:8]}]")
+        _err(f"[{result.outcome.value} · session {session.session_id[:SHORT_ID]}]")
     return EXIT_OK if result.passed else EXIT_RUNTIME
+
+
+def _installed_model_names(config: Any) -> list[str] | None:
+    """Installed names, or None when Ollama cannot be reached (validation is skipped, not failed)."""
+    import httpx
+
+    from .model_manager import OllamaManager
+
+    manager = OllamaManager(config.models.ollama_url)
+    try:
+        return manager.list_models() if manager.api_available() else None
+    except httpx.HTTPError:
+        return None
+
+
+def _validate_requested_model(model: str | None, config: Any) -> str | None:
+    """Reject `run --model X` when X is not installed; keep the configured model on a typo."""
+    if not model:
+        return model
+    from .model_manager import match_installed_model, model_not_installed_message
+
+    installed = _installed_model_names(config)
+    if installed is None:
+        return model  # endpoint offline: let the run surface the transport error itself
+    canonical = match_installed_model(model, installed)
+    if canonical is None:
+        raise UsageError(model_not_installed_message(model, installed))
+    return canonical
+
+
+def _report_model_transport_error(result: Any, model: str) -> None:
+    """Map a transport 404/not-found onto the same actionable message as a typo."""
+    from .model_manager import is_model_missing_error, model_not_installed_message
+
+    if result.outcome.value != "failed" or not model:
+        return
+    if any(is_model_missing_error(str(reason)) for reason in result.reasons):
+        _err(model_not_installed_message(model, []))
 
 
 def _verify_ledger(args: argparse.Namespace) -> int:
@@ -573,6 +1044,83 @@ def _permissions(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _soul(args: argparse.Namespace) -> int:
+    from ironclad.engine.prompt import (
+        DEFAULT_SOUL_TEMPLATE,
+        SOUL_PREFERENCES_HEADER,
+        soul_path,
+        with_preference,
+        write_soul,
+    )
+
+    config, _ = _resolve(args)
+    mode = str(getattr(config.runtime, "soul", "off") or "off")
+    path = soul_path()
+    action = str(getattr(args, "action", None) or "show")
+    if action == "path":
+        if args.json:
+            _emit_json({"path": str(path)})
+        else:
+            print(path)
+        return EXIT_OK
+    if action == "remember":
+        try:
+            current = path.read_text(encoding="utf-8") if path.is_file() else DEFAULT_SOUL_TEMPLATE
+        except OSError as exc:
+            _err(f"nedster: could not read {path}: {exc}")
+            return EXIT_RUNTIME
+        edit = with_preference(current, args.text)
+        if not edit.ok:
+            reason = "already in soul.md" if edit.action == "duplicate" else "empty; nothing to add"
+            _err(f"nedster: preference is {reason}")
+            return EXIT_USAGE
+        if not args.yes:
+            if not sys.stdin.isatty():  # never hang on piped stdin
+                _err("nedster: refusing to edit soul.md without confirmation; pass --yes")
+                return EXIT_USAGE
+            print(f"Add this preference under {SOUL_PREFERENCES_HEADER}?")
+            print(f"  {edit.bullet}")
+            if not _ask_yes_no("Save it?", default=False):
+                print("Cancelled; soul.md unchanged.")
+                return EXIT_OK
+        try:
+            write_soul(path, edit.text)
+        except OSError as exc:
+            _err(f"nedster: could not write {path}: {exc}")
+            return EXIT_RUNTIME
+        if args.json:
+            _emit_json({"path": str(path), "added": edit.bullet, "dropped": edit.dropped, "applies": "next session"})
+        elif args.plain:
+            print(f"added\t{edit.bullet}")
+            print(f"dropped\t{edit.dropped}")
+        else:
+            extra = f" (dropped oldest: {edit.dropped})" if edit.dropped else ""
+            print(f"Added to {path}{extra}. Applies from your next session.")
+            if mode != "full":
+                print(f'Note: soul.md reaches the prompt only in "full" mode (runtime.soul = "{mode}").')
+        return EXIT_OK
+    if action != "show":
+        raise UsageError(f"unknown soul action: {action}")
+
+    exists = path.is_file()
+    size = path.stat().st_size if exists else 0
+    if args.json:
+        _emit_json({"mode": mode, "path": str(path), "exists": exists, "size": size})
+        return EXIT_OK
+    if args.plain:
+        print(f"mode\t{mode}")
+        print(f"path\t{path}")
+        print(f"exists\t{str(exists).lower()}")
+        print(f"size\t{size}")
+        return EXIT_OK
+    print(f"mode    {mode}")
+    print(f"path    {path}")
+    print(f"size    {size} bytes" + ("" if exists else " (file missing)"))
+    if mode != "full":
+        print('note    soul.md reaches the prompt only in "full" mode')
+    return EXIT_OK
+
+
 # --- sessions ------------------------------------------------------------------------------
 
 SHOW_TRANSCRIPT_LIMIT = 100  # entries `sessions show` prints without --json
@@ -588,6 +1136,10 @@ def _clip(text: str, limit: int = SHOW_ENTRY_CHARS) -> str:
     return flat if len(flat) <= limit else flat[: limit - 3] + "..."
 
 
+def _short(session_id: str) -> str:
+    return str(session_id)[:SHORT_ID]
+
+
 def _lock_label(lock: Any) -> str:
     if not lock:
         return "none"
@@ -599,14 +1151,25 @@ def _lock_label(lock: Any) -> str:
 
 
 def _find_session(store: Any, project_root: Path, wanted: str) -> dict[str, Any]:
-    """Project-bound lookup: only sessions of *this* canonical root can be shown or deleted."""
-    sessions = store.list_sessions(str(project_root), limit=10_000)
-    matches = [entry for entry in sessions if str(entry["id"]).startswith(wanted)]
-    if not matches:
-        raise UsageError(f"no session matches {wanted!r} in this project ({project_root})")
-    if len(matches) > 1:
-        raise UsageError(f"{wanted!r} matches {len(matches)} sessions; give a longer id")
-    return matches[0]
+    """Project-bound lookup via the store's one resolver (id, prefix or title); a resolution
+    failure is a usage error (exit 2) before anything is shown, deleted or written."""
+    from ironclad.session_store.sqlite_store import SessionResolutionError
+
+    try:
+        return store.resolve_session(str(project_root), wanted)
+    except SessionResolutionError as exc:
+        raise UsageError(str(exc)) from exc
+
+
+def _display_title(store: Any, session_id: str, title: str) -> str:
+    """Name for display: the stored title, else the first user message, else "Untitled conversation"."""
+    from ironclad.session_store.titles import display_title
+
+    if str(title or "").strip():
+        return str(title).strip()
+    first = getattr(store, "first_user_text", None)
+    fallback = first(session_id) if callable(first) else ""
+    return display_title("", fallback)
 
 
 def _sessions_list(args: argparse.Namespace, store: Any, project_root: Path) -> int:
@@ -617,18 +1180,23 @@ def _sessions_list(args: argparse.Namespace, store: Any, project_root: Path) -> 
         return EXIT_OK
     if not rows:
         if not args.plain:
-            print("No saved sessions for this project.")
+            print('No saved conversations here. Start one: nedster run "Explain this project"')
         return EXIT_OK
     if args.plain:
         for row in rows:
             flag = "active" if row["active"] else "-"
             print(f"{row['id']}\t{_stamp(row['updated_ns'])}\t{flag}\t{row['title']}")
         return EXIT_OK
-    print(f"{'id':<34}{'updated':<18}{'state':<9}title")
+    print(f"{'id':<10}{'updated':<12}{'messages':<10}title")
+    from ironclad.session_store.titles import relative_age
+
     for row in rows:
-        flag = "active" if row["active"] else ""
-        print(f"{row['id']:<34}{_stamp(row['updated_ns']):<18}{flag:<9}{row['title']}")
-    print(f"{len(rows)} session(s). Actions: nedster sessions show|delete <id>, nedster sessions prune --older-than DAYS")
+        sid = str(row["id"])
+        flag = "  [active]" if row["active"] else ""
+        title = _display_title(store, sid, row.get("title", ""))
+        print(f"{_short(sid):<10}{relative_age(int(row['updated_ns'])):<12}{int(row.get('message_count', 0)):<10}{title}{flag}")
+    print(f"{len(rows)} session(s).")
+    print('Resume: nedster resume <id or title>   (scripts: nedster run --session <id or title> "...")')
     return EXIT_OK
 
 
@@ -652,7 +1220,7 @@ def _sessions_show(args: argparse.Namespace, store: Any, project_root: Path) -> 
         _emit_json(payload)
         return EXIT_OK
     print(f"session     {session_id}")
-    print(f"title       {session['title']}")
+    print(f"title       {_display_title(store, session_id, session['title'])}")
     print(f"project     {session['project_root']}")
     print(f"created     {_stamp(session['created_ns'])}")
     print(f"updated     {_stamp(session['updated_ns'])}")
@@ -673,10 +1241,66 @@ def _sessions_show(args: argparse.Namespace, store: Any, project_root: Path) -> 
     return EXIT_OK
 
 
-def _sessions_delete(args: argparse.Namespace, store: Any, project_root: Path) -> int:
+def _sessions_rename(args: argparse.Namespace, store: Any, project_root: Path) -> int:
+    from ironclad.session_store.titles import normalize_title
+
     session = _find_session(store, project_root, args.session_id)
     session_id = str(session["id"])
-    if not store.delete_session(session_id):  # atomically refused while a live lock exists
+    name = normalize_title(args.name)
+    if not name:
+        raise UsageError("The new name needs at least one visible character.")
+    store.set_title(session_id, name)
+    if args.json:
+        _emit_json({"renamed": True, "id": session_id, "title": name})
+    else:
+        print(f"Renamed session {session_id[:SHORT_ID]} to {name}.")
+    return EXIT_OK
+
+
+def _session_delete_preview(store: Any, checkpoints: Any, session: Any) -> list[tuple[str, str]]:
+    """Rows for the delete preview: identity, last update, message count and checkpoint count."""
+    session_id = str(session["id"])
+    counter = getattr(checkpoints, "checkpoint_count", None)
+    return [
+        ("session", session_id),
+        ("title", _display_title(store, session_id, session.get("title", ""))),
+        ("updated", _stamp(session["updated_ns"])),
+        ("messages", str(len(store.messages(session_id)))),
+        ("checkpoints", str(counter(session_id) if callable(counter) else 0)),
+    ]
+
+
+def _print_delete_preview(fields: list[tuple[str, str]]) -> None:
+    width = max(len(name) for name, _ in fields)
+    for name, value in fields:
+        print(f"{name:<{width}}  {value}")
+
+
+def _sessions_delete(args: argparse.Namespace, store: Any, project_root: Path, checkpoints: Any) -> int:
+    from ironclad.session_store.checkpoints import delete_session_cascade
+
+    session = _find_session(store, project_root, args.session_id)
+    session_id = str(session["id"])
+    fields = _session_delete_preview(store, checkpoints, session)
+    if args.dry_run:
+        if args.json:
+            _emit_json({"dry_run": True, "deleted": False, "session": dict(fields)})
+        else:
+            _print_delete_preview(fields)
+            print("Dry run: nothing deleted.")
+        return EXIT_OK
+    if args.json and not args.yes:
+        raise UsageError("--json needs --yes: machine output cannot be confirmed interactively.")
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise UsageError(
+                "Refusing to delete without confirmation in a non-interactive shell. Re-run with --yes."
+            )
+        _print_delete_preview(fields)
+        if not _ask_yes_no("Delete this conversation and its saved checkpoints?", default=False):
+            print("Cancelled; nothing was deleted.")
+            return EXIT_OK
+    if not delete_session_cascade(store, checkpoints, session_id):  # refused while a live lock exists
         _err(f"nedster: session {session_id} is active (locked); close it in the other Nedster and retry")
         return EXIT_RUNTIME
     if args.json:
@@ -691,21 +1315,40 @@ def _sessions_prune(args: argparse.Namespace, store: Any, project_root: Path) ->
     if not 0 < days < 1_000_000:  # positive, finite, and never older than the store itself
         raise UsageError("--older-than must be a positive number of days")
     cutoff_ns = time.time_ns() - int(days * 86_400 * 1e9)
-    stats = store.prune_outputs(str(project_root), cutoff_ns=cutoff_ns)
-    payload = {"project_root": str(project_root), "older_than_days": days, "cutoff_ns": cutoff_ns, **stats}
+    stats = store.prune_outputs(str(project_root), cutoff_ns=cutoff_ns, dry_run=args.dry_run)
+    removable = stats["deleted"]
+    payload = {
+        "project_root": str(project_root),
+        "older_than_days": days,
+        "cutoff_ns": cutoff_ns,
+        **stats,
+    }
+    if args.dry_run:
+        payload["dry_run"] = True
     if args.json:
         _emit_json(payload)
         return EXIT_OK
     if args.plain:
         for key in ("sessions", "outputs", "deleted", "retained_referenced", "retained_recent"):
             print(f"{key}\t{stats[key]}")
+        print(f"dry_run\t{1 if args.dry_run else 0}")
         return EXIT_OK
-    print(f"Scanned {stats['sessions']} session(s), {stats['outputs']} output(s) older than {days:g} day(s).")
-    print(f"Deleted {stats['deleted']} unreferenced output(s).")
-    print(f"Kept {stats['retained_referenced']} referenced by a message or task state.")
-    print(f"Kept {stats['retained_recent']} newer than the cutoff.")
-    if stats["outputs"] == stats["retained_referenced"] + stats["retained_recent"]:
+    # human output – fix the summary line to report removable count
+    print(
+        f"Scanned {stats['outputs']} output(s) in {stats['sessions']} session(s): "
+        f"{removable} removable, {stats['retained_referenced']} referenced, "
+        f"{stats['retained_recent']} newer than {days:g} day(s)."
+    )
+    if removable == 0:
         print("Nothing was prunable.")
+    elif args.dry_run:
+        print(
+            f"Dry run: nothing was deleted. Run again without --dry-run to delete "
+            f"{removable} output(s)."
+        )
+    else:
+        print(f"Deleted {removable} unreferenced output(s).")
+    print("This prunes stored tool output only; conversations are kept.")
     return EXIT_OK
 
 
@@ -714,46 +1357,135 @@ def _sessions(args: argparse.Namespace) -> int:
 
     config, _ = _resolve(args)
     project_root = Path(config.runtime.project_root)
-    store = SqliteSessionStore(Path(config.runtime.state_dir) / "sessions.sqlite3")
+    db_path = Path(config.runtime.state_dir) / "sessions.sqlite3"
+    store = SqliteSessionStore(db_path)
+    if str(getattr(args, "action", None) or "list") == "delete":
+        from ironclad.session_store.checkpoints import CheckpointStore
+
+        checkpoints = CheckpointStore(db_path)  # same file: checkpoints are purged in one transaction
+    else:
+        checkpoints = None
     try:
         action = str(getattr(args, "action", None) or "list")
         if action == "show":
             return _sessions_show(args, store, project_root)
+        if action == "rename":
+            return _sessions_rename(args, store, project_root)
         if action == "delete":
-            return _sessions_delete(args, store, project_root)
+            return _sessions_delete(args, store, project_root, checkpoints)
         if action == "prune":
             return _sessions_prune(args, store, project_root)
         if action == "list":
             return _sessions_list(args, store, project_root)
         raise UsageError(f"unknown sessions action: {action}")
     finally:
+        if checkpoints is not None:
+            checkpoints.close()
         store.close()
 
 
+def _tui_session_ref(config: Any, ref: str) -> str:
+    """Resolve ``tui --session`` / ``resume <ref>`` up front so a bad reference is a usage error (exit 2)."""
+    from ironclad.session_store.sqlite_store import SqliteSessionStore
+
+    store = SqliteSessionStore(Path(config.runtime.state_dir) / "sessions.sqlite3")
+    try:
+        return str(_find_session(store, Path(config.runtime.project_root), ref)["id"])
+    finally:
+        store.close()
+
+
+def _latest_non_empty(config: Any) -> str | None:
+    from ironclad.session_store.sqlite_store import SqliteSessionStore
+
+    store = SqliteSessionStore(Path(config.runtime.state_dir) / "sessions.sqlite3")
+    try:
+        return store.latest_non_empty(str(config.runtime.project_root))
+    finally:
+        store.close()
+
+
+def _check_flags(args: argparse.Namespace) -> None:
+    # Check output mode conflicts (more than one of --json, --plain, --jsonl).
+    active_modes = [args.json, args.plain]
+    if hasattr(args, "jsonl") and args.jsonl:
+        active_modes.append(args.jsonl)
+    if sum(active_modes) > 1:
+        raise UsageError("Choose one output mode: --plain, --json, or --jsonl.")
+
+    # Check --color / --no-color conflict.
+    if getattr(args, "color", False) and getattr(args, "no_color", False):
+        raise UsageError("Choose either --color or --no-color, not both.")
+    # --session / --continue are a mutually exclusive argparse group (exit 2 before dispatch).
+
+
+def _admits_interactive_ui(args: argparse.Namespace) -> bool:
+    """The one admission rule for every full-screen entry (`tui`, `resume`, bare launch).
+
+    Both stdin and stdout must be terminals, and no machine-output or no-TUI flag may be set.
+    """
+    if getattr(args, "json", False) or getattr(args, "plain", False) or getattr(args, "no_tui", False):
+        return False
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
 def _tui_or_help(args: argparse.Namespace) -> int:
-    machine = args.json or args.plain or args.no_tui
-    interactive_tui = not machine and sys.stdout.isatty()
-    if not interactive_tui:
+    if not _admits_interactive_ui(args):
+        if args.command == "tui":
+            _err(
+                "The TUI needs an interactive terminal. For piped output use: "
+                "nedster run \"...\""
+            )
+            return EXIT_USAGE
         build_parser().print_help()
         return EXIT_OK
     from .model_manager import state_dir
 
-    if args.command is None and not (state_dir() / "config.toml").exists() and sys.stdin.isatty():
+    if args.command is None and not (state_dir() / "config.toml").exists():
         setup_args = build_parser().parse_args(["--project", args.project, "setup"])
         if _setup(setup_args):
             return EXIT_RUNTIME
     from .tui import run_tui
 
     config, _ = _resolve(args)
+    ref = getattr(args, "session", None)
+    if ref is not None:
+        ref = _tui_session_ref(config, ref)
     run_tui(config, ascii_only=args.ascii,
-            no_color=args.no_color or (not args.color and bool(os.getenv("NO_COLOR"))))
+            no_color=args.no_color or (not args.color and bool(os.getenv("NO_COLOR"))),
+            session_ref=ref,
+            resume_latest=bool(getattr(args, "resume_latest", False)))
+    return EXIT_OK
+
+
+def _resume(args: argparse.Namespace) -> int:
+    if not _admits_interactive_ui(args):
+        _err('nedster resume needs an interactive terminal; for scripts use: nedster run --session <ref> "..."')
+        return EXIT_USAGE
+    from .tui import run_tui
+
+    config, _ = _resolve(args)
+    no_color = args.no_color or (not args.color and bool(os.getenv("NO_COLOR")))
+    ref = getattr(args, "ref", None)
+    if ref is not None:
+        run_tui(config, ascii_only=args.ascii, no_color=no_color, session_ref=_tui_session_ref(config, ref))
+        return EXIT_OK
+    if getattr(args, "last", False):
+        latest = _latest_non_empty(config)
+        if latest is not None:
+            run_tui(config, ascii_only=args.ascii, no_color=no_color, session_ref=latest)
+            return EXIT_OK
+    run_tui(config, ascii_only=args.ascii, no_color=no_color, open_picker_on_start=True)
     return EXIT_OK
 
 
 def _dispatch(args: argparse.Namespace) -> int:
+    _check_flags(args)
     command = args.command
     if command == "config":
-        return _config_show(args)
+        return _config(args)
+    if command == "init":
+        return _init(args)
     if command == "setup":
         return _setup(args)
     if command == "doctor":
@@ -764,8 +1496,12 @@ def _dispatch(args: argparse.Namespace) -> int:
         return _verify_ledger(args)
     if command == "permissions":
         return _permissions(args)
+    if command == "soul":
+        return _soul(args)
     if command == "sessions":
         return _sessions(args)
+    if command == "resume":
+        return _resume(args)
     if command == "run":
         import asyncio
 

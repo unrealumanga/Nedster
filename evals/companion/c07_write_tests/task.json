@@ -1,0 +1,9 @@
+{
+  "prompt": "intervals.py has no tests at all and I'm about to let someone refactor it. Please write a proper unittest suite for it in test_intervals.py next to it, covering the edge cases.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": ["intervals.py"],
+  "may_change": ["test_*.py", "tests/**"],
+  "requires": [],
+  "forbidden_commands": []
+}

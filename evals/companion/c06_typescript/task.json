@@ -1,0 +1,18 @@
+{
+  "prompt": "Two things in the cart: adding the same SKU twice ends up with just the last quantity instead of the sum, that's a bug. And we need a `removeItem(sku)` that drops that SKU's line and returns true, or false if it wasn't in the cart. Add tests for both.",
+  "kind": "change",
+  "check": "check.py",
+  "forbidden_changes": [],
+  "may_change": [
+    "src/cart.js",
+    "test/*.js",
+    "test/**",
+    "*.test.js",
+    "tests/**",
+    "test*.js"
+  ],
+  "requires": [
+    "node"
+  ],
+  "forbidden_commands": []
+}

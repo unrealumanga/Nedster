@@ -25,11 +25,6 @@ class ModelConfig:
     router_keep_alive: str = "-1"
     worker_keep_alive: str = "90s"
     local_thinking: bool | str = True
-    cloud_oracle_enabled: bool = False
-    cloud_model: str = "gpt-5.6-sol"
-    cloud_reasoning_effort: str = "high"
-    cloud_reasoning_mode: str = "standard"
-    cloud_reasoning_context: str = "current_turn"
 
 
 @dataclass(slots=True)
@@ -75,6 +70,12 @@ class RuntimeConfig:
     conversation_history_chars: int = 6_000
     max_grounding_sources: int = 5
     context_tokens: int = 0  # engine context budget; 0 = the worker model's num_ctx (from Ollama), else 32768
+    max_steps: int = 40  # model calls per run; 0 = no limit
+    max_tool_calls: int = 120  # tool calls per run; 0 = no limit
+    notify: str = "bell"  # completion notice in the TUI: "off" | "bell" | "osc9"
+    notify_after_s: float = 15.0  # only turns longer than this notify (seconds)
+    soul: str = "off"  # opt-in personality: "off" (plain), "ui" (status lines only) or "full" (soul.md in the prompt)
+    role: str = "code"  # enforced workflow preset: code | plan | review | explain (read-only roles only remove tools)
 
 
 @dataclass(slots=True)
@@ -93,9 +94,11 @@ Config = NedsterConfig
 _BOOL_TRUE = {"1", "true", "yes", "on"}
 _BOOL_FALSE = {"0", "false", "no", "off", ""}
 _ENGINES = ("native", "legacy")  # "legacy" is accepted once more so old configs warn instead of failing
+_SOUL_MODES = ("off", "ui", "full")
 _RISK_ORDER = ("read", "write", "execute", "destructive", "external")
 # A cloned repo's .nedster/config.toml is untrusted: it may only pick model names / tuning,
-# and may only tighten (never loosen) the security settings below.
+# and may only tighten (never loosen) the security settings below. ``runtime.role`` is deliberately
+# absent: a role widens or narrows the tool set, so only the user (config, env, --role, /role) picks it.
 _PROJECT_SAFE_KEYS = frozenset({
     "models.router", "models.coder", "models.reasoner", "models.critic", "models.summarizer",
     "runtime.context_tokens", "runtime.profile", "engine",
@@ -108,8 +111,6 @@ _SECTIONS = ("models", "sandbox", "policy", "runtime")
 # Legacy / convenience variables -> dotted field. Applied before NEDSTER_<SECTION>__<FIELD>.
 _ENV_ALIASES: tuple[tuple[str, str], ...] = (
     ("OLLAMA_HOST", "models.ollama_url"),
-    ("NEDSTER_CLOUD_MODEL", "models.cloud_model"),
-    ("NEDSTER_CLOUD_ORACLE", "models.cloud_oracle_enabled"),
     ("NEDSTER_AUTONOMOUS", "policy.autonomous"),
     ("NEDSTER_PROJECT", "runtime.project_root"),
     ("NEDSTER_STATE_DIR", "runtime.state_dir"),
@@ -170,6 +171,11 @@ def _coerce(current: Any, value: Any, key: str) -> Any:
             return int(value)
         except (TypeError, ValueError):
             raise ValueError(f"{key}: expected an integer, got {value!r}") from None
+    if isinstance(current, float):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key}: expected a number, got {value!r}") from None
     if isinstance(current, list):
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
@@ -202,6 +208,26 @@ def _set(config: Config, key: str, value: Any) -> bool:
             message = 'engine = "legacy" was removed; the native engine runs instead (rollback: tag v3-legacy)'
             if message not in config.warnings:
                 config.warnings.append(message)
+    if key == "runtime.soul":
+        text = str(coerced).strip().lower()
+        if text not in _SOUL_MODES:
+            message = f'unknown runtime.soul {coerced!r}; using "off"'
+            if message not in config.warnings:
+                config.warnings.append(message)
+            text = "off"
+        coerced = text
+    if key == "runtime.role":
+        from ironclad.engine.roles import role_names
+
+        text = str(coerced).strip().lower()
+        if text not in role_names():
+            # Keep the role an earlier (trusted) layer chose; a typo must never widen a read-only role.
+            current = getattr(target, name)
+            message = f'unknown runtime.role {coerced!r}; keeping "{current}"'
+            if message not in config.warnings:
+                config.warnings.append(message)
+            return False
+        coerced = text
     setattr(target, name, coerced)
     return True
 

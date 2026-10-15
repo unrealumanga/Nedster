@@ -282,7 +282,7 @@ async def test_exhausted_window_stops_incomplete_without_crash() -> None:
 
 
 async def test_single_oversized_result_stops_instead_of_overflowing() -> None:
-    budget = Budget(context_tokens=1_500, max_steps=10, max_output_chars=50_000)
+    budget = Budget(context_tokens=2_500, max_steps=10, max_output_chars=50_000)  # fits the instructions + tools, not the 30K result
     transport = ScriptedTransport([turn("", [call("read_file", "c1", path="big.py")]), turn("never")])
     runtime = FakeRuntime({"read_file": lambda c: ok(c, "x" * 30_000)})
     engine = Engine(transport, runtime, model="m", budget=budget, estimator=est)

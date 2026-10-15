@@ -168,13 +168,27 @@ async def test_status_bar_warns_about_host_execution_and_header_is_truthful(tmp_
         assert "ctx" in screen and "idle" in screen
 
 
-async def test_status_bar_shows_sandbox_and_context(tmp_path):
+async def test_status_bar_shows_sandbox_context_speed_and_step(tmp_path):
     h = Harness(tmp_path, info={"sandbox": "bwrap", "isolation": "full"})
     async with h.app.run_test(size=(100, 30)) as pilot:
         await ready(pilot, h.app)
         screen = screen_text(h.app)
-        assert "bwrap full" in screen and "1.2k/32.8k" in screen and "nedster-worker" in screen
+        assert "bwrap full" in screen and "nedster-worker" in screen
+        assert "ctx —" in screen and "step —" in screen  # nothing measured until the first model call
         assert "LOCAL" in str(h.app.query_one("#identity").render())
+
+        h.app.submit_text("work")
+        await settle(pilot)
+        h.fake.event("model.delta", text="hi")
+        h.fake.event("model.usage", prompt_tokens=19333, completion_tokens=380, decode_ms=10000)
+        await settle(pilot)
+        screen = screen_text(h.app)
+        assert "ctx 41% left" in screen
+        assert "38 tok/s" in screen
+        assert "step 1/40" in screen
+        h.fake.finish("ok")
+        await settle(pilot, 5)
+        assert "step —" in screen_text(h.app)  # no run active any more
 
 
 async def test_escape_cancels_and_cancelling_persists_until_confirmed(tmp_path):
@@ -412,3 +426,29 @@ async def test_minimum_size_keeps_composer_status_and_transcript_usable(tmp_path
             assert h.app.query_one(selector).display
         assert h.app.query_one("#work").size.height >= 10
         assert h.app.query_one("#status").size.height == 1
+
+
+async def test_startup_announces_loaded_project_instructions(tmp_path):
+    info = {"instructions": {"name": "AGENTS.md", "size": 1229, "truncated": False}}
+    h = Harness(tmp_path, info=info)
+    async with h.app.run_test(size=(100, 30)) as pilot:
+        await ready(pilot, h.app)
+        assert "Loaded AGENTS.md (1.2 KB)" in transcript(h.app)
+
+
+async def test_slash_init_writes_and_refuses_to_overwrite(tmp_path):
+    h = Harness(tmp_path)
+    async with h.app.run_test(size=(100, 30)) as pilot:
+        await ready(pilot, h.app)
+        h.app._command("/init")
+        await settle(pilot)
+        path = h.project / "AGENTS.md"
+        assert path.is_file()
+        content = path.read_text(encoding="utf-8")
+        assert "Project instructions" in content
+
+        h.app._command("/init")
+        await settle(pilot)
+        assert "already exists" in transcript(h.app)
+        assert path.read_text(encoding="utf-8") == content
+
