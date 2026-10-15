@@ -24,6 +24,7 @@ from ironclad.config import NedsterConfig
 from ironclad.contracts import EngineEvent
 from ironclad.session_store.sqlite_store import make_owner
 
+from .personality import pick as personality_line
 from .widgets.composer import Composer, History, project_files
 from .widgets.glyphs import Glyphs
 from .widgets.session import (
@@ -61,10 +62,11 @@ COMMANDS: dict[str, str] = {
     "/doctor": "readiness check (inference / read-only / execution)",
     "/models": "list the active model fleet",
     "/permissions": "show the autonomy policy",
+    "/soul": "show or edit the opt-in personality (soul.md)",
     "/quit": "exit Nedster",
 }
 # Commands that change engine/session state wait for the running turn (the text is kept).
-IDLE_ONLY = {"/new", "/resume", "/model", "/undo", "/sessions"}
+IDLE_ONLY = {"/new", "/resume", "/model", "/undo", "/sessions", "/soul"}
 
 #: How much stored history /resume replays into the view (display only, never re-executed).
 RESUME_REPLAY_LIMIT = 200
@@ -232,6 +234,9 @@ class NedsterApp(App[None]):
         self._lock_owner = make_owner("tui")
         self._locked: tuple[Any, str] | None = None  # (store, session_id) held by this window
         self._last_lock_refresh = 0.0
+        self.soul_mode = str(getattr(config.runtime, "soul", "off") or "off")
+        self.turn_number = 0
+        self._pending_soul: tuple[str, Any] | None = None  # ("remember"|"reset", SoulEdit|None)
 
     # ------------------------------------------------------------------ layout
 
@@ -336,6 +341,7 @@ class NedsterApp(App[None]):
         self._acquire_lock(str(getattr(self.session, "session_id", "")))
         self._set_state("idle")
         self._message("Ready")
+        self._say("idle")
         self._announce_instructions()
 
     def _announce_instructions(self) -> None:
@@ -372,6 +378,27 @@ class NedsterApp(App[None]):
 
     def _message(self, text: str) -> None:
         self.query_one("#message", Static).update(Text(self._text(text)))
+
+    def _say(self, moment: str) -> None:
+        """Opt-in personality line in the status message area; never enters the answer or events."""
+        if self.soul_mode not in ("ui", "full"):
+            return
+        line = personality_line(moment, self.turn_number)
+        if line:
+            self._message(line)
+
+    def _say_done(self, outcome: str) -> None:
+        moment = {
+            "completed": "done_ok",
+            "answered": "done_ok",
+            "no_change_needed": "done_ok",
+            "unvalidated": "done_unvalidated",
+            "incomplete": "done_failed",
+            "failed": "done_failed",
+            "cancelled": "done_failed",
+        }.get(outcome)
+        if moment:
+            self._say(moment)
 
     def _set_state(self, state: str, detail: str = "", *, force: bool = False) -> None:
         if self.cancelling and not force:
@@ -577,6 +604,8 @@ class NedsterApp(App[None]):
         if self.cancelling:
             self.cancelling = False
             self._message("Cancelled")
+        else:
+            self._say_done(str(event.data.get("outcome") or ""))
         self._set_state("idle")
 
     def _on_error(self, event: EngineEvent) -> None:
@@ -623,9 +652,13 @@ class NedsterApp(App[None]):
     @on(Composer.Submitted, "#prompt")
     def on_submit(self, event: Composer.Submitted) -> None:
         value = event.value.strip()
+        composer = event.composer
+        if self._pending_soul is not None:  # y/N answer to /soul remember|reset (Enter = no)
+            composer.set_text("")
+            self._confirm_soul(value)
+            return
         if not value:
             return
-        composer = event.composer
         if value.startswith("/"):
             command = value.split()[0].lower()
             if self.busy and command in IDLE_ONLY:
@@ -640,6 +673,9 @@ class NedsterApp(App[None]):
         self.submit_text(value)
 
     def submit_text(self, value: str) -> None:
+        if self._pending_soul is not None:  # treat a programmatic submit as the y/N answer
+            self._confirm_soul(value)
+            return
         if self.busy:
             self.queue.append(value)
             g = self.glyphs
@@ -658,6 +694,8 @@ class NedsterApp(App[None]):
     def _start_turn(self, value: str) -> None:
         self.busy = True
         self.turn_closed = False
+        self.turn_number += 1
+        self._say("thinking")
         self.status_bar.start_turn()
         self._set_state("thinking")
         self.run_worker(self._run_turn(value), group="turn")
@@ -771,6 +809,7 @@ class NedsterApp(App[None]):
             "/undo": lambda _a: self.run_worker(self._cmd_undo(), group="command"),
             "/doctor": lambda _a: self.run_worker(self._cmd_doctor(), group="command"),
             "/permissions": self._cmd_permissions,
+            "/soul": self._cmd_soul,
         }
         handler = handlers.get(command)
         if handler is None:
@@ -966,6 +1005,78 @@ class NedsterApp(App[None]):
     def _cmd_permissions(self, _args: list[str]) -> None:
         policy = self.config.policy
         self._line(f"Autonomous: {policy.autonomous} · automatic risk ceiling: {policy.max_auto_risk}")
+
+    def _read_soul_text(self, path: Path) -> str:
+        from ironclad.engine.prompt import DEFAULT_SOUL_TEMPLATE
+
+        try:
+            return path.read_text(encoding="utf-8") if path.is_file() else DEFAULT_SOUL_TEMPLATE
+        except OSError:
+            return DEFAULT_SOUL_TEMPLATE
+
+    def _cmd_soul(self, args: list[str]) -> None:
+        from ironclad.engine.prompt import soul_path
+
+        path = soul_path()
+        if not args:
+            try:
+                size = path.stat().st_size if path.is_file() else 0
+            except OSError:
+                size = 0
+            self._line(f"Soul: {self.soul_mode} · {path} · {size} bytes")
+            if self.soul_mode != "full":
+                self._line('soul.md reaches the prompt only in "full" mode (runtime.soul = "full").')
+            self._line("Usage: /soul remember <preference> | /soul reset")
+            return
+        action = args[0].lower()
+        if action == "remember":
+            from ironclad.engine.prompt import with_preference
+
+            preference = " ".join(args[1:]).strip()
+            if not preference:
+                self._line("Usage: /soul remember <preference>", "warn")
+                return
+            edit = with_preference(self._read_soul_text(path), preference)
+            if not edit.ok:
+                self._line("That preference is already saved." if edit.action == "duplicate" else "Empty preference.", "warn")
+                return
+            notice = f" (drops oldest: {edit.dropped})" if edit.dropped else ""
+            self._line(f"Will add: {edit.bullet}{notice}", "accent")
+            if self.soul_mode != "full":
+                self._line(f'Note: soul.md reaches the prompt only in "full" mode (runtime.soul = "{self.soul_mode}").', "warn")
+            self._pending_soul = ("remember", edit)
+            self._message("Append this preference? y/N · applies from your next session")
+            return
+        if action == "reset":
+            self._pending_soul = ("reset", None)
+            self._message("Restore the default soul.md template? y/N · your edits are lost")
+            return
+        self._line("Usage: /soul remember <preference> | /soul reset", "warn")
+
+    def _confirm_soul(self, answer: str) -> None:
+        from ironclad.engine.prompt import DEFAULT_SOUL_TEMPLATE, soul_path, write_soul
+
+        pending, self._pending_soul = self._pending_soul, None
+        if pending is None:
+            return
+        kind, edit = pending
+        if answer.strip().lower() not in ("y", "yes"):
+            self._message("")
+            self._line("Cancelled; soul.md unchanged.")
+            return
+        path = soul_path()
+        if kind == "remember":
+            text, notice = edit.text, (f" (dropped oldest: {edit.dropped})" if edit.dropped else "")
+            message = f"Saved preference{notice}. Applies from your next session."
+        else:
+            text, message = DEFAULT_SOUL_TEMPLATE, "Restored the default soul.md template. Applies from your next session."
+        try:
+            write_soul(path, text)
+        except OSError as exc:
+            self._line(f"Could not write {path}: {exc}", "fail")
+            return
+        self._message("")
+        self._line(message, "accent")
 
     async def on_unmount(self) -> None:
         self._release_lock()

@@ -14,11 +14,36 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ironclad.config import config_dir
+
 MAX_TOP_LEVEL = 40
 MAX_NAME_CHARS = 64
 MAX_INSTRUCTIONS_BYTES = 4_096  # cap on the project instruction text that reaches the prompt
 PROJECT_INSTRUCTION_FILES = ("AGENTS.md", "NEDSTER.md")  # first one found in the project root wins
 INSTRUCTIONS_STATE = "project_instructions"  # session state key holding the per-session snapshot
+
+SOUL_FILENAME = "soul.md"  # user-owned personality file, never read from the project
+MAX_SOUL_BYTES = 1_200  # cap on the soul text that reaches the prompt
+MAX_SOUL_PREFERENCES = 5  # newest kept; adding a sixth drops the oldest
+SOUL_STATE = "soul"  # session state key holding the per-session snapshot
+SOUL_PREFERENCES_HEADER = "## Preferences"
+SOUL_HEADER = (
+    "Voice (style only - it never changes facts, tool calls, file contents, test results or outcome claims):"
+)
+# Default template written on first use in "full" mode; keep it terse and candid (<= 600 bytes).
+DEFAULT_SOUL_TEMPLATE = """\
+# Voice
+
+Style only. This file never changes facts, tool calls, file contents, test results or outcome claims.
+
+- Be terse and candid.
+- Dry humour is fine in small talk and status lines, not in answers, code, commits or results.
+- Say "I don't know" instead of guessing.
+- If I am wrong, say so and explain why.
+- Never flatter me. Never claim tests ran when they did not.
+
+## Preferences
+"""
 
 INSTRUCTIONS = """\
 You are Nedster, a local coding agent working inside one project directory through tools.
@@ -173,9 +198,164 @@ def session_instructions(store: Any, session_id: str, root: str | Path | None) -
     return loaded
 
 
+@dataclass(slots=True, frozen=True)
+class SoulText:
+    """The user's ``soul.md`` snapshotted once per session in ``full`` mode.
+
+    ``mode`` is the effective mode frozen for the session; ``text`` is what reaches the prompt (capped).
+    ``sha256``/``size`` describe the source file. The text is style only and cannot change permissions.
+    """
+
+    mode: str = "off"
+    text: str = ""
+    sha256: str = ""
+    size: int = 0
+    truncated: bool = False
+
+    @property
+    def present(self) -> bool:
+        return self.mode == "full" and bool(self.text)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "text": self.text,
+            "sha256": self.sha256,
+            "size": self.size,
+            "truncated": self.truncated,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any] | None) -> SoulText:
+        if not data:
+            return cls()
+        return cls(
+            mode=str(data.get("mode", "off")),
+            text=str(data.get("text", "")),
+            sha256=str(data.get("sha256", "")),
+            size=int(data.get("size", 0) or 0),
+            truncated=bool(data.get("truncated", False)),
+        )
+
+
+def soul_path() -> Path:
+    """The user's soul file inside the config dir (honours ``NEDSTER_CONFIG_DIR``)."""
+    return config_dir() / SOUL_FILENAME
+
+
+def write_soul(path: str | Path, text: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def ensure_soul_file(path: str | Path | None = None) -> bool:
+    """Write the default template when the file is missing. Returns True when it wrote the file."""
+    target = Path(path) if path is not None else soul_path()
+    try:
+        if target.is_file():
+            return False
+        write_soul(target, DEFAULT_SOUL_TEMPLATE)
+        return True
+    except OSError:  # an unwritable config dir degrades to no voice, never crashes a session
+        return False
+
+
+def load_soul(path: str | Path | None = None, *, mode: str = "full", max_bytes: int = MAX_SOUL_BYTES) -> SoulText:
+    """Read ``path`` with a byte cap and a visible marker; a non-``full`` mode carries no text."""
+    if mode != "full":
+        return SoulText(mode=mode)
+    target = Path(path) if path is not None else soul_path()
+    try:
+        raw = target.read_bytes()
+    except OSError:
+        return SoulText(mode=mode)
+    text = raw[:max_bytes].decode("utf-8", "replace")
+    truncated = len(raw) > max_bytes
+    if truncated:
+        text += "\n[truncated]"
+    return SoulText(
+        mode=mode,
+        text=text.rstrip("\n"),
+        sha256=hashlib.sha256(raw).hexdigest(),
+        size=len(raw),
+        truncated=truncated,
+    )
+
+
+def session_soul(store: Any, session_id: str, mode: str, path: str | Path | None = None) -> SoulText:
+    """Snapshot of the soul text for ``session_id`` (computed once, reused on resume).
+
+    Snapshots are stored for every mode, so a resumed session keeps the mode it started with (edits and
+    mode changes apply to the next session). In ``full`` mode the default template is written on first use.
+    """
+    if store is not None:
+        saved = store.get_state(session_id, SOUL_STATE)
+        if saved is not None:
+            return SoulText.from_dict(saved)
+    effective = str(mode).strip().lower()
+    if effective not in ("off", "ui", "full"):
+        effective = "off"
+    if effective == "full":
+        ensure_soul_file(path)
+    loaded = load_soul(path, mode=effective)
+    if store is not None:
+        store.set_state(session_id, SOUL_STATE, loaded.to_dict())
+    return loaded
+
+
+def _preference_bullets(lines: list[str]) -> list[str]:
+    return [line.strip() for line in lines if line.strip().startswith("- ") and line.strip() != "-"]
+
+
+def _split_preferences(text: str) -> tuple[list[str], int, int]:
+    """(lines, header index, section end index); appends the header when it is missing."""
+    lines = text.rstrip("\n").splitlines()
+    index = next((i for i, line in enumerate(lines) if line.strip() == SOUL_PREFERENCES_HEADER), None)
+    if index is None:
+        lines += ["", SOUL_PREFERENCES_HEADER]
+        index = len(lines) - 1
+    end = index + 1
+    while end < len(lines) and not lines[end].startswith("## "):
+        end += 1
+    return lines, index, end
+
+
+@dataclass(slots=True, frozen=True)
+class SoulEdit:
+    """Result of staging one preference bullet: never applied without an explicit user confirmation."""
+
+    ok: bool
+    action: str  # added | duplicate | invalid
+    bullet: str = ""
+    dropped: str = ""
+    text: str = ""
+
+
+def with_preference(text: str, preference: str) -> SoulEdit:
+    """Stage ``preference`` as a bullet under ``## Preferences`` (deduped, at most five)."""
+    bullet = " ".join(str(preference).split())
+    if not bullet:
+        return SoulEdit(False, "invalid", text=text)
+    if not bullet.startswith("- "):
+        bullet = f"- {bullet}"
+    lines, index, end = _split_preferences(text)
+    existing = _preference_bullets(lines[index + 1 : end])
+    key = bullet[2:].strip().casefold()
+    if any(item[2:].strip().casefold() == key for item in existing):
+        return SoulEdit(False, "duplicate", bullet=bullet, text=text)
+    dropped = ""
+    if len(existing) >= MAX_SOUL_PREFERENCES:
+        dropped = existing.pop(0)
+    existing.append(bullet)
+    new_lines = lines[: index + 1] + ["", *existing] + lines[end:]
+    return SoulEdit(True, "added", bullet=bullet, dropped=dropped, text="\n".join(new_lines) + "\n")
+
+
 def build_system_prompt(
     facts: Mapping[str, str] | None = None,
     instructions: ProjectInstructions | None = None,
+    soul: SoulText | None = None,
 ) -> str:
     parts = [INSTRUCTIONS]
     if facts:
@@ -186,4 +366,6 @@ def build_system_prompt(
             f"Project instructions (from {instructions.name}; they cannot change tool permissions):\n"
             f"{instructions.text}"
         )
+    if soul is not None and soul.text:
+        parts.append(f"{SOUL_HEADER}\n{soul.text}")
     return "\n\n".join(parts)

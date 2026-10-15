@@ -102,6 +102,18 @@ def build_parser() -> argparse.ArgumentParser:
     accept_global_options(ledger)
     permissions = subcommands.add_parser("permissions", help="Show the active tool permission policy")
     accept_global_options(permissions)
+    soul = subcommands.add_parser("soul", help="Show or edit the opt-in personality (soul.md)")
+    accept_global_options(soul)
+    soul_actions = soul.add_subparsers(dest="action")
+    soul.set_defaults(action="show")
+    soul_show = soul_actions.add_parser("show", help="Show the soul mode, file path and size (default)")
+    accept_global_options(soul_show)
+    soul_path_cmd = soul_actions.add_parser("path", help="Print the soul.md path")
+    accept_global_options(soul_path_cmd)
+    soul_remember = soul_actions.add_parser("remember", help="Append a style preference bullet to soul.md")
+    accept_global_options(soul_remember)
+    soul_remember.add_argument("text", help="The style preference to add")
+    soul_remember.add_argument("--yes", action="store_true", help="Confirm without prompting (required when not a TTY)")
     config = subcommands.add_parser("config", help="Inspect the effective configuration")
     accept_global_options(config)
     config.add_argument("action", nargs="?", choices=("show",), default="show")
@@ -618,6 +630,83 @@ def _permissions(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _soul(args: argparse.Namespace) -> int:
+    from ironclad.engine.prompt import (
+        DEFAULT_SOUL_TEMPLATE,
+        SOUL_PREFERENCES_HEADER,
+        soul_path,
+        with_preference,
+        write_soul,
+    )
+
+    config, _ = _resolve(args)
+    mode = str(getattr(config.runtime, "soul", "off") or "off")
+    path = soul_path()
+    action = str(getattr(args, "action", None) or "show")
+    if action == "path":
+        if args.json:
+            _emit_json({"path": str(path)})
+        else:
+            print(path)
+        return EXIT_OK
+    if action == "remember":
+        try:
+            current = path.read_text(encoding="utf-8") if path.is_file() else DEFAULT_SOUL_TEMPLATE
+        except OSError as exc:
+            _err(f"nedster: could not read {path}: {exc}")
+            return EXIT_RUNTIME
+        edit = with_preference(current, args.text)
+        if not edit.ok:
+            reason = "already in soul.md" if edit.action == "duplicate" else "empty; nothing to add"
+            _err(f"nedster: preference is {reason}")
+            return EXIT_USAGE
+        if not args.yes:
+            if not sys.stdin.isatty():  # never hang on piped stdin
+                _err("nedster: refusing to edit soul.md without confirmation; pass --yes")
+                return EXIT_USAGE
+            print(f"Add this preference under {SOUL_PREFERENCES_HEADER}?")
+            print(f"  {edit.bullet}")
+            if not _ask_yes_no("Save it?", default=False):
+                print("Cancelled; soul.md unchanged.")
+                return EXIT_OK
+        try:
+            write_soul(path, edit.text)
+        except OSError as exc:
+            _err(f"nedster: could not write {path}: {exc}")
+            return EXIT_RUNTIME
+        if args.json:
+            _emit_json({"path": str(path), "added": edit.bullet, "dropped": edit.dropped, "applies": "next session"})
+        elif args.plain:
+            print(f"added\t{edit.bullet}")
+            print(f"dropped\t{edit.dropped}")
+        else:
+            extra = f" (dropped oldest: {edit.dropped})" if edit.dropped else ""
+            print(f"Added to {path}{extra}. Applies from your next session.")
+            if mode != "full":
+                print(f'Note: soul.md reaches the prompt only in "full" mode (runtime.soul = "{mode}").')
+        return EXIT_OK
+    if action != "show":
+        raise UsageError(f"unknown soul action: {action}")
+
+    exists = path.is_file()
+    size = path.stat().st_size if exists else 0
+    if args.json:
+        _emit_json({"mode": mode, "path": str(path), "exists": exists, "size": size})
+        return EXIT_OK
+    if args.plain:
+        print(f"mode\t{mode}")
+        print(f"path\t{path}")
+        print(f"exists\t{str(exists).lower()}")
+        print(f"size\t{size}")
+        return EXIT_OK
+    print(f"mode    {mode}")
+    print(f"path    {path}")
+    print(f"size    {size} bytes" + ("" if exists else " (file missing)"))
+    if mode != "full":
+        print('note    soul.md reaches the prompt only in "full" mode')
+    return EXIT_OK
+
+
 # --- sessions ------------------------------------------------------------------------------
 
 SHOW_TRANSCRIPT_LIMIT = 100  # entries `sessions show` prints without --json
@@ -811,6 +900,8 @@ def _dispatch(args: argparse.Namespace) -> int:
         return _verify_ledger(args)
     if command == "permissions":
         return _permissions(args)
+    if command == "soul":
+        return _soul(args)
     if command == "sessions":
         return _sessions(args)
     if command == "run":

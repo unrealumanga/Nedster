@@ -82,6 +82,7 @@ class Harness:
         self.config = config
         self.session: FakeSession | None = None
         info = app_kwargs.pop("info", None)
+        config.runtime.soul = app_kwargs.pop("soul", "off")
 
         def factory(_config: NedsterConfig, emit: EventCallback) -> FakeSession:
             self.session = FakeSession(emit, info)

@@ -72,6 +72,7 @@ class RuntimeConfig:
     context_tokens: int = 0  # engine context budget; 0 = the worker model's num_ctx (from Ollama), else 32768
     max_steps: int = 40  # model calls per run; 0 = no limit
     max_tool_calls: int = 120  # tool calls per run; 0 = no limit
+    soul: str = "off"  # opt-in personality: "off" (plain), "ui" (status lines only) or "full" (soul.md in the prompt)
 
 
 @dataclass(slots=True)
@@ -90,6 +91,7 @@ Config = NedsterConfig
 _BOOL_TRUE = {"1", "true", "yes", "on"}
 _BOOL_FALSE = {"0", "false", "no", "off", ""}
 _ENGINES = ("native", "legacy")  # "legacy" is accepted once more so old configs warn instead of failing
+_SOUL_MODES = ("off", "ui", "full")
 _RISK_ORDER = ("read", "write", "execute", "destructive", "external")
 # A cloned repo's .nedster/config.toml is untrusted: it may only pick model names / tuning,
 # and may only tighten (never loosen) the security settings below.
@@ -197,6 +199,14 @@ def _set(config: Config, key: str, value: Any) -> bool:
             message = 'engine = "legacy" was removed; the native engine runs instead (rollback: tag v3-legacy)'
             if message not in config.warnings:
                 config.warnings.append(message)
+    if key == "runtime.soul":
+        text = str(coerced).strip().lower()
+        if text not in _SOUL_MODES:
+            message = f'unknown runtime.soul {coerced!r}; using "off"'
+            if message not in config.warnings:
+                config.warnings.append(message)
+            text = "off"
+        coerced = text
     setattr(target, name, coerced)
     return True
 

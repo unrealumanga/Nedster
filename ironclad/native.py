@@ -146,6 +146,7 @@ class NativeSession:
         self.tools, self.executor = build_tools(self.project_root, config, self.checkpoints)
         self.checkpoints.on_undone.append(self.tools.invalidate_after_undo)
         self.transport = OllamaTransport(config.models.ollama_url)
+        soul_mode = str(getattr(config.runtime, "soul", "off") or "off")
         self.engine = Engine(
             self.transport,
             self.tools,
@@ -154,10 +155,12 @@ class NativeSession:
             budget=engine_budget(config, self.model),
             emit=emit,
             project_root=self.project_root,
+            soul=soul_mode,
         )
-        from .engine.prompt import session_instructions
+        from .engine.prompt import session_instructions, session_soul
 
         self.instructions = session_instructions(self.store, self.session_id, self.project_root)
+        self.soul = session_soul(self.store, self.session_id, soul_mode)
 
     def info(self) -> dict[str, Any]:
         status = self.executor.backend_status()
@@ -177,6 +180,7 @@ class NativeSession:
                 if self.instructions.present
                 else None
             ),
+            "soul": self.soul.mode,
         }
 
     async def run(self, text: str, *, intent: Any = None) -> AcceptanceResult:

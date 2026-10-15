@@ -58,9 +58,11 @@ from ironclad.engine.context import (
 from ironclad.engine.intent import Intent, classify
 from ironclad.engine.prompt import (
     ProjectInstructions,
+    SoulText,
     build_system_prompt,
     project_facts,
     session_instructions,
+    session_soul,
 )
 from ironclad.engine.state import Budget, TaskState, ToolRecord
 
@@ -189,6 +191,7 @@ class Engine:
         temperature: float | None = None,
         completion_reserve_tokens: int | None = None,
         auto_verify: int = 2,
+        soul: str = "off",
     ) -> None:
         self.transport = transport
         self.tools = tools
@@ -202,8 +205,10 @@ class Engine:
         self.temperature = temperature
         self.completion_reserve_tokens = completion_reserve_tokens
         self.auto_verify = max(0, auto_verify)  # max engine-run validations per run when the model skips them
+        self.soul_mode = soul
         self.last_answer = ""
         self.instructions: ProjectInstructions = ProjectInstructions()
+        self.soul: SoulText = SoulText()
         self._sessions: dict[str, _Session] = {}
         self._running: set[JobHandle] = set()
         self._task: asyncio.Task[Stop] | None = None
@@ -254,9 +259,11 @@ class Engine:
                 store.set_state(session_id, "project_facts", facts)
         instructions = session_instructions(store, session_id, self.project_root)
         self.instructions = instructions
+        soul = session_soul(store, session_id, self.soul_mode)
+        self.soul = soul
         vault = OutputVault(session_id, store)
         messages = [
-            ChatMessage(role="system", content=build_system_prompt(facts, instructions)),
+            ChatMessage(role="system", content=build_system_prompt(facts, instructions, soul)),
             ChatMessage(role="system", content=state.render()),
             *history,
         ]
