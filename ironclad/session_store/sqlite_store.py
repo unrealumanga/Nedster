@@ -796,9 +796,15 @@ class SqliteSessionStore:
             "unreferenced": len(existing - referenced),
         }
 
-    def prune_outputs(self, project_root: str, *, cutoff_ns: int) -> dict[str, int]:
+    def prune_outputs(
+        self, project_root: str, *, cutoff_ns: int, dry_run: bool = False
+    ) -> dict[str, int]:
         """Delete outputs of *this project* that are older than ``cutoff_ns`` AND not referenced
-        by any message or task state of their session. Referenced and recent handles always stay."""
+        by any message or task state of their session. Referenced and recent handles always stay.
+
+        When *dry_run* is True the same stats are computed but nothing is deleted;
+        ``"deleted"`` then counts what *would* be removed.
+        """
         root = normalize_project_root(project_root)
         stats = {
             "sessions": 0,
@@ -826,11 +832,12 @@ class SqliteSessionStore:
                         elif int(handle) in referenced:
                             stats["retained_referenced"] += 1
                         else:
-                            self._connection.execute(
-                                "DELETE FROM outputs WHERE session_id = ? AND handle = ?",
-                                (session_id, handle),
-                            )
                             stats["deleted"] += 1
+                            if not dry_run:
+                                self._connection.execute(
+                                    "DELETE FROM outputs WHERE session_id = ? AND handle = ?",
+                                    (session_id, handle),
+                                )
                 self._connection.execute("COMMIT")
             except BaseException:
                 self._connection.execute("ROLLBACK")

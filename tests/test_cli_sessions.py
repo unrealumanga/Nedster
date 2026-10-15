@@ -239,9 +239,76 @@ def test_sessions_prune_human_reports_what_it_kept(clean_env, capsys):
 
     assert main(["sessions", "prune", "--older-than", "30", "--project", str(clean_env)]) == EXIT_OK
     out = capsys.readouterr().out
-    assert "Deleted 0 unreferenced output(s)." in out
-    assert "Kept 1 referenced by a message or task state." in out
     assert "Nothing was prunable." in out
+    assert "This prunes stored tool output only; conversations are kept." in out
+
+
+def test_sessions_prune_dry_run_deletes_nothing(clean_env, capsys):
+    """Dry run computes the same stats but removes nothing."""
+    store = _store(clean_env)
+    session = store.create(_root(clean_env))
+    unreferenced_old = store.put_output(session, "bash", "c1", "stale")
+    handle = store.put_output(session, "bash", "c2", "log")
+    store.append_message(
+        session, ChatMessage(role="tool", content=f'{{"handle": {handle}}}', tool_call_id="c2", name="bash")
+    )
+    foreign = store.create(str((clean_env / "other").resolve()))
+    foreign_handle = store.put_output(foreign, "bash", "x", "foreign")
+    store.close()
+    _backdate(clean_env, [(session, unreferenced_old), (session, handle)])
+
+    # dry-run: same stats as real run but nothing deleted
+    assert main(["sessions", "prune", "--older-than", "1", "--project", str(clean_env), "--dry-run"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "1 removable" in out
+    assert "Dry run: nothing was deleted. Run again without --dry-run to delete 1 output(s)." in out
+    assert "This prunes stored tool output only; conversations are kept." in out
+
+    # both outputs still exist
+    after = _store(clean_env)
+    assert after.get_output(session, unreferenced_old) == "stale"
+    assert after.get_output(session, handle) == "log"
+    assert after.get_output(foreign, foreign_handle) == "foreign"
+    after.close()
+
+    # real run: deletes the unreferenced one
+    assert main(["sessions", "prune", "--older-than", "1", "--project", str(clean_env)]) == EXIT_OK
+    after2 = _store(clean_env)
+    with pytest.raises(KeyError):
+        after2.get_output(session, unreferenced_old)  # deleted
+    assert after2.get_output(session, handle) == "log"  # referenced → kept
+    after2.close()
+
+
+def test_sessions_prune_json_includes_dry_run_key(clean_env, capsys):
+    """When --dry-run is passed, the JSON payload contains 'dry_run': true."""
+    store = _store(clean_env)
+    session = store.create(_root(clean_env))
+    handle = store.put_output(session, "bash", "c1", "log")
+    store.close()
+    _backdate(clean_env, [(session, handle)])
+
+    assert main(["sessions", "prune", "--older-than", "1", "--project", str(clean_env), "--dry-run", "--json"]) == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert payload["deleted"] == 1  # same count as a real run
+
+
+def test_sessions_prune_dry_run_plain_has_dry_run_line(clean_env, capsys):
+    """--plain output with --dry-run includes the dry_run\t1 line."""
+    store = _store(clean_env)
+    session = store.create(_root(clean_env))
+    handle = store.put_output(session, "bash", "c1", "log")
+    store.close()
+    _backdate(clean_env, [(session, handle)])
+
+    assert main(["sessions", "prune", "--older-than", "1", "--project", str(clean_env), "--plain", "--dry-run"]) == EXIT_OK
+    out = capsys.readouterr().out
+    lines = out.strip().splitlines()
+    keys = [line.split("\t")[0] for line in lines]
+    assert "dry_run" in keys
+    dry_run_line = [ln for ln in lines if ln.startswith("dry_run\t")][0]
+    assert dry_run_line == "dry_run\t1"
 
 
 def test_sessions_show_marks_a_session_another_window_is_using(clean_env, capsys):

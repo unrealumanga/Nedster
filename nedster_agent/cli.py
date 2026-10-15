@@ -30,31 +30,39 @@ class SessionActive(RuntimeError):
     """Another live Nedster holds the session's activity lock (exit 1)."""
 
 
+# Shared help strings for global flags, used in both root parser and subcommand parsers.
+GLOBAL_HELP: dict[str, str] = {
+    "--project": "Project folder (default: current folder)",
+    "--config": "Nedster TOML configuration path",
+    "--json": "Emit one machine-readable JSON document",
+    "--plain": "Emit stable, one-record-per-line text",
+    "--no-tui": "Never open the full-screen interface",
+    "--color": "Force color when the destination supports it",
+    "--no-color": "Disable color output",
+    "--ascii": "Use ASCII-safe symbols",
+}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="nedster",
         description="Nedster — a local-first AI coding and automation agent",
     )
-    parser.add_argument("--project", default=".", help="Project folder (default: current folder)")
-    parser.add_argument("--config", default=None, help="Nedster TOML configuration path")
-    parser.add_argument("--json", action="store_true", help="Emit one machine-readable JSON document")
-    parser.add_argument("--plain", action="store_true", help="Emit stable, one-record-per-line text")
-    parser.add_argument("--no-tui", action="store_true", help="Never open the full-screen interface")
-    parser.add_argument("--color", action="store_true", help="Force color when the destination supports it")
-    parser.add_argument("--no-color", action="store_true", help="Disable color output")
-    parser.add_argument("--ascii", action="store_true", help="Use ASCII-safe symbols")
+    parser.add_argument("--project", default=".", help=GLOBAL_HELP["--project"])
+    parser.add_argument("--config", default=None, help=GLOBAL_HELP["--config"])
+    for flag in list(GLOBAL_HELP)[2:]:
+        parser.add_argument(flag, action="store_true", help=GLOBAL_HELP[flag])
     parser.add_argument("--version", action="version", version=f"Nedster {__version__}")
     subcommands = parser.add_subparsers(dest="command")
 
     def accept_global_options(command_parser: argparse.ArgumentParser) -> None:
-        command_parser.add_argument("--project", default=argparse.SUPPRESS)
-        command_parser.add_argument("--config", default=argparse.SUPPRESS)
-        command_parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
-        command_parser.add_argument("--plain", action="store_true", default=argparse.SUPPRESS)
-        command_parser.add_argument("--no-tui", action="store_true", default=argparse.SUPPRESS)
-        command_parser.add_argument("--color", action="store_true", default=argparse.SUPPRESS)
-        command_parser.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
-        command_parser.add_argument("--ascii", action="store_true", default=argparse.SUPPRESS)
+        for flag, help_text in GLOBAL_HELP.items():
+            if flag == "--project" or flag == "--config":
+                command_parser.add_argument(flag, default=argparse.SUPPRESS, help=help_text)
+            else:
+                command_parser.add_argument(
+                    flag, action="store_true", default=argparse.SUPPRESS, help=help_text
+                )
 
     setup = subcommands.add_parser("setup", help="Install/adopt Ollama and configure recommended models")
     accept_global_options(setup)
@@ -127,7 +135,8 @@ def build_parser() -> argparse.ArgumentParser:
     accept_global_options(permissions)
     config = subcommands.add_parser("config", help="Inspect the effective configuration")
     accept_global_options(config)
-    config.add_argument("action", nargs="?", choices=("show",), default="show")
+    config.add_argument("action", nargs="?", choices=("show", "get", "path"), default="show")
+    config.add_argument("key", nargs="?", default=None, help="Dotted key for get, e.g. models.coder")
 
     sessions = subcommands.add_parser(
         "sessions", help="List, show, rename, delete or prune the saved sessions of this project"
@@ -164,6 +173,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar="DAYS",
         help="Only outputs older than DAYS are candidates (required)",
+    )
+    sessions_prune.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be deleted; change nothing",
     )
     return parser
 
@@ -245,6 +259,63 @@ def _config_show(args: argparse.Namespace) -> int:
         print(f"{key} = {value}  [{provenance[key]}]")
     for warning in config.warnings:
         print(f"# warning: {warning}")
+    return EXIT_OK
+
+
+def _config(args: argparse.Namespace) -> int:
+    action = getattr(args, "action", None) or "show"
+    if action == "show":
+        return _config_show(args)
+    if action == "get":
+        return _config_get(args)
+    if action == "path":
+        return _config_path(args)
+    raise UsageError(f"unknown config action: {action}")
+
+
+def _config_get(args: argparse.Namespace) -> int:
+    key = getattr(args, "key", None)
+    if not key:
+        raise UsageError("Usage: nedster config get <section.field>, e.g. models.coder")
+    config, provenance = _resolve(args)
+    data = _config_dict(config)
+    node: Any = data
+    for part in key.split("."):
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        else:
+            raise UsageError(f"Unknown config key {key!r}. See: nedster config show")
+    if args.json:
+        source = provenance.get(key, "default")
+        _emit_json({"key": key, "value": node, "source": source})
+    else:
+        if isinstance(node, str):
+            print(node)
+        else:
+            print(json.dumps(node))
+    return EXIT_OK
+
+
+def _config_path(args: argparse.Namespace) -> int:
+    from ironclad.config import config_dir, data_dir
+
+    user_cfg = config_dir() / "config.toml"
+    state_d = data_dir()
+    project_root = Path(args.project or ".").resolve()
+    proj_cfg = project_root / ".nedster" / "config.toml"
+
+    if args.json:
+        _emit_json({
+            "user_config": str(user_cfg),
+            "project_config": str(proj_cfg),
+            "data_dir": str(state_d),
+        })
+        return EXIT_OK
+    user_suffix = " (exists)" if user_cfg.exists() else " (not created yet)"
+    proj_suffix = " (exists)" if proj_cfg.exists() else " (not created yet)"
+    print(f"user config: {user_cfg}{user_suffix}")
+    print(f"project config: {proj_cfg}{proj_suffix}")
+    print(f"data dir: {state_d}")
     return EXIT_OK
 
 
@@ -431,7 +502,7 @@ def _doctor(args: argparse.Namespace) -> int:
             mark = "ready" if tier["ready"] else "NOT READY"
             console.print(_ascii(f"{label:<16}{mark} · {tier.get('detail', '')}", args.ascii), highlight=False, markup=False)
         if context:
-            kv = f"KV {context['kv_cache_type']}, flash attention {'on' if context['flash_attention'] else 'off'}"
+            kv = f"KV {context['kv_cache_type']} / flash attention {'on' if context['flash_attention'] else 'off'} (as seen by this shell; server unknown)"
             line = f"{'context':<16}model {context['num_ctx'] or '?'} tokens · engine budget {context['engine_budget']} · {kv}"
             console.print(_ascii(line, args.ascii), highlight=False, markup=False)
             for tip in context["advice"]:  # type: ignore[union-attr]
@@ -849,21 +920,40 @@ def _sessions_prune(args: argparse.Namespace, store: Any, project_root: Path) ->
     if not 0 < days < 1_000_000:  # positive, finite, and never older than the store itself
         raise UsageError("--older-than must be a positive number of days")
     cutoff_ns = time.time_ns() - int(days * 86_400 * 1e9)
-    stats = store.prune_outputs(str(project_root), cutoff_ns=cutoff_ns)
-    payload = {"project_root": str(project_root), "older_than_days": days, "cutoff_ns": cutoff_ns, **stats}
+    stats = store.prune_outputs(str(project_root), cutoff_ns=cutoff_ns, dry_run=args.dry_run)
+    removable = stats["deleted"]
+    payload = {
+        "project_root": str(project_root),
+        "older_than_days": days,
+        "cutoff_ns": cutoff_ns,
+        **stats,
+    }
+    if args.dry_run:
+        payload["dry_run"] = True
     if args.json:
         _emit_json(payload)
         return EXIT_OK
     if args.plain:
         for key in ("sessions", "outputs", "deleted", "retained_referenced", "retained_recent"):
             print(f"{key}\t{stats[key]}")
+        print(f"dry_run\t{1 if args.dry_run else 0}")
         return EXIT_OK
-    print(f"Scanned {stats['sessions']} session(s), {stats['outputs']} output(s) older than {days:g} day(s).")
-    print(f"Deleted {stats['deleted']} unreferenced output(s).")
-    print(f"Kept {stats['retained_referenced']} referenced by a message or task state.")
-    print(f"Kept {stats['retained_recent']} newer than the cutoff.")
-    if stats["outputs"] == stats["retained_referenced"] + stats["retained_recent"]:
+    # human output – fix the summary line to report removable count
+    print(
+        f"Scanned {stats['outputs']} output(s) in {stats['sessions']} session(s): "
+        f"{removable} removable, {stats['retained_referenced']} referenced, "
+        f"{stats['retained_recent']} newer than {days:g} day(s)."
+    )
+    if removable == 0:
         print("Nothing was prunable.")
+    elif args.dry_run:
+        print(
+            f"Dry run: nothing was deleted. Run again without --dry-run to delete "
+            f"{removable} output(s)."
+        )
+    else:
+        print(f"Deleted {removable} unreferenced output(s).")
+    print("This prunes stored tool output only; conversations are kept.")
     return EXIT_OK
 
 
@@ -920,10 +1010,30 @@ def _latest_non_empty(config: Any) -> str | None:
         store.close()
 
 
+def _check_flags(args: argparse.Namespace) -> None:
+    # Check output mode conflicts (more than one of --json, --plain, --jsonl).
+    active_modes = [args.json, args.plain]
+    if hasattr(args, "jsonl") and args.jsonl:
+        active_modes.append(args.jsonl)
+    if sum(active_modes) > 1:
+        raise UsageError("Choose one output mode: --plain, --json, or --jsonl.")
+
+    # Check --color / --no-color conflict.
+    if getattr(args, "color", False) and getattr(args, "no_color", False):
+        raise UsageError("Choose either --color or --no-color, not both.")
+    # --session / --continue are a mutually exclusive argparse group (exit 2 before dispatch).
+
+
 def _tui_or_help(args: argparse.Namespace) -> int:
     machine = args.json or args.plain or args.no_tui
     interactive_tui = not machine and sys.stdout.isatty()
     if not interactive_tui:
+        if args.command == "tui":
+            _err(
+                "The TUI needs an interactive terminal. For piped output use: "
+                "nedster run \"...\""
+            )
+            return EXIT_USAGE
         build_parser().print_help()
         return EXIT_OK
     from .model_manager import state_dir
@@ -967,9 +1077,10 @@ def _resume(args: argparse.Namespace) -> int:
 
 
 def _dispatch(args: argparse.Namespace) -> int:
+    _check_flags(args)
     command = args.command
     if command == "config":
-        return _config_show(args)
+        return _config(args)
     if command == "setup":
         return _setup(args)
     if command == "doctor":

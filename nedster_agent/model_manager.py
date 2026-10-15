@@ -643,6 +643,9 @@ def context_report(
     flash = env.get("OLLAMA_FLASH_ATTENTION", "").strip().lower() in {"1", "true", "yes", "on"}
     kv_type = env.get("OLLAMA_KV_CACHE_TYPE", "").strip().lower() or "f16"
     report.update(flash_attention=flash, kv_cache_type=kv_type)
+    # Track where we got these values from.
+    report["kv_source"] = "client shell (Ollama server settings unknown)"
+
     advice: list[str] = []
     num_ctx = report["num_ctx"]
     if not budget:
@@ -652,12 +655,35 @@ def context_report(
     if isinstance(num_ctx, int) and budget > num_ctx:
         advice.append(f"engine budget {budget} > model num_ctx {num_ctx}: Ollama will truncate; lower runtime.context_tokens")
     if not flash or kv_type == "f16":
-        advice.append(
-            "set OLLAMA_FLASH_ATTENTION=1 and OLLAMA_KV_CACHE_TYPE=q8_0 for the Ollama server (then restart it): "
-            "halves KV-cache memory, so the same VRAM holds about twice the context"
-        )
+        advice.append(kv_cache_advice())
     report["advice"] = advice
     return report
+
+
+def kv_cache_advice(system: str | None = None) -> str:
+    """Return a platform-specific, copy-pasteable command to set KV-cache env vars for the Ollama server."""
+    import platform
+
+    system = system or platform.system()
+    base = (
+        "To halve KV-cache memory (about 2x context in the same VRAM), "
+        "set these for the Ollama server and restart it (quit Ollama from the tray first):"
+    )
+    if system == "Windows":
+        return (
+            base
+            + ' setx OLLAMA_FLASH_ATTENTION 1 ; setx OLLAMA_KV_CACHE_TYPE q8_0'
+        )
+    elif system == "Darwin":
+        return (
+            base
+            + ' launchctl setenv OLLAMA_FLASH_ATTENTION 1 && launchctl setenv OLLAMA_KV_CACHE_TYPE q8_0 (then restart the Ollama app)'
+        )
+    else:  # Linux / other
+        return (
+            base
+            + ' add Environment="OLLAMA_FLASH_ATTENTION=1" and Environment="OLLAMA_KV_CACHE_TYPE=q8_0" with `sudo systemctl edit ollama`, then `sudo systemctl restart ollama`'
+        )
 
 
 def readiness(config: Any, manager: OllamaManager | None = None) -> dict[str, dict[str, object]]:
