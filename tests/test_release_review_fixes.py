@@ -67,13 +67,13 @@ def test_outcome_to_moment_mapping(outcome, moment):
 
 
 def test_only_completed_lines_mention_tests_or_checks():
-    claims = ("test", "pass", "verified", "green", "check", "suite", "works")
+    claims = ("test", "pass", "verified", "green", "check", "suite", "works", "citation", "source", "proof", "evidence")
     for outcome in ("answered", "no_change_needed", "unvalidated", "failed", "incomplete", "cancelled"):
         moment = personality.moment_for_outcome(outcome)
         for line in personality.lines(moment):
             lowered = line.lower().replace("not verified", "").replace("verified nothing", "")
             assert not any(word in lowered for word in claims), (outcome, line)
-    assert "Answered. Citations are in the text, opinions are my own." in personality.lines("done_answered")
+    assert "Answered. Read it with the usual suspicion." in personality.lines("done_answered")
 
 
 # --- S7 ------------------------------------------------------------------------------------------

@@ -30,7 +30,7 @@ LINES: dict[str, tuple[str, ...]] = {
         "All checks passed. Suspiciously smooth.",
     ),
     "done_answered": (
-        "Answered. Citations are in the text, opinions are my own.",
+        "Answered. Read it with the usual suspicion.",
         "That's my answer. Weigh it like you would anyone's.",
         "Done talking. The details are above.",
     ),
