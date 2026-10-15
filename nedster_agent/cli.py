@@ -637,6 +637,84 @@ async def _run_objective(args: argparse.Namespace, objective: str) -> int:
     return await _run_native(args, config, objective)
 
 
+class ProgressLine:
+    """Render one live progress line on the stream using \\r and \\x1b[K.
+
+    When ``enabled`` is False nothing is written to the stream at all.
+    Events are fed via ``on_event()``; the final teardown happens in ``close()``.
+    """
+
+    _THROTTLE = 0.25  # seconds between redraws
+
+    def __init__(self, stream, *, enabled: bool, ascii_only: bool = False, clock=time.monotonic):
+        self._stream = stream
+        self._enabled = enabled
+        self._ascii = ascii_only
+        self._clock = clock
+        self._start = clock()
+        self._last_redraw = 0.0
+        self._step = 1
+        self._tool: str | None = None
+
+    # -- public API ---------------------------------------------------------
+
+    def on_event(self, event) -> None:
+        if not self._enabled:
+            return
+        kind = event.kind
+        data = event.data
+        if kind == "model.usage":
+            self._step += 1
+        elif kind == "tool.started":
+            self._tool = str(data.get("tool", ""))
+        elif kind == "tool.finished":
+            self._tool = None
+        # throttled redraw
+        now = self._clock()
+        if now - self._last_redraw >= self._THROTTLE:
+            self._redraw(now)
+            self._last_redraw = now
+
+    def _sep(self) -> str:
+        return " · " if not self._ascii else " - "
+
+    def _text(self, elapsed: float) -> str:
+        parts: list[str] = ["thinking"]
+        total_s = int(elapsed)
+        parts.append(f"{total_s}s")
+        parts.append(f"step {self._step}")
+        if self._tool:
+            parts.append(self._tool)
+        return self._sep().join(parts)
+
+    def _redraw(self, now: float) -> None:
+        if not self._enabled:
+            return
+        text = self._text(now - self._start)
+        self._stream.write("\r" + text + "\x1b[K")
+        self._stream.flush()
+
+    def tool_line(self, text: str) -> None:
+        """Clear the progress line, emit *text* on its own line, then redraw."""
+        if not self._enabled:
+            return
+        # clear current progress line first
+        self._stream.write("\r\x1b[K")
+        self._stream.write(text + "\n")
+        self._stream.flush()
+        # redraw remaining progress below
+        now = self._clock()
+        if now - self._last_redraw >= self._THROTTLE:
+            self._redraw(now)
+            self._last_redraw = now
+
+    def close(self) -> None:
+        if not self._enabled:
+            return
+        self._stream.write("\r\x1b[K")
+        self._stream.flush()
+
+
 class _SessionHeartbeat:
     """Refreshes the activity lock of the session a `nedster run` is using, then releases it.
 
@@ -695,12 +773,24 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> 
 
     from ironclad.native import NativeSession
 
+    # Live progress line on interactive terminals.
+    prog = ProgressLine(
+        sys.stderr,
+        enabled=sys.stderr.isatty() and not (args.json or args.jsonl or getattr(args, "plain", False)),
+        ascii_only=getattr(args, "ascii", False),
+    )
+
     def emit(event: Any) -> None:
+        prog.on_event(event)  # always; ProgressLine handles disabled state
         if args.jsonl:
             _emit_json({"kind": event.kind, "session_id": event.session_id, "run_id": event.run_id, "data": dict(event.data)})
         elif event.kind == "tool.finished" and not args.json:
             data = event.data
-            _err(f"  {data.get('tool')} -> {data.get('status')} ({data.get('elapsed_ms', 0):.0f} ms)")
+            msg = f"  {data.get('tool')} -> {data.get('status')} ({data.get('elapsed_ms', 0):.0f} ms)"
+            if prog._enabled:
+                prog.tool_line(msg)
+            else:
+                _err(msg)
 
     model = _validate_requested_model(args.model, config)
     session = NativeSession(
@@ -723,6 +813,7 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> 
 
         result = await session.run(objective, intent=parse_expect(getattr(args, "expect", None)))
     finally:
+        prog.close()
         if heartbeat is not None:
             heartbeat.close()  # releases the lock; before aclose() closes the store
         await session.aclose()
