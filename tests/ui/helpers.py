@@ -19,6 +19,7 @@ DEFAULT_INFO: dict[str, Any] = {
     "isolation": "full",
     "context_used": 1200,
     "context_max": 32768,
+    "max_steps": 40,
     "session_id": "sess-1",
     "engine": "fake",
 }

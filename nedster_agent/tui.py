@@ -64,11 +64,18 @@ COMMANDS: dict[str, str] = {
 }
 # Commands that change engine/session state wait for the running turn (the text is kept).
 IDLE_ONLY = {"/new", "/resume", "/model", "/models", "/undo", "/sessions"}
+# Commands that take no argument: extra text is rejected with a usage hint instead of being ignored.
+NO_ARG_COMMANDS = frozenset({
+    "/help", "/new", "/clear", "/sessions", "/models", "/status",
+    "/diff", "/undo", "/doctor", "/permissions", "/quit", "/exit",
+})
 
 #: How much stored history /resume replays into the view (display only, never re-executed).
 RESUME_REPLAY_LIMIT = 200
 #: Activity-lock heartbeat period; well below the store's 60 s lock TTL.
 LOCK_REFRESH_S = 5.0
+#: Longest the @file inventory may stay stale when no turn changed files.
+FILE_REFRESH_S = 30.0
 
 DoctorProvider = Callable[[NedsterConfig], Mapping[str, Mapping[str, Any]]]
 SessionFactoryFor = Callable[[NedsterConfig, EventCallback], EngineSession]
@@ -180,6 +187,7 @@ class NedsterApp(App[None]):
     #work { height: 1fr; padding: 0 2; background: #0b0d10; color: #e6edf3; scrollbar-color: #394150; scrollbar-color-hover: #596579; scrollbar-size-vertical: 1; }
     #details { height: 1fr; padding: 0 2; display: none; background: #0b0d10; color: #e6edf3; }
     #completions { height: auto; max-height: 8; margin: 0 2; display: none; background: #11151b; border: round #394150; }
+    #search-hint { height: 1; padding: 0 2; display: none; background: #0b0d10; color: #d29922; }
     #prompt { height: auto; min-height: 3; max-height: 8; margin: 0 2; background: #11151b; color: #f0f6fc; border: round #394150; }
     #prompt:focus { border: round #7aa2f7; }
     #status { height: 1; padding: 0 2; background: #0b0d10; color: #c9d1d9; }
@@ -188,7 +196,7 @@ class NedsterApp(App[None]):
     #too-small { display: none; height: 1fr; content-align: center middle; text-align: center; }
     .queued { color: #d29922; }
     .no-color, .no-color #identity, .no-color #work, .no-color #details, .no-color #message, .no-color #status,
-    .no-color Footer, .no-color #prompt, .no-color #completions { color: ansi_default; background: ansi_default; }
+    .no-color Footer, .no-color #prompt, .no-color #completions, .no-color #search-hint { color: ansi_default; background: ansi_default; }
     .no-color #prompt, .no-color #completions { border: round ansi_default; }
     .no-color #prompt:focus { border: round ansi_default; }
     .no-color .queued { color: ansi_default; text-style: italic; }
@@ -197,11 +205,13 @@ class NedsterApp(App[None]):
     """
 
     BINDINGS = [
-        Binding("escape", "escape", "Stop", priority=True),
-        Binding("ctrl+c", "interrupt", "Quit (x2)", priority=True),
-        Binding("f2", "details", "Events"),
-        Binding("f4", "models", "Models"),
-        Binding("ctrl+l", "clear", "Clear"),
+        Binding("f1", "help", "help"),
+        Binding("f4", "models", "models"),
+        Binding("ctrl+r", "history", "history"),
+        Binding("escape", "escape", "stop", priority=True),
+        Binding("f2", "details", "events", show=False),
+        Binding("ctrl+c", "interrupt", "quit x2", priority=True, show=False),
+        Binding("ctrl+l", "clear", "clear", show=False),
     ]
 
     def __init__(
@@ -223,7 +233,10 @@ class NedsterApp(App[None]):
         self.session_factory = session_factory
         self.doctor = doctor or _default_doctor
         root = Path(config.runtime.project_root)
-        self.files_source = files or (lambda: project_files(root))
+        self._files_fetch = files or (lambda: project_files(root))
+        self._files_cache: list[str] = []  # refreshed by a worker; read from the UI thread without blocking
+        self._files_at = 0.0
+        self._files_refreshing = False
         self.model_source = model_source or self._default_model_source
         self.history = History.for_project(Path(config.runtime.state_dir), root)
         self.session: EngineSession | None = None
@@ -235,11 +248,13 @@ class NedsterApp(App[None]):
         self.event_buffer: list[str] = []
         self.tool_rows: dict[str, ToolRow] = {}
         self.changed_paths: list[str] = []
+        self._turn_changed = False  # did the current turn touch any file (drives @file inventory refresh)?
         self.current_reply: AssistantMessage | None = None
         self.turn_replies: list[AssistantMessage] = []
         self.pending_badge: OutcomeBadge | None = None
         self.turn_closed = True
         self.last_interrupt = 0.0
+        self._model_started: float | None = None  # wall-clock start of the model call in flight (speed fallback)
         self._loop_thread = threading.get_ident()
         self._lock_owner = make_owner("tui")
         self._locked: tuple[Any, str] | None = None  # (store, session_id) held by this window
@@ -254,12 +269,15 @@ class NedsterApp(App[None]):
         yield Transcript(id="work")
         yield RichLog(id="details", markup=False, wrap=False, auto_scroll=True)
         yield OptionList(id="completions")
+        yield Static("", id="search-hint")
         yield Composer(
             id="prompt",
             history=self.history,
             commands=list(COMMANDS),
-            files=self.files_source,
+            command_descriptions=COMMANDS,
+            files=lambda: self._files_cache,
             menu=lambda: self.query_one("#completions", OptionList),
+            hint=self._search_hint,
         )
         yield StatusBar(g, id="status")
         yield Static("", id="message")
@@ -293,6 +311,7 @@ class NedsterApp(App[None]):
             "@ mentions a file, / lists commands, Esc stops a running turn."
         ), g.style("muted")))
         self.set_interval(0.5, self._tick)
+        self.run_worker(self._refresh_files(), group="files", exclusive=True)
         self.run_worker(self._initialize(), group="startup", exclusive=True)
 
     @property
@@ -311,6 +330,7 @@ class NedsterApp(App[None]):
         self.query_one("#details").display = not too_small and self.details_visible
         if too_small:
             self.query_one("#completions").display = False
+            self.query_one("#search-hint").display = False
         for selector in ("#prompt", "#status", "#message", "Footer"):
             self.query_one(selector).display = not too_small
 
@@ -328,6 +348,13 @@ class NedsterApp(App[None]):
             for row in self.tool_rows.values():
                 if row.finished is None:
                     row.refresh()
+        elif (
+            not self._files_refreshing
+            and self._files_at
+            and time.monotonic() - self._files_at >= FILE_REFRESH_S
+        ):
+            # keep the @file inventory from going stale even when no turn has run for a while
+            self.run_worker(self._refresh_files(), group="files", exclusive=True)
 
     # ------------------------------------------------------------------ startup
 
@@ -380,6 +407,26 @@ class NedsterApp(App[None]):
 
     def _message(self, text: str) -> None:
         self.query_one("#message", Static).update(Text(self._text(text)))
+
+    def _search_hint(self, text: str | None) -> None:
+        """Composer callback: show/hide the one-line reverse-search hint above the prompt."""
+        hint = self.query_one("#search-hint", Static)
+        hint.display = text is not None
+        hint.update(Text(self._text(text or "")))
+
+    async def _refresh_files(self, *, force: bool = False) -> None:
+        """Refresh the @file inventory in a worker thread; a changed turn forces it, otherwise 30 s TTL."""
+        if not force and self._files_cache and time.monotonic() - self._files_at < FILE_REFRESH_S:
+            return
+        self._files_refreshing = True
+        try:
+            files = await asyncio.to_thread(self._files_fetch)
+        except Exception:  # noqa: BLE001 - a failed scan keeps the last inventory rather than crashing
+            return
+        finally:
+            self._files_refreshing = False
+        self._files_cache = list(files)
+        self._files_at = time.monotonic()
 
     def _set_state(self, state: str, detail: str = "", *, force: bool = False) -> None:
         if self.cancelling and not force:
@@ -492,6 +539,7 @@ class NedsterApp(App[None]):
             self._line("No saved transcript for this session.", "muted")
         self.transcript.add(Banner(self.glyphs, RESUME_BANNER))
         self._refresh_info()
+        self.status_bar.reset_usage()  # the resumed session's context usage is unknown until the next call
 
     # ------------------------------------------------------------------ events
 
@@ -525,9 +573,12 @@ class NedsterApp(App[None]):
 
     def _on_turn_started(self, event: EngineEvent) -> None:
         self.turn_closed = False
+        self._model_started = None
         self._set_state("thinking")
 
     def _on_model_delta(self, event: EngineEvent) -> None:
+        if self._model_started is None:
+            self._model_started = time.monotonic()
         if self.current_reply is None:
             self.current_reply = AssistantMessage(self.glyphs)
             self.turn_replies.append(self.current_reply)
@@ -537,10 +588,16 @@ class NedsterApp(App[None]):
         self._set_state("thinking")
 
     def _on_model_usage(self, event: EngineEvent) -> None:
-        used = int(event.data.get("prompt_tokens") or 0) + int(event.data.get("completion_tokens") or 0)
-        info = dict(self.status_bar.info)
-        info["context_used"] = used
-        self.status_bar.set_info(info)
+        data = event.data
+        wall = time.monotonic() - self._model_started if self._model_started is not None else None
+        self._model_started = None
+        self.status_bar.note_usage(
+            int(data.get("prompt_tokens") or 0),
+            int(data.get("completion_tokens") or 0),
+            decode_ms=float(data.get("decode_ms") or 0.0),
+            wall_s=wall,
+        )
+        self.status_bar.advance_step()
 
     def _on_tool_started(self, event: EngineEvent) -> None:
         self.current_reply = None
@@ -622,6 +679,7 @@ class NedsterApp(App[None]):
         for path in paths:
             if str(path) not in self.changed_paths:
                 self.changed_paths.append(str(path))
+                self._turn_changed = True
 
     def _diff_loader(self, paths: Sequence[str]) -> str:
         return session_diff(Path(self.config.runtime.project_root), paths)
@@ -689,6 +747,8 @@ class NedsterApp(App[None]):
         self.status_bar.end_turn()
         self._set_state("idle")
         self._refresh_info()
+        self.run_worker(self._refresh_files(force=self._turn_changed), group="files", exclusive=True)
+        self._turn_changed = False
         self._dequeue()
 
     def _dequeue(self) -> None:
@@ -712,6 +772,9 @@ class NedsterApp(App[None]):
                 cancel()
             return
         composer = self.query_one("#prompt", Composer)
+        if composer.search_active:
+            composer.cancel_search()  # Esc restores the draft that was in the composer
+            return
         if composer.completion is not None:
             composer.close_completion()
             return
@@ -749,6 +812,9 @@ class NedsterApp(App[None]):
 
     def action_help(self) -> None:
         self._command("/help")
+
+    def action_history(self) -> None:
+        self.query_one("#prompt", Composer).cycle_search()
 
     def action_details(self) -> None:
         self.details_visible = not self.details_visible
@@ -793,6 +859,9 @@ class NedsterApp(App[None]):
         if handler is None:
             self._line(f"Unknown command {command}. /help lists commands.", "warn")
             return
+        if command in NO_ARG_COMMANDS and args:
+            self._line(f"{command} takes no arguments · usage: {command}", "warn")
+            return
         handler(args)
 
     def _cmd_help(self, _args: list[str]) -> None:
@@ -800,9 +869,10 @@ class NedsterApp(App[None]):
         for name, text in COMMANDS.items():
             self._line(f"  {name:<13}{text}")
         self._line("Keys", "accent")
-        self._line("  Enter send · Shift+Enter/Ctrl+J newline · Up/Down history · @ file · / command")
-        self._line("  Esc stop the running turn · Ctrl+C twice exit · F2 raw events · Ctrl+L clear")
-        self._line("  F4 models · Tool rows: focus with Tab/click, Enter expands argv, output and diff")
+        self._line("  Enter send · Shift+Enter/Ctrl+J newline · Up/Down history · Ctrl+R search history")
+        self._line("  @ file · / command · Esc stop the running turn · Ctrl+C twice exit")
+        self._line("  F1 help · F4 models · F2 raw events · Ctrl+L clear")
+        self._line("  Tool rows: focus with Tab/click, Enter expands argv, output and diff")
 
     def _cmd_new(self, _args: list[str]) -> None:
         new = getattr(self.session, "new", None)
@@ -816,6 +886,7 @@ class NedsterApp(App[None]):
         self.changed_paths.clear()
         self._line(f"New conversation {str(session_id)[:12]}", "accent")
         self._refresh_info()
+        self.status_bar.reset_usage()
 
     def _cmd_sessions(self, _args: list[str]) -> None:
         lister = getattr(self.session, "list_sessions", None)
@@ -939,6 +1010,7 @@ class NedsterApp(App[None]):
             return
         self._line(f"Model set to {name}", "accent")
         self._refresh_info()
+        self.status_bar.reset_usage()  # a different model's measured context/speed does not apply
 
     def _models_unreachable(self) -> str:
         g = self.glyphs

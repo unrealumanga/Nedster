@@ -147,6 +147,7 @@ class NativeSession:
             "isolation": self.isolation,
             "context_used": self.context_used,
             "context_max": int(getattr(budget, "context_tokens", 0) or 0),
+            "max_steps": getattr(budget, "max_steps", None),  # None = no limit
             "session_id": self.session_id,
             "engine": "native",
         }
