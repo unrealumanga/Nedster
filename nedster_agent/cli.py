@@ -71,6 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     models.add_argument("name", nargs="?", help="Model name for `models use`")
     models.add_argument("--profile", choices=("fast", "balanced", "maximum"), default="balanced")
     models.add_argument("--dry-run", action="store_true")
+    models.add_argument("--all", action="store_true", help="Also list models that cannot chat (embeddings)")
 
     run = subcommands.add_parser("run", help="Run one objective and exit")
     accept_global_options(run)
@@ -457,22 +458,26 @@ def _models(args: argparse.Namespace) -> int:
         _err(f"Ollama is not reachable at {manager.url}. Run `nedster setup`.")
         return EXIT_NOT_READY
     worker = config.models.coder if config.models.coder != "auto" else "nedster-worker"
-    rows = list_installed_models(manager, worker)
+    show_all = bool(getattr(args, "all", False))
+    rows = list_installed_models(manager, worker, include_embedding=show_all)
     if args.json:
         # `models` stays a list of names (machine contract); `installed` adds the details.
         _emit_json({"models": [row.name for row in rows], "current": worker, "installed": [asdict(row) for row in rows]})
     elif args.plain:
         for row in rows:
-            print(row.name)
+            print(f"{row.name}{'  (embedding)' if row.embedding else ''}")
     else:
         print(f"{'':2}{'model':<30}{'size':>9}  {'params':>7}  {'quant':>8}  {'context':>8}")
         for row in rows:
             mark = "*" if row.current else " "
+            tag = "  (embedding)" if row.embedding else ""
             print(
                 f"{mark:2}{row.name:<30}{row.size_label():>9}  {row.parameter_size or '?':>7}  "
-                f"{row.quantization or '?':>8}  {row.context_label():>8}"
+                f"{row.quantization or '?':>8}  {row.context_label():>8}{tag}"
             )
         print(f"{len(rows)} model(s) installed · current: {worker}")
+        if not show_all:
+            print("Embedding models are hidden; `nedster models list --all` shows them.")
         print("Switch this session with /models, or persist with: nedster models use <name>")
     return EXIT_OK
 

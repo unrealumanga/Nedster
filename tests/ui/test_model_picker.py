@@ -27,6 +27,13 @@ def _rows(current: str = "nedster-worker") -> list[InstalledModel]:
     ]
 
 
+def test_picker_never_shows_models_that_cannot_chat():
+    rows = [*_rows(), InstalledModel("nomic-embed-text:latest", embedding=True)]
+    picker = ModelPicker(rows)
+    assert [m.name for m in picker.models] == [m.name for m in _rows()]
+    assert "nomic-embed-text:latest" not in [m.name for m in picker.filtered]
+
+
 @pytest.mark.asyncio
 async def test_models_command_filters_and_switches_the_session_model(tmp_path):
     h = Harness(tmp_path, model_source=lambda current: _rows(current))

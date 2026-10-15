@@ -183,6 +183,7 @@ class MemoryStore:
         self.msgs: dict[str, list[ChatMessage]] = {}
         self.state: dict[tuple[str, str], Any] = {}
         self.outputs: dict[tuple[str, int], str] = {}
+        self.output_calls: dict[tuple[str, int], str] = {}
         self.replaced = 0
 
     def create(self, project_root: str, title: str = "") -> str:
@@ -208,10 +209,19 @@ class MemoryStore:
     def put_output(self, session_id: str, tool: str, call_id: str, text: str) -> int:
         handle = 1 + sum(1 for sid, _ in self.outputs if sid == session_id)
         self.outputs[(session_id, handle)] = text
+        self.output_calls[(session_id, handle)] = call_id
         return handle
 
     def get_output(self, session_id: str, handle: int) -> str:
         return self.outputs[(session_id, handle)]
+
+    def output_for_call(self, session_id: str, call_id: str) -> str | None:
+        if not call_id:
+            return None
+        for (sid, handle), cid in self.output_calls.items():
+            if sid == session_id and cid == call_id:
+                return self.outputs[(session_id, handle)]
+        return None
 
     def replace_messages(self, session_id: str, messages: list[ChatMessage]) -> None:
         self.replaced += 1

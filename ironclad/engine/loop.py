@@ -502,6 +502,9 @@ class Engine:
         if result.status in (ToolStatus.INVALID, ToolStatus.DENIED):
             sig = _signature(call)
             run.invalid[sig] = run.invalid.get(sig, 0) + 1
+        # The event carries only a bounded preview, but the *full* text is kept durably for the UI
+        # whenever it is bigger than the preview — even below the model-facing truncation budget.
+        output_handle = session.vault.put(result.tool, result.call_id, result.output) if len(result.output) > EVENT_OUTPUT_CHARS else 0
         self._event(
             "tool.finished",
             session,
@@ -514,6 +517,7 @@ class Engine:
                 "mutated_paths": list(result.mutated_paths),
                 "elapsed_ms": result.elapsed_ms,
                 "output": result.output[:EVENT_OUTPUT_CHARS],
+                "output_handle": output_handle,
                 **{key: result.data[key] for key in EVENT_DATA_KEYS if key in result.data},
             },
         )

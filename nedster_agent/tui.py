@@ -24,8 +24,10 @@ from ironclad.config import NedsterConfig
 from ironclad.contracts import EngineEvent
 from ironclad.session_store.sqlite_store import make_owner
 
+from .notify import notification
 from .widgets.composer import Composer, History, project_files
 from .widgets.glyphs import Glyphs
+from .widgets.output_viewer import OutputViewer
 from .widgets.session import (
     EngineSession,
     EventCallback,
@@ -76,6 +78,8 @@ RESUME_REPLAY_LIMIT = 200
 LOCK_REFRESH_S = 5.0
 #: Longest the @file inventory may stay stale when no turn changed files.
 FILE_REFRESH_S = 30.0
+#: Acceptance outcomes that count as a failed turn for the completion notice.
+FAILURE_OUTCOMES = frozenset({"failed", "incomplete", "unvalidated"})
 
 DoctorProvider = Callable[[NedsterConfig], Mapping[str, Mapping[str, Any]]]
 SessionFactoryFor = Callable[[NedsterConfig, EventCallback], EngineSession]
@@ -188,6 +192,7 @@ class NedsterApp(App[None]):
     #details { height: 1fr; padding: 0 2; display: none; background: #0b0d10; color: #e6edf3; }
     #completions { height: auto; max-height: 8; margin: 0 2; display: none; background: #11151b; border: round #394150; }
     #search-hint { height: 1; padding: 0 2; display: none; background: #0b0d10; color: #d29922; }
+    #follow-hint { height: 1; padding: 0 2; display: none; background: #0b0d10; color: #58a6ff; }
     #prompt { height: auto; min-height: 3; max-height: 8; margin: 0 2; background: #11151b; color: #f0f6fc; border: round #394150; }
     #prompt:focus { border: round #7aa2f7; }
     #status { height: 1; padding: 0 2; background: #0b0d10; color: #c9d1d9; }
@@ -196,7 +201,7 @@ class NedsterApp(App[None]):
     #too-small { display: none; height: 1fr; content-align: center middle; text-align: center; }
     .queued { color: #d29922; }
     .no-color, .no-color #identity, .no-color #work, .no-color #details, .no-color #message, .no-color #status,
-    .no-color Footer, .no-color #prompt, .no-color #completions, .no-color #search-hint { color: ansi_default; background: ansi_default; }
+    .no-color Footer, .no-color #prompt, .no-color #completions, .no-color #search-hint, .no-color #follow-hint { color: ansi_default; background: ansi_default; }
     .no-color #prompt, .no-color #completions { border: round ansi_default; }
     .no-color #prompt:focus { border: round ansi_default; }
     .no-color .queued { color: ansi_default; text-style: italic; }
@@ -212,6 +217,7 @@ class NedsterApp(App[None]):
         Binding("f2", "details", "events", show=False),
         Binding("ctrl+c", "interrupt", "quit x2", priority=True, show=False),
         Binding("ctrl+l", "clear", "clear", show=False),
+        Binding("ctrl+o", "verbose", "verbose", show=False),
     ]
 
     def __init__(
@@ -254,6 +260,11 @@ class NedsterApp(App[None]):
         self.pending_badge: OutcomeBadge | None = None
         self.turn_closed = True
         self.last_interrupt = 0.0
+        self.verbose = False  # Ctrl+O: auto-expand every tool row (in-memory, per session)
+        self._output_handles: dict[str, str] = {}  # call_id -> stored-output handle (for the full-output modal)
+        self._turn_started = 0.0  # wall-clock start of the running turn (drives the completion notice)
+        self._turn_outcome = ""  # acceptance outcome reported by the engine for this turn
+        self._notify_writer: Callable[[str], None] = self._default_notify_writer
         self._model_started: float | None = None  # wall-clock start of the model call in flight (speed fallback)
         self._loop_thread = threading.get_ident()
         self._lock_owner = make_owner("tui")
@@ -270,6 +281,7 @@ class NedsterApp(App[None]):
         yield RichLog(id="details", markup=False, wrap=False, auto_scroll=True)
         yield OptionList(id="completions")
         yield Static("", id="search-hint")
+        yield Static("", id="follow-hint")
         yield Composer(
             id="prompt",
             history=self.history,
@@ -300,6 +312,7 @@ class NedsterApp(App[None]):
         if self.ascii_only:
             self.screen.add_class("ascii")
         self._apply_size(self.size.width, self.size.height)
+        self.transcript.on_follow_change = self._show_follow_hint
         prompt = self.query_one("#prompt", Composer)
         prompt.cursor_blink = False
         prompt.focus()
@@ -331,6 +344,7 @@ class NedsterApp(App[None]):
         if too_small:
             self.query_one("#completions").display = False
             self.query_one("#search-hint").display = False
+            self.query_one("#follow-hint").display = False
         for selector in ("#prompt", "#status", "#message", "Footer"):
             self.query_one(selector).display = not too_small
 
@@ -533,7 +547,7 @@ class NedsterApp(App[None]):
                 except Exception as exc:  # noqa: BLE001
                     self._line(f"Could not read the transcript: {exc}", "warn")
         self._line(f"Resumed session {session_id[:12]}", "accent")
-        for widget in replay_widgets(self.glyphs, entries):
+        for widget in replay_widgets(self.glyphs, entries, output_loader=self._output_loader_for):
             self.transcript.add(widget)
         if not entries:
             self._line("No saved transcript for this session.", "muted")
@@ -584,7 +598,7 @@ class NedsterApp(App[None]):
             self.turn_replies.append(self.current_reply)
             self.transcript.add(self.current_reply)
         self.current_reply.append(str(event.data.get("text") or ""), str(event.data.get("kind") or "content"))
-        self.transcript.call_after_refresh(self.transcript.scroll_end, animate=False)
+        self.transcript.follow_output()
         self._set_state("thinking")
 
     def _on_model_usage(self, event: EngineEvent) -> None:
@@ -603,7 +617,12 @@ class NedsterApp(App[None]):
         self.current_reply = None
         call_id = str(event.data.get("call_id") or f"call-{len(self.tool_rows)}")
         tool = str(event.data.get("tool") or "tool")
-        row = ToolRow(self.glyphs, call_id, tool, dict(event.data.get("arguments") or {}), diff_loader=self._diff_loader)
+        row = ToolRow(
+            self.glyphs, call_id, tool, dict(event.data.get("arguments") or {}),
+            diff_loader=self._diff_loader,
+            output_loader=lambda cid=call_id: self._load_full_output(cid),
+            expanded=self.verbose,
+        )
         self.tool_rows[call_id] = row
         self.transcript.add(row)
         self._set_state("running tool", tool)
@@ -611,9 +630,17 @@ class NedsterApp(App[None]):
     def _on_tool_finished(self, event: EngineEvent) -> None:
         data = dict(event.data)
         call_id = str(data.get("call_id") or "")
+        handle = str(data.get("output_handle") or "")
+        if handle:
+            self._output_handles[call_id] = handle
         row = self.tool_rows.get(call_id)
         if row is None:
-            row = ToolRow(self.glyphs, call_id, str(data.get("tool") or "tool"), {}, diff_loader=self._diff_loader)
+            row = ToolRow(
+                self.glyphs, call_id, str(data.get("tool") or "tool"), {},
+                diff_loader=self._diff_loader,
+                output_loader=lambda cid=call_id: self._load_full_output(cid),
+                expanded=self.verbose,
+            )
             self.tool_rows[call_id or f"call-{len(self.tool_rows)}"] = row
             self.transcript.add(row)
         row.finish(data)
@@ -635,6 +662,7 @@ class NedsterApp(App[None]):
 
     def _on_turn_finished(self, event: EngineEvent) -> None:
         answer = str(event.data.get("answer") or "").strip()
+        self._turn_outcome = str(event.data.get("outcome") or "")
         self._show_answer(answer)
         if self.pending_badge is None and event.data.get("outcome"):
             self.pending_badge = OutcomeBadge(self.glyphs, str(event.data["outcome"]))
@@ -684,6 +712,74 @@ class NedsterApp(App[None]):
     def _diff_loader(self, paths: Sequence[str]) -> str:
         return session_diff(Path(self.config.runtime.project_root), paths)
 
+    # ------------------------------------------------------------------ completion notice
+
+    def _turn_outcome_word(self) -> str:
+        """One word for the completion notice: cancelled / failed / completed."""
+        if self.cancelling:
+            return "cancelled"
+        return "failed" if self._turn_outcome in FAILURE_OUTCOMES else "completed"
+
+    def _notify_turn(self, outcome: str, seconds: float) -> None:
+        """Emit the configured completion notice; silent in machine modes (the TUI never runs there)."""
+        mode = str(getattr(self.config.runtime, "notify", "bell") or "off")
+        threshold = float(getattr(self.config.runtime, "notify_after_s", 15.0) or 0.0)
+        data = notification(mode, outcome, seconds, threshold=threshold, interactive=True)
+        if data is not None:
+            self._notify_writer(data)
+
+    def _default_notify_writer(self, data: str) -> None:
+        """Write an escape sequence straight to the terminal (bypasses the screen buffer)."""
+        file = getattr(self.console, "file", None)
+        if file is None:
+            return
+        with suppress(Exception):
+            file.write(data)
+            file.flush()
+
+    # ------------------------------------------------------------------ full output + follow hint
+
+    def _load_full_output(self, call_id: str) -> str:
+        """Read a tool call's complete stored output (blocking; call from a worker)."""
+        store = self._session_store()
+        session_id = str(getattr(self.session, "session_id", "")) if self.session is not None else ""
+        reader = getattr(store, "output_for_call", None)
+        if callable(reader) and session_id and call_id:
+            try:
+                return str(reader(session_id, call_id) or "")
+            except Exception:  # noqa: BLE001 - fall back to whatever the row already has
+                return ""
+        return ""
+
+    @on(ToolRow.FullOutput)
+    def _open_full_output(self, message: ToolRow.FullOutput) -> None:
+        row = message.row
+        loader = row.output_loader
+        if loader is None and not row.event_output():
+            self._message("No stored output to show for this tool call")
+            return
+        name = self.glyphs.text(row.tool)
+        self.push_screen(
+            OutputViewer(
+                self.glyphs,
+                title=name,
+                loader=loader,
+                fallback=row.event_output(),
+                historical=row.historical,
+            )
+        )
+
+    def _output_loader_for(self, call_id: str) -> Callable[[], str]:
+        return lambda: self._load_full_output(call_id)
+
+    def _show_follow_hint(self, pending: bool) -> None:
+        hint = self.query_one("#follow-hint", Static)
+        if pending and self.size.width >= 80 and self.size.height >= 24:
+            hint.update(Text(self._text("New output - End to follow")))
+            hint.display = True
+        else:
+            hint.display = False
+
     # ------------------------------------------------------------------ input
 
     @on(Composer.Submitted, "#prompt")
@@ -724,6 +820,8 @@ class NedsterApp(App[None]):
     def _start_turn(self, value: str) -> None:
         self.busy = True
         self.turn_closed = False
+        self._turn_started = time.monotonic()
+        self._turn_outcome = ""
         self.status_bar.start_turn()
         self._set_state("thinking")
         self.run_worker(self._run_turn(value), group="turn")
@@ -740,6 +838,7 @@ class NedsterApp(App[None]):
         except Exception as exc:  # noqa: BLE001 - shown in the transcript
             self._line(f"{g.icon('fail')} Turn failed: {exc}", "fail")
         self._close_turn()
+        self._notify_turn(self._turn_outcome_word(), time.monotonic() - self._turn_started)
         self.busy = False
         if self.cancelling:
             self.cancelling = False
@@ -830,6 +929,17 @@ class NedsterApp(App[None]):
     def action_clear(self) -> None:
         self.transcript.remove_children()
         self.tool_rows = {k: v for k, v in self.tool_rows.items() if v.finished is None}
+        self.transcript.following = True
+        self.transcript.new_output = False
+        self._show_follow_hint(False)
+
+    def action_verbose(self) -> None:
+        """Ctrl+O: expand every tool row in this session (in-memory; not persisted)."""
+        self.verbose = not self.verbose
+        for row in self.tool_rows.values():
+            row.expanded = self.verbose
+            row.refresh(layout=True)
+        self._message("Verbose transcript · tool rows expanded" if self.verbose else "")
 
     def action_models(self) -> None:
         self._open_model_picker()
@@ -871,8 +981,9 @@ class NedsterApp(App[None]):
         self._line("Keys", "accent")
         self._line("  Enter send · Shift+Enter/Ctrl+J newline · Up/Down history · Ctrl+R search history")
         self._line("  @ file · / command · Esc stop the running turn · Ctrl+C twice exit")
-        self._line("  F1 help · F4 models · F2 raw events · Ctrl+L clear")
+        self._line("  F1 help · F4 models · F2 raw events · Ctrl+L clear · Ctrl+O verbose")
         self._line("  Tool rows: focus with Tab/click, Enter expands argv, output and diff")
+        self._line("  On a tool row, press o for the full stored output (Esc closes)")
 
     def _cmd_new(self, _args: list[str]) -> None:
         new = getattr(self.session, "new", None)

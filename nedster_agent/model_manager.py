@@ -11,7 +11,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -46,12 +46,16 @@ class InstalledModel:
     quantization: str = ""
     context_length: int | None = None
     current: bool = False
+    embedding: bool = False  # cannot chat (embedding-only): hidden unless `models list --all`
 
     def size_label(self) -> str:
         return f"{self.size_gb:.1f} GB" if self.size_gb is not None else "?"
 
     def context_label(self) -> str:
         return "unknown" if self.context_length is None else str(self.context_length)
+
+    def kind_label(self) -> str:
+        return "(embedding)" if self.embedding else ""
 
 
 MODEL_PLANS: dict[str, dict[str, ModelPlan]] = {
@@ -236,11 +240,20 @@ class OllamaManager:
     def list_models(self) -> list[str]:
         return [str(item["name"]) for item in self.list_model_details()]
 
-    def context_window(self, model: str) -> tuple[int | None, int | None]:
-        """(configured num_ctx, trained context length) from /api/show; None when unknown."""
+    def show(self, model: str) -> dict[str, Any]:
+        """The raw ``/api/show`` payload for one model."""
         response = httpx.post(f"{self.url}/api/show", json={"model": model}, timeout=10)
         response.raise_for_status()
-        data = response.json()
+        return dict(response.json())
+
+    def capabilities(self, model: str) -> set[str]:
+        """The capability tags Ollama reports for a model (empty when the field is missing)."""
+        caps = self.show(model).get("capabilities")
+        return {str(item) for item in caps} if isinstance(caps, list) else set()
+
+    def context_window(self, model: str) -> tuple[int | None, int | None]:
+        """(configured num_ctx, trained context length) from /api/show; None when unknown."""
+        data = self.show(model)
         return _num_ctx(str(data.get("parameters") or "")), _trained_ctx(data.get("model_info") or {})
 
     def install(self, *, dry_run: bool = False) -> None:
@@ -686,16 +699,42 @@ def is_model_missing_error(text: str) -> bool:
     return "404" in lowered or "not found" in lowered
 
 
+EMBEDDING_NAME_MARKERS = ("embed",)
+
+
+def is_embedding_model(name: str, capabilities: Collection[str] | None = None) -> bool:
+    """True when a model cannot chat: an obvious name, or Ollama reporting no ``completion`` capability."""
+    if any(marker in name.lower() for marker in EMBEDDING_NAME_MARKERS):
+        return True
+    caps = {str(item).lower() for item in (capabilities or ())}
+    return bool(caps) and "completion" not in caps
+
+
 def list_installed_models(
-    manager: OllamaManager, current: str = "", *, with_context: bool = True
+    manager: OllamaManager,
+    current: str = "",
+    *,
+    with_context: bool = True,
+    include_embedding: bool = False,
 ) -> list[InstalledModel]:
     """Installed models with size, parameters, quantization and (cheap) context.
 
-    Context comes from ``/api/show``; a model whose probe fails is reported as ``unknown`` rather
-    than guessed. A dead endpoint raises the underlying ``httpx`` error so the caller can explain it.
+    Context and capabilities come from ``/api/show``; a model whose probe fails is reported as
+    ``unknown`` rather than guessed. Models that cannot chat (embeddings) are hidden unless
+    ``include_embedding`` is set. A dead endpoint raises the underlying ``httpx`` error so the
+    caller can explain it.
     """
     models: list[InstalledModel] = []
     probe = getattr(manager, "context_window", None)
+    show = getattr(manager, "show", None)
+    seen: set[str] | None = getattr(manager, "_nedster_show_seen", None)
+    shown_info: dict[str, Any] | None = getattr(manager, "_nedster_shown_info", None)
+    if seen is None:
+        seen = set()
+        manager._nedster_show_seen = seen
+    if shown_info is None:
+        shown_info = {}
+        manager._nedster_shown_info = shown_info
     for entry in manager.list_model_details():
         name = str(entry.get("name") or "")
         if not name:
@@ -704,12 +743,29 @@ def list_installed_models(
         details = details if isinstance(details, Mapping) else {}
         size = entry.get("size")
         context: int | None = None
-        if with_context and callable(probe):
+        capabilities: set[str] = set()
+        if with_context and callable(show):  # one /api/show gives both context and capabilities
+            if name in seen:
+                info = shown_info[name]
+            else:
+                try:
+                    info = show(name)
+                except (httpx.HTTPError, ValueError):
+                    info = {}
+                seen.add(name)
+                shown_info[name] = info
+            context = _num_ctx(str(info.get("parameters") or "")) or _trained_ctx(info.get("model_info") or {})
+            caps = info.get("capabilities")
+            capabilities = {str(item) for item in caps} if isinstance(caps, list) else set()
+        elif with_context and callable(probe):
             try:
                 configured, trained = probe(name)
             except (httpx.HTTPError, ValueError):
                 configured = trained = None
             context = configured or trained
+        embedding = is_embedding_model(name, capabilities)
+        if embedding and not include_embedding:
+            continue
         models.append(
             InstalledModel(
                 name=name,
@@ -718,6 +774,7 @@ def list_installed_models(
                 quantization=str(details.get("quantization_level") or ""),
                 context_length=context,
                 current=match_installed_model(current, [name]) is not None,
+                embedding=embedding,
             )
         )
     return models

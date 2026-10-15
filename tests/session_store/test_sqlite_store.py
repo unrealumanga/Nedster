@@ -49,6 +49,26 @@ def test_output_handles_increase_per_session(tmp_path: Path):
             store.get_output(other, 2)
 
 
+def test_output_for_call_returns_the_full_text_and_is_session_scoped(tmp_path: Path):
+    with SqliteSessionStore(tmp_path / "sessions.sqlite3") as store:
+        session = store.create(str(tmp_path))
+        store.put_output(session, "bash", "c1", "first")
+        store.put_output(session, "bash", "c2", "second")
+        assert store.output_for_call(session, "c1") == "first"
+        assert store.output_for_call(session, "missing") is None
+        assert store.output_for_call(session, "") is None
+        other = store.create(str(tmp_path))
+        assert store.output_for_call(other, "c1") is None  # never leaks across sessions
+
+
+def test_output_for_call_prefers_the_newest_handle(tmp_path: Path):
+    with SqliteSessionStore(tmp_path / "sessions.sqlite3") as store:
+        session = store.create(str(tmp_path))
+        store.put_output(session, "bash", "c1", "older")
+        store.put_output(session, "bash", "c1", "newer")
+        assert store.output_for_call(session, "c1") == "newer"
+
+
 def test_list_sessions_filters_by_normalized_root(tmp_path: Path):
     root_a = tmp_path / "proj_a"
     root_b = tmp_path / "proj_b"

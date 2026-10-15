@@ -231,6 +231,7 @@ def test_describe_permissions_states_exact_capability():
 import httpx  # noqa: E402
 
 from nedster_agent.model_manager import (  # noqa: E402
+    is_embedding_model,
     is_model_missing_error,
     list_installed_models,
     match_installed_model,
@@ -257,6 +258,24 @@ class _ListingManager:
         raise httpx.HTTPError("dead endpoint")
 
 
+class _ShowManager:
+    """Double exposing the real ``show`` path so context *and* capabilities come from one /api/show."""
+
+    def __init__(self, entries, shows=None):
+        self.entries = list(entries)
+        self.shows = shows or {}
+        self.shown: list[str] = []
+
+    def list_model_details(self):
+        return list(self.entries)
+
+    def show(self, model):
+        self.shown.append(model)
+        if model in self.shows:
+            return self.shows[model]
+        raise httpx.HTTPError("dead endpoint")
+
+
 def _entry(name, size=9_500_000_000, params="9B", quant="Q4_K_M"):
     return {"name": name, "size": size, "details": {"parameter_size": params, "quantization_level": quant}}
 
@@ -280,6 +299,34 @@ def test_list_installed_models_can_skip_context_probes():
     manager = _ListingManager([_entry("qwen3.6:27b")], contexts={"qwen3.6:27b": (40960, None)})
     rows = list_installed_models(manager, with_context=False)
     assert rows[0].context_length is None and manager.probed == []
+
+
+def test_is_embedding_model_by_name_and_capabilities():
+    assert is_embedding_model("nomic-embed-text:latest")  # obvious name
+    assert is_embedding_model("embeddinggemma:300m")  # the recommended default embedding model
+    assert is_embedding_model("mystery:7b", {"embedding"})  # no completion capability
+    assert not is_embedding_model("qwen3.6:27b", {"completion", "tools"})
+    assert not is_embedding_model("qwen3.6:27b", set())  # unknown capabilities: trust the name
+
+
+def test_list_installed_models_hides_embeddings_unless_asked():
+    entries = [_entry("qwen3.6:27b"), _entry("nomic-embed-text:latest")]
+    manager = _ShowManager(
+        entries,
+        shows={
+            "qwen3.6:27b": {"parameters": "num_ctx 65536", "capabilities": ["completion", "tools"]},
+            "nomic-embed-text:latest": {"parameters": "", "capabilities": ["embedding"]},
+        },
+    )
+    visible = list_installed_models(manager)
+    assert [row.name for row in visible] == ["qwen3.6:27b"]
+    assert all(not row.embedding for row in visible)
+
+    everything = list_installed_models(manager, include_embedding=True)
+    assert [row.name for row in everything] == ["qwen3.6:27b", "nomic-embed-text:latest"]
+    assert everything[1].embedding is True and everything[1].kind_label() == "(embedding)"
+    assert everything[0].context_length == 65536  # context comes from the same show probe
+    assert manager.shown == ["qwen3.6:27b", "nomic-embed-text:latest"]
 
 
 def test_match_installed_model_accepts_an_implicit_latest_tag():

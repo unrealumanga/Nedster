@@ -44,9 +44,10 @@ class ModelPicker(ModalScreen[str | None]):
         self, models: Sequence[InstalledModel], *, current: str = "", glyphs: Glyphs | None = None
     ) -> None:
         super().__init__()
-        self.models = list(models)
+        # Embedding-only models cannot chat; keep them out of the picker even if a caller passes them.
+        self.models = [model for model in models if not model.embedding]
         self.current = current
-        self.filtered = list(models)
+        self.filtered = list(self.models)
         self.glyphs = glyphs or Glyphs()
 
     def compose(self) -> ComposeResult:
