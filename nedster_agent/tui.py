@@ -143,6 +143,10 @@ class _WiredNativeSession(NativeSession):
     def undo_last(self) -> Any:
         return self.core.undo_last()
 
+    def set_owner_guard(self, guard: Callable[[str], bool] | None) -> None:
+        if self.core is not None:
+            self.core.set_owner_guard(guard)
+
     def set_role(self, name: str) -> None:
         # Through the core: the accepted role is persisted with the session immediately (S2).
         if self.core is None:
@@ -472,6 +476,9 @@ class NedsterApp(App[None]):
             self.status_bar.set_state("setup needed")
             return
         self._refresh_info()
+        guard = getattr(self.session, "set_owner_guard", None)
+        if callable(guard) and callable(getattr(self._session_store(), "acquire_lock", None)):
+            guard(self._owns_session)  # B3: a turn stops writing the moment this window loses the lock
         session_id = str(getattr(self.session, "session_id", "") or "")
         if session_id:  # a lazily-created session has no id yet and needs no lock
             if not self._acquire_lock(session_id):  # B3: shown, and every turn is refused until it is free
@@ -644,7 +651,24 @@ class NedsterApp(App[None]):
             recovered = False
         if not recovered:
             self._locked = None  # B3: the next turn must re-acquire (or be refused), never write unowned
+            if self.busy:  # ... and the running one stops now (the engine guard blocks its writes meanwhile)
+                self._line("This conversation was taken over by another Nedster; the running turn was stopped.", "warn")
+                self.cancel_turn()
         self._message("" if recovered else "Session lock lost - another Nedster may have taken over")
+
+    def _owns_session(self, session_id: str) -> bool:
+        """Engine ownership guard: this window holds the lock of exactly ``session_id`` (checked in the
+        store, atomically, before every tool dispatch and persisted message)."""
+        if self._locked is None or self._locked[1] != str(session_id):
+            return False
+        store, held = self._locked
+        refresh = getattr(store, "refresh_lock", None)
+        if not callable(refresh):
+            return True
+        try:
+            return bool(refresh(held, self._lock_owner))
+        except Exception:  # noqa: BLE001 - an unverifiable lock is a lost lock
+            return False
 
     def _activate_session(self) -> bool:
         """Create the lazily-held session row and hold its activity lock before a turn runs.

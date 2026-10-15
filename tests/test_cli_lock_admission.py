@@ -159,3 +159,38 @@ def test_run_heartbeat_verify_refuses_after_an_expired_lock_is_taken_over(clean_
         heartbeat.close()
     finally:
         store.close()
+
+
+def test_cli_owner_guard_tracks_the_held_lock_and_never_reacquires(clean_env):
+    import time
+
+    sid = _seed(clean_env)
+    store = _store(clean_env)
+    try:
+        heartbeat = _lock_run_session(store, sid)
+        assert heartbeat is not None
+        assert heartbeat.owns(sid) is True
+        assert heartbeat.owns("someone-else") is False
+        connection = sqlite3.connect(clean_env / "data" / "sessions.sqlite3")
+        try:
+            connection.execute(
+                "UPDATE session_locks SET heartbeat_ns = ? WHERE session_id = ?",
+                (time.time_ns() - 61 * 1_000_000_000, sid),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        other_store = _store(clean_env)
+        other = make_owner("tui")
+        try:
+            assert other_store.acquire_lock(sid, other)
+        finally:
+            other_store.close()
+        assert heartbeat.owns(sid) is False
+        assert heartbeat.lost
+        assert heartbeat.owns(sid) is False  # stays lost
+        assert store.lock_info(sid)["owner"] == other
+        heartbeat.close()
+        assert store.lock_info(sid)["owner"] == other  # closing never removes the new owner's lock
+    finally:
+        store.close()

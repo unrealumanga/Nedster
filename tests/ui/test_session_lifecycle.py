@@ -378,3 +378,110 @@ def test_explicit_role_override_wins_over_the_saved_role_on_switch(tmp_path):
         import asyncio
 
         asyncio.run(core.aclose())
+
+
+# --- re-review 2 B3: losing the lock while a turn is running --------------------------------------
+
+
+class _GatedTransport(ScriptedTransport):
+    """The first model call waits on ``gate`` (the UI is mid-turn, awaiting model output)."""
+
+    def __init__(self, script: list[Any]) -> None:
+        super().__init__(script)
+        import asyncio
+
+        self.gate = asyncio.Event()
+        self.waiting = False
+
+    async def chat(self, **kwargs: Any):  # type: ignore[override]
+        if len(self.requests) == 0:
+            self.waiting = True
+            await self.gate.wait()
+        async for event in super().chat(**kwargs):
+            yield event
+
+
+def _expire_and_take_over(config: NedsterConfig, session_id: str) -> str:
+    import time
+
+    connection = sqlite3.connect(Path(config.runtime.state_dir) / "sessions.sqlite3")
+    try:
+        connection.execute(
+            "UPDATE session_locks SET heartbeat_ns = ? WHERE session_id = ?",
+            (time.time_ns() - 61 * 1_000_000_000, session_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    other_store = _store(config)
+    other = make_owner("tui")
+    try:
+        assert other_store.acquire_lock(session_id, other)
+    finally:
+        other_store.close()
+    return other
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ui_cancels", [True, False], ids=["heartbeat-cancels", "engine-guard-only"])
+async def test_lock_lost_mid_turn_stops_the_turn_and_writes_nothing_more(tmp_path, monkeypatch, ui_cancels):
+    config = _config(tmp_path)
+    (a,) = _seed(config, "alpha")
+    after = Path(config.runtime.project_root) / "after-loss.txt"
+    factory = _Factory([], session_id=a, lazy=False)
+    gated = _GatedTransport([
+        Turn(calls=[call("write_file", "w1", path="after-loss.txt", content="written after the loss\n")]),
+        Turn("done"),
+    ])
+    factory.transport = gated
+    app = _app(config, factory)
+    if not ui_cancels:  # prove the engine-side guard alone blocks the write
+        monkeypatch.setattr(NedsterApp, "cancel_turn", lambda self: None)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await ready(pilot, app)
+        app.submit_text("write after-loss.txt")
+        await wait_for(pilot, lambda: gated.waiting)  # admitted; awaiting scripted model output
+        persisted = _contents(config, a)
+        assert "write after-loss.txt" in persisted  # the admitted turn's user message
+
+        other = _expire_and_take_over(config, a)
+        before = _dump(config)
+        app._last_lock_refresh = 0.0  # the UI heartbeat runs now and sees the loss
+        app._heartbeat_lock()
+        assert app._locked is None
+        gated.gate.set()
+        await wait_for(pilot, lambda: not app.busy and app.status_bar.state == "idle")
+
+        assert not after.exists()
+        assert _contents(config, a) == persisted  # nothing persisted after the loss
+        assert _dump(config) == before
+        assert app._turn_outcome == "cancelled"
+        assert app.session.store.lock_info(a)["owner"] == other  # the foreign lock is intact
+        if ui_cancels:
+            assert "the running turn was stopped" in app.transcript.plain_text()
+
+
+@pytest.mark.asyncio
+async def test_engine_guard_blocks_persisting_and_dispatch_once_ownership_is_lost(tmp_path):
+    """Core level: the guard flips while the model 'thinks'; its tool call is never dispatched."""
+    from ironclad.native import NativeSession as CoreSession
+
+    config = _config(tmp_path)
+    (a,) = _seed(config, "alpha")
+    owned = {"ok": True}
+
+    def lose(_messages: Any) -> Turn:
+        owned["ok"] = False
+        return Turn(calls=[call("write_file", "w1", path="after-loss.txt", content="x\n")])
+
+    core = CoreSession(config, session_id=a)
+    try:
+        core.engine.transport = ScriptedTransport([lose, Turn("done")])
+        core.set_owner_guard(lambda sid: owned["ok"] and sid == a)
+        result = await core.run("write it")
+        assert result.outcome.value == "cancelled"
+        assert "session lock lost" in " ".join(result.reasons)
+        assert not (Path(config.runtime.project_root) / "after-loss.txt").exists()
+        assert [m.content for m in core.store.messages(a)] == ["alpha", "reply to alpha", "write it"]
+    finally:
+        await core.aclose()

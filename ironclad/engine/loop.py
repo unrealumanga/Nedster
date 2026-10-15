@@ -150,6 +150,19 @@ def _groups(calls: Sequence[ToolCall], mutating: Callable[[ToolCall], bool]) -> 
 
 
 INTERRUPTED = "[cancelled] not completed: session was interrupted"
+LOCK_LOST = "session lock lost"
+
+
+class OwnershipLost(Exception):
+    """The session's activity lock is no longer ours: nothing more may be dispatched or persisted."""
+
+
+def _ownership_lost(exc: BaseException) -> bool:
+    if isinstance(exc, OwnershipLost):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_ownership_lost(inner) for inner in exc.exceptions)
+    return False
 
 
 def repair_history(history: Sequence[ChatMessage]) -> list[ChatMessage]:
@@ -223,6 +236,9 @@ class Engine:
         self._in_turn = False  # True for the whole of run(): the role is frozen while it is set
         self._augmented: set[str] = set()
         self._validating: set[str] = set()
+        # ``owner_guard(session_id)``: False once this process no longer owns the session's lock. Checked
+        # before every tool dispatch and every persisted message; a lost lock ends the run as cancelled.
+        self.owner_guard: Callable[[str], bool] | None = None
 
     # ------------------------------------------------------------------ public API
 
@@ -284,6 +300,7 @@ class Engine:
         try:
             self._event("turn.started", session, run, {"user_text": user_text})
             self._task = asyncio.create_task(self._drive(session, run, user_text))
+            persist = True
             try:
                 stop, detail = await self._task
             except asyncio.CancelledError:
@@ -291,9 +308,15 @@ class Engine:
                 if current is not None and current.cancelling():
                     raise
                 stop, detail = "cancelled", ""
+            except Exception as exc:
+                if not _ownership_lost(exc):
+                    raise
+                stop, detail, persist = "cancelled", LOCK_LOST, False
             finally:
                 self._task = None
-            return self._finish(session, run, stop, detail)
+            if persist and not self._owns(session):
+                stop, detail, persist = "cancelled", LOCK_LOST, False
+            return self._finish(session, run, stop, detail, persist=persist)
         finally:
             self._in_turn = False
 
@@ -581,6 +604,7 @@ class Engine:
         validation = call.name in self._validating or (
             call.name in self._augmented and call.arguments.get(VALIDATION_ARG) is True
         )
+        self._require_owner(session)  # dispatch nothing once the session lock is lost
         self._event("tool.started", session, run, {"call_id": call.id, "tool": call.name, "arguments": dict(call.arguments)})
         before = self.tools.revision()
         if not self._role_allows(call.name):  # enforced here too, so a fake/loose runtime cannot bypass the role
@@ -702,7 +726,21 @@ class Engine:
                 return {record.call.id} if verdict == "fail" else set()
         return set()
 
+    def _owns(self, session: _Session) -> bool:
+        guard = self.owner_guard
+        if guard is None:
+            return True
+        try:
+            return bool(guard(session.session_id))
+        except Exception:  # noqa: BLE001 - an unverifiable lock is a lost lock (fail closed)
+            return False
+
+    def _require_owner(self, session: _Session) -> None:
+        if not self._owns(session):
+            raise OwnershipLost(LOCK_LOST)
+
     def _append(self, session: _Session, message: ChatMessage) -> None:
+        self._require_owner(session)  # never persist a message under someone else's lock
         session.messages.append(message)
         if self.store is not None:
             self.store.append_message(session.session_id, message)
@@ -727,16 +765,18 @@ class Engine:
             text = _first_line(text)
         append(session.session_id, message.role, text[:TRANSCRIPT_TEXT_CHARS], meta)
 
-    def _finish(self, session: _Session, run: _Run, stop: StopReason, detail: str) -> AcceptanceResult:
+    def _finish(
+        self, session: _Session, run: _Run, stop: StopReason, detail: str, *, persist: bool = True
+    ) -> AcceptanceResult:
         result = acceptance.evaluate(run.records, stop, detail, intent=run.intent)
         session.state.validation = acceptance.validation_status(session.records)
         session.state.obligations = acceptance.obligations(run.records, result)
-        if self.store is not None:
+        if self.store is not None and persist:
             self.store.set_state(session.session_id, "task_state", session.state.to_dict())
         prose = run.prose.strip()
         summary = acceptance.render_summary(run.records, result)
         self.last_answer = f"{prose}\n\n{summary}" if prose else summary
-        append = getattr(self.store, "append_transcript", None) if self.store is not None else None
+        append = getattr(self.store, "append_transcript", None) if self.store is not None and persist else None
         if callable(append):
             append(session.session_id, "assistant", summary[:TRANSCRIPT_TEXT_CHARS], {"outcome": result.outcome.value})
         self._event(

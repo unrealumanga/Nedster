@@ -259,6 +259,11 @@ class NativeSession:
 
             self.store.set_state(self.session_id, ROLE_STATE, self.engine.role_name)
 
+    def set_owner_guard(self, guard: Callable[[str], bool] | None) -> None:
+        """``guard(session_id)`` is False once this process no longer owns the session's lock: the engine
+        then dispatches no further tool and persists nothing more, and the run ends as cancelled."""
+        self.engine.owner_guard = guard
+
     def note_brief(self, path: str, digest: str) -> None:
         """Record a ``--brief`` file's provenance in the session transcript (display history, not model history)."""
         append = getattr(self.store, "append_transcript", None)

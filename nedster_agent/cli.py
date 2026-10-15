@@ -803,6 +803,7 @@ class _SessionHeartbeat:
 
     def __init__(self, store: Any, session_id: str, owner: str, interval_s: float = 10.0) -> None:
         self._store, self._session_id, self._owner, self._interval = store, session_id, owner, interval_s
+        self.lost = False  # set once ownership could not be renewed; the engine guard then stops the run
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="nedster-session-lock", daemon=True)
         self._thread.start()
@@ -813,10 +814,25 @@ class _SessionHeartbeat:
                 renewed = bool(self._store.refresh_lock(self._session_id, self._owner))
                 if not renewed:
                     renewed = bool(self._store.acquire_lock(self._session_id, self._owner))
-            except Exception:  # noqa: BLE001 - a dead store ends the heartbeat, never the run
+            except Exception:  # noqa: BLE001 - a dead store ends the heartbeat; the guard then fails closed
+                self.lost = True
                 return
             if not renewed:
+                self.lost = True
                 return
+
+    def owns(self, session_id: str) -> bool:
+        """Engine ownership guard (B3): checked atomically in the store before every tool dispatch and
+        every persisted message. Never re-acquires: a lock another owner took stays theirs."""
+        if self.lost or str(session_id) != self._session_id:
+            return False
+        try:
+            owned = bool(self._store.refresh_lock(self._session_id, self._owner))
+        except Exception:  # noqa: BLE001 - an unverifiable lock is a lost lock
+            owned = False
+        if not owned:
+            self.lost = True
+        return owned
 
     def verify(self) -> None:
         """Re-validate ownership in the store right before writing; ``SessionActive`` when lost."""
@@ -928,6 +944,9 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str, bri
 
         if heartbeat is not None:
             heartbeat.verify()  # B3: ownership is re-checked in the store before the first write
+            guard = getattr(session, "set_owner_guard", None)
+            if callable(guard):
+                guard(heartbeat.owns)  # ... and before every tool dispatch / persisted message
         if brief_path is not None:
             path = Path(brief_path)
             data = path.read_bytes()
