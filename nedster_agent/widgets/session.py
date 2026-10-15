@@ -168,10 +168,15 @@ class NativeSession:
         if session_id is None:
             chosen = sessions[0]
         else:
-            matches = [s for s in sessions if str(s.get("id", "")).startswith(session_id)]
-            if len(matches) != 1:
-                raise LookupError(f"no unique session matches {session_id!r}")
-            chosen = matches[0]
+            resolver = getattr(self.store, "resolve_session", None)
+            if callable(resolver):
+                # id, unique prefix or exact title, over every session (not just a list page)
+                chosen = resolver(str(self.project_root), session_id)
+            else:
+                matches = [s for s in sessions if str(s.get("id", "")).startswith(session_id)]
+                if len(matches) != 1:
+                    raise LookupError(f"no unique session matches {session_id!r}")
+                chosen = matches[0]
         self.session_id = str(chosen["id"])
         return self.session_id
 

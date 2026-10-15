@@ -21,7 +21,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,33 @@ SCHEMA_VERSION = 2
 
 #: A session counts as *active* while its lock heartbeat is younger than this.
 LOCK_TTL_S = 60.0
+
+#: Shortest id prefix ``resolve_session`` accepts; shorter refs must be an exact title.
+MIN_PREFIX_CHARS = 4
+#: How many ambiguous candidates the error message lists.
+MAX_AMBIGUOUS_SHOWN = 5
+#: Characters of a session id shown in human output (one length on every surface).
+SHORT_ID = 8
+
+
+class SessionResolutionError(LookupError):
+    """A session reference did not resolve to exactly one session of this project.
+
+    Subclasses ``LookupError`` so display layers that already handle that type keep working;
+    ``str()`` is a complete user-facing sentence.
+    """
+
+
+class SessionNotFound(SessionResolutionError):
+    """No session of this project matches the reference."""
+
+
+class SessionAmbiguous(SessionResolutionError):
+    """The reference matches several sessions of this project."""
+
+
+class SessionForeignProject(SessionResolutionError):
+    """The reference matches a session that belongs to a different project."""
 
 #: Synthetic result text for an assistant call that never produced one.
 #: Kept byte-identical to ``ironclad.engine.loop.INTERRUPTED``.
@@ -169,6 +196,15 @@ def _handle_numbers(text: str) -> set[int]:
     return found
 
 
+def _search_hit(record: Mapping[str, Any], needle: str) -> bool:
+    """Picker filter: id prefix, title substring or first user message substring (all case-insensitive)."""
+    if str(record.get("id", "")).lower().startswith(needle):
+        return True
+    if needle in str(record.get("title", "")).lower():
+        return True
+    return needle in str(record.get("first_user_text", "")).lower()
+
+
 def _serialize_tool_calls(tool_calls: list[ToolCall]) -> str:
     payload = [
         {"id": call.id, "name": call.name, "arguments": dict(call.arguments)}
@@ -298,8 +334,9 @@ class SqliteSessionStore:
         root = normalize_project_root(project_root)
         with self._lock:
             rows = self._connection.execute(
-                "SELECT id, project_root, title, created_ns, updated_ns FROM sessions"
-                " WHERE project_root = ? ORDER BY updated_ns DESC, id DESC LIMIT ?",
+                "SELECT id, project_root, title, created_ns, updated_ns,"
+                " (SELECT COUNT(*) FROM messages WHERE session_id = sessions.id)"
+                " FROM sessions WHERE project_root = ? ORDER BY updated_ns DESC, id DESC LIMIT ?",
                 (root, limit),
             ).fetchall()
         return [
@@ -309,6 +346,7 @@ class SqliteSessionStore:
                 "title": row[2],
                 "created_ns": row[3],
                 "updated_ns": row[4],
+                "message_count": int(row[5]),
             }
             for row in rows
         ]
@@ -322,6 +360,65 @@ class SqliteSessionStore:
                 (root,),
             ).fetchone()
         return str(row[0]) if row else None
+
+    def latest_non_empty(self, project_root: str) -> str | None:
+        """Newest session of the project that has at least one stored message (``None`` when none)."""
+        root = normalize_project_root(project_root)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT id FROM sessions WHERE project_root = ?"
+                " AND (SELECT COUNT(*) FROM messages WHERE session_id = sessions.id) > 0"
+                " ORDER BY updated_ns DESC, id DESC LIMIT 1",
+                (root,),
+            ).fetchone()
+        return str(row[0]) if row else None
+
+    def search_sessions(
+        self,
+        project_root: str,
+        query: str = "",
+        *,
+        exclude_empty: bool = True,
+        limit: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Every session of the project, newest first, with counts and first/last user text.
+
+        Searches *all* sessions of the project (never a capped page) so older conversations
+        stay reachable. ``query`` matches the display title, the first user message or an id
+        prefix when non-empty; ``exclude_empty`` drops sessions that have no messages at all;
+        ``limit <= 0`` returns everything.
+        """
+        root = normalize_project_root(project_root)
+        needle = (query or "").strip().lower()
+        sql = (
+            "SELECT s.id, s.project_root, s.title, s.created_ns, s.updated_ns,"
+            " (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,"
+            " (SELECT m.content FROM messages m WHERE m.session_id = s.id AND m.role = 'user'"
+            "  AND TRIM(m.content) <> '' ORDER BY m.seq ASC LIMIT 1) AS first_user_text,"
+            " (SELECT m.content FROM messages m WHERE m.session_id = s.id AND m.role = 'user'"
+            "  AND TRIM(m.content) <> '' ORDER BY m.seq DESC LIMIT 1) AS last_user_text"
+            " FROM sessions s WHERE s.project_root = ? ORDER BY s.updated_ns DESC, s.id DESC"
+        )
+        with self._lock:
+            rows = self._connection.execute(sql, (root,)).fetchall()
+        found: list[dict[str, Any]] = []
+        for row in rows:
+            record = {
+                "id": row[0],
+                "project_root": row[1],
+                "title": row[2],
+                "created_ns": row[3],
+                "updated_ns": row[4],
+                "message_count": int(row[5]),
+                "first_user_text": str(row[6] or ""),
+                "last_user_text": str(row[7] or ""),
+            }
+            if exclude_empty and record["message_count"] <= 0:
+                continue
+            if needle and not _search_hit(record, needle):
+                continue
+            found.append(record)
+        return found[:limit] if limit and limit > 0 else found
 
     def _touch(self, session_id: str, now: int) -> None:
         self._connection.execute(
@@ -344,6 +441,101 @@ class SqliteSessionStore:
             "updated_ns": row[4],
         }
 
+    def set_title(self, session_id: str, title: str) -> None:
+        """Set the session's name. Does not touch ``updated_ns``: renaming is not activity."""
+        self._write([("UPDATE sessions SET title = ? WHERE id = ?", (str(title), session_id))])
+
+    def first_user_text(self, session_id: str) -> str:
+        """Content of the first stored user message that is not blank (``""`` when there is none)."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT content FROM messages WHERE session_id = ? AND role = 'user' ORDER BY seq",
+                (session_id,),
+            ).fetchall()
+        for (content,) in rows:
+            if str(content or "").strip():
+                return str(content)
+        return ""
+
+    def resolve_session(self, project_root: str, ref: str) -> dict[str, Any]:
+        """Resolve ``ref`` to one session of ``project_root``.
+
+        Accepts a full id, a unique id prefix (at least :data:`MIN_PREFIX_CHARS`) or an exact
+        title (case-insensitive). Searches every session of the project, independent of any
+        display/list limit. Raises :class:`SessionResolutionError` (a ``LookupError``) whose
+        message is user-facing for: no match, ambiguity, or a reference that resolves to a
+        session of another project.
+        """
+        root = normalize_project_root(project_root)
+        wanted = (ref or "").strip()
+        needle = wanted.lower()
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT id, project_root, title, created_ns, updated_ns FROM sessions"
+                " ORDER BY updated_ns DESC, id DESC"
+            ).fetchall()
+        sessions = [
+            {
+                "id": row[0],
+                "project_root": row[1],
+                "title": row[2],
+                "created_ns": row[3],
+                "updated_ns": row[4],
+            }
+            for row in rows
+        ]
+        if wanted:
+            exact = next((s for s in sessions if str(s["id"]).lower() == needle), None)
+            if exact is not None:
+                if str(exact["project_root"]) != root:
+                    raise SessionForeignProject(self._foreign_message(exact))
+                return exact
+        mine = [s for s in sessions if str(s["project_root"]) == root]
+        if not wanted:
+            if len(mine) == 1:
+                return mine[0]
+            if mine:
+                raise SessionAmbiguous(self._ambiguous_message(ref, mine))
+            raise SessionNotFound(self._not_found_message(ref))
+        if len(wanted) >= MIN_PREFIX_CHARS:
+            prefixed = [s for s in mine if str(s["id"]).lower().startswith(needle)]
+            if len(prefixed) == 1:
+                return prefixed[0]
+            if prefixed:
+                raise SessionAmbiguous(self._ambiguous_message(ref, prefixed))
+        titled = [s for s in mine if str(s["title"]).strip().lower() == needle]
+        if len(titled) == 1:
+            return titled[0]
+        if titled:
+            raise SessionAmbiguous(self._ambiguous_message(ref, titled))
+        if len(wanted) >= MIN_PREFIX_CHARS:
+            foreign = [
+                s for s in sessions
+                if str(s["project_root"]) != root and str(s["id"]).lower().startswith(needle)
+            ]
+            if len(foreign) == 1:
+                raise SessionForeignProject(self._foreign_message(foreign[0]))
+        raise SessionNotFound(self._not_found_message(ref))
+
+    @staticmethod
+    def _not_found_message(ref: str) -> str:
+        return f"No session matches {ref!r} in this project. Run: nedster sessions list"
+
+    @staticmethod
+    def _foreign_message(session: Mapping[str, Any]) -> str:
+        return f"Session {str(session['id'])[:SHORT_ID]} belongs to another project, not this one."
+
+    @staticmethod
+    def _ambiguous_message(ref: str, matches: list[dict[str, Any]]) -> str:
+        lines = [
+            f"  {str(m['id'])[:SHORT_ID]}  {str(m['title']).strip() or 'Untitled conversation'}"
+            for m in matches[:MAX_AMBIGUOUS_SHOWN]
+        ]
+        return (
+            f"{ref!r} matches {len(matches)} sessions in this project; "
+            "use a longer id or the full title:\n" + "\n".join(lines)
+        )
+
     def state_keys(self, session_id: str) -> list[str]:
         with self._lock:
             rows = self._connection.execute(
@@ -351,10 +543,20 @@ class SqliteSessionStore:
             ).fetchall()
         return [str(row[0]) for row in rows]
 
-    def delete_session(self, session_id: str, *, force: bool = False, ttl_s: float = LOCK_TTL_S) -> bool:
+    def delete_session(
+        self,
+        session_id: str,
+        *,
+        force: bool = False,
+        ttl_s: float = LOCK_TTL_S,
+        extra: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> bool:
         """Delete a session and every row that belongs to it (messages, transcript, outputs,
         state, lock). Returns ``False`` and deletes nothing while the session is active
-        (live lock) unless ``force`` is set. Unknown ids count as deleted (idempotent)."""
+        (live lock) unless ``force`` is set. Unknown ids count as deleted (idempotent).
+
+        ``extra`` runs inside the same transaction, after the lock check but before the session
+        rows, so callers can purge the checkpoint tables that share this database file."""
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
@@ -365,6 +567,8 @@ class SqliteSessionStore:
                 if not force and row is not None and self._lock_live(str(row[0]), int(row[1]), ttl_s):
                     self._connection.execute("ROLLBACK")
                     return False
+                if extra is not None:
+                    extra(self._connection)
                 self._connection.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
                 self._connection.execute("DELETE FROM transcript WHERE session_id = ?", (session_id,))
                 self._connection.execute("DELETE FROM outputs WHERE session_id = ?", (session_id,))

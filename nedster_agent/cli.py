@@ -18,9 +18,16 @@ from . import __version__
 
 EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, EXIT_NOT_READY = 0, 1, 2, 3
 
+#: Characters of a session id shown in human output (one length on every surface).
+SHORT_ID = 8
+
 
 class UsageError(Exception):
     """Bad invocation (exit 2)."""
+
+
+class SessionActive(RuntimeError):
+    """Another live Nedster holds the session's activity lock (exit 1)."""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -83,15 +90,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--model", default=None, help="Worker model for the native engine (default: configuration)")
     run.add_argument(
+        "--name",
+        default=None,
+        help="Name the session (sets the title at creation; renames it when resuming)",
+    )
+    run.add_argument(
         "--expect",
         choices=("change", "answer"),
         default=None,
         help="What a successful run must do: change files, or only answer (default: inferred from the objective)",
     )
-    run.add_argument("--continue", dest="resume_latest", action="store_true", help="Continue the latest session here")
-    run.add_argument("--session", default=None, help="Continue a specific session id")
+    resume = run.add_mutually_exclusive_group()
+    resume.add_argument("--continue", dest="resume_latest", action="store_true", help="Continue the latest session here")
+    resume.add_argument(
+        "--session", default=None, help="Continue a session by id, unique id prefix or exact title"
+    )
     tui = subcommands.add_parser("tui", help="Open the interactive terminal interface")
     accept_global_options(tui)
+    tui_open = tui.add_mutually_exclusive_group()
+    tui_open.add_argument("--session", default=None, help="Open on a session by id, unique id prefix or exact title")
+    tui_open.add_argument(
+        "--continue", dest="resume_latest", action="store_true", help="Open the most recent conversation"
+    )
+    resume_command = subcommands.add_parser(
+        "resume", help="Open the interface on a saved conversation (picker when no reference is given)"
+    )
+    accept_global_options(resume_command)
+    resume_choice = resume_command.add_mutually_exclusive_group()
+    resume_choice.add_argument("ref", nargs="?", default=None, help="Session id, unique id prefix or exact title")
+    resume_choice.add_argument(
+        "--last", action="store_true", help="Resume the most recent non-empty conversation here"
+    )
     ledger = subcommands.add_parser("verify-ledger", help="Verify the local event chain")
     accept_global_options(ledger)
     permissions = subcommands.add_parser("permissions", help="Show the active tool permission policy")
@@ -101,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("action", nargs="?", choices=("show",), default="show")
 
     sessions = subcommands.add_parser(
-        "sessions", help="List, show, delete or prune the saved sessions of this project"
+        "sessions", help="List, show, rename, delete or prune the saved sessions of this project"
     )
     accept_global_options(sessions)
     session_actions = sessions.add_subparsers(dest="action")
@@ -111,11 +140,19 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_show = session_actions.add_parser("show", help="One session: metadata + stored transcript")
     accept_global_options(sessions_show)
     sessions_show.add_argument("session_id", help="Session id or unique prefix")
+    sessions_rename = session_actions.add_parser("rename", help="Give a session a new name")
+    accept_global_options(sessions_rename)
+    sessions_rename.add_argument("session_id", help="Session id, unique prefix or exact title")
+    sessions_rename.add_argument("name", help="New name (1-80 characters)")
     sessions_delete = session_actions.add_parser(
         "delete", help="Delete a session; refused while the session is active (locked)"
     )
     accept_global_options(sessions_delete)
     sessions_delete.add_argument("session_id", help="Session id or unique prefix")
+    sessions_delete.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+    sessions_delete.add_argument(
+        "--dry-run", action="store_true", help="Show what would be deleted without deleting anything"
+    )
     sessions_prune = session_actions.add_parser(
         "prune", help="Delete tool outputs older than a cutoff that no message or task state references"
     )
@@ -445,8 +482,40 @@ def _read_objective(args: argparse.Namespace) -> str:
     return objective
 
 
+def _resolve_run_session(config: Any, ref: str) -> str:
+    """Resolve ``--session`` to one project session before any engine/store write.
+
+    Unknown, ambiguous and foreign references raise :class:`UsageError` (exit 2); a session
+    another live Nedster is using raises :class:`SessionActive` (exit 1). Nothing is written.
+    """
+    from ironclad.session_store.sqlite_store import SessionResolutionError, SqliteSessionStore
+
+    store = SqliteSessionStore(Path(config.runtime.state_dir) / "sessions.sqlite3")
+    try:
+        try:
+            session_id = str(store.resolve_session(str(config.runtime.project_root), ref)["id"])
+        except SessionResolutionError as exc:
+            raise UsageError(str(exc)) from exc
+        if store.is_active(session_id):
+            raise SessionActive(
+                f"Session {session_id[:SHORT_ID]} is active in another Nedster. Close it there and retry."
+            )
+        return session_id
+    finally:
+        store.close()
+
+
 async def _run_objective(args: argparse.Namespace, objective: str) -> int:
+    from ironclad.session_store.titles import normalize_title
+
     config, _ = _resolve(args)
+    if getattr(args, "name", None) is not None:
+        name = normalize_title(args.name)
+        if not name:
+            raise UsageError("--name needs at least one visible character.")
+        args.name = name
+    if args.session is not None:
+        args.session = _resolve_run_session(config, args.session)
     return await _run_native(args, config, objective)
 
 
@@ -482,7 +551,8 @@ class _SessionHeartbeat:
 
 
 def _lock_run_session(session: Any) -> _SessionHeartbeat | None:
-    """Take the activity lock for a CLI run; None (with a stderr note) when it cannot be held."""
+    """Take the activity lock for a CLI run; ``SessionActive`` (exit 1) when another live
+    Nedster holds it, so a lock conflict is refused instead of silently writing (F03)."""
     from ironclad.session_store.sqlite_store import make_owner
 
     store = getattr(session, "store", None)
@@ -496,8 +566,9 @@ def _lock_run_session(session: Any) -> _SessionHeartbeat | None:
     except Exception:  # noqa: BLE001 - never block a run on the lock layer
         return None
     if not acquired:
-        _err(f"[warning] session {session_id[:8]} is active in another Nedster; continuing anyway")
-        return None
+        raise SessionActive(
+            f"Session {session_id[:SHORT_ID]} is active in another Nedster. Close it there and retry."
+        )
     return _SessionHeartbeat(store, session_id, owner)
 
 
@@ -514,9 +585,20 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> 
             _err(f"  {data.get('tool')} -> {data.get('status')} ({data.get('elapsed_ms', 0):.0f} ms)")
 
     session = NativeSession(
-        config, emit=emit, model=args.model, session_id=args.session, resume_latest=args.resume_latest
+        config,
+        emit=emit,
+        model=args.model,
+        session_id=args.session,
+        resume_latest=args.resume_latest,
+        title=getattr(args, "name", "") or "",
     )
-    heartbeat = _lock_run_session(session)
+    if args.resume_latest and getattr(session, "started_new", False):
+        _err("No previous conversation here; starting a new one.")  # F06: never silently continue an empty launch
+    try:
+        heartbeat = _lock_run_session(session)
+    except SessionActive:
+        await session.aclose()
+        raise
     try:
         from ironclad.engine.intent import parse_expect
 
@@ -533,7 +615,7 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> 
         _emit_json(payload)
     elif not args.jsonl:
         print(result.answer)
-        _err(f"[{result.outcome.value} · session {session.session_id[:8]}]")
+        _err(f"[{result.outcome.value} · session {session.session_id[:SHORT_ID]}]")
     return EXIT_OK if result.passed else EXIT_RUNTIME
 
 
@@ -588,6 +670,10 @@ def _clip(text: str, limit: int = SHOW_ENTRY_CHARS) -> str:
     return flat if len(flat) <= limit else flat[: limit - 3] + "..."
 
 
+def _short(session_id: str) -> str:
+    return str(session_id)[:SHORT_ID]
+
+
 def _lock_label(lock: Any) -> str:
     if not lock:
         return "none"
@@ -599,14 +685,25 @@ def _lock_label(lock: Any) -> str:
 
 
 def _find_session(store: Any, project_root: Path, wanted: str) -> dict[str, Any]:
-    """Project-bound lookup: only sessions of *this* canonical root can be shown or deleted."""
-    sessions = store.list_sessions(str(project_root), limit=10_000)
-    matches = [entry for entry in sessions if str(entry["id"]).startswith(wanted)]
-    if not matches:
-        raise UsageError(f"no session matches {wanted!r} in this project ({project_root})")
-    if len(matches) > 1:
-        raise UsageError(f"{wanted!r} matches {len(matches)} sessions; give a longer id")
-    return matches[0]
+    """Project-bound lookup via the store's one resolver (id, prefix or title); a resolution
+    failure is a usage error (exit 2) before anything is shown, deleted or written."""
+    from ironclad.session_store.sqlite_store import SessionResolutionError
+
+    try:
+        return store.resolve_session(str(project_root), wanted)
+    except SessionResolutionError as exc:
+        raise UsageError(str(exc)) from exc
+
+
+def _display_title(store: Any, session_id: str, title: str) -> str:
+    """Name for display: the stored title, else the first user message, else "Untitled conversation"."""
+    from ironclad.session_store.titles import display_title
+
+    if str(title or "").strip():
+        return str(title).strip()
+    first = getattr(store, "first_user_text", None)
+    fallback = first(session_id) if callable(first) else ""
+    return display_title("", fallback)
 
 
 def _sessions_list(args: argparse.Namespace, store: Any, project_root: Path) -> int:
@@ -617,18 +714,23 @@ def _sessions_list(args: argparse.Namespace, store: Any, project_root: Path) -> 
         return EXIT_OK
     if not rows:
         if not args.plain:
-            print("No saved sessions for this project.")
+            print('No saved conversations here. Start one: nedster run "Explain this project"')
         return EXIT_OK
     if args.plain:
         for row in rows:
             flag = "active" if row["active"] else "-"
             print(f"{row['id']}\t{_stamp(row['updated_ns'])}\t{flag}\t{row['title']}")
         return EXIT_OK
-    print(f"{'id':<34}{'updated':<18}{'state':<9}title")
+    print(f"{'id':<10}{'updated':<12}{'messages':<10}title")
+    from ironclad.session_store.titles import relative_age
+
     for row in rows:
-        flag = "active" if row["active"] else ""
-        print(f"{row['id']:<34}{_stamp(row['updated_ns']):<18}{flag:<9}{row['title']}")
-    print(f"{len(rows)} session(s). Actions: nedster sessions show|delete <id>, nedster sessions prune --older-than DAYS")
+        sid = str(row["id"])
+        flag = "  [active]" if row["active"] else ""
+        title = _display_title(store, sid, row.get("title", ""))
+        print(f"{_short(sid):<10}{relative_age(int(row['updated_ns'])):<12}{int(row.get('message_count', 0)):<10}{title}{flag}")
+    print(f"{len(rows)} session(s).")
+    print('Resume: nedster run --session <id or title> "..."')
     return EXIT_OK
 
 
@@ -652,7 +754,7 @@ def _sessions_show(args: argparse.Namespace, store: Any, project_root: Path) -> 
         _emit_json(payload)
         return EXIT_OK
     print(f"session     {session_id}")
-    print(f"title       {session['title']}")
+    print(f"title       {_display_title(store, session_id, session['title'])}")
     print(f"project     {session['project_root']}")
     print(f"created     {_stamp(session['created_ns'])}")
     print(f"updated     {_stamp(session['updated_ns'])}")
@@ -673,10 +775,66 @@ def _sessions_show(args: argparse.Namespace, store: Any, project_root: Path) -> 
     return EXIT_OK
 
 
-def _sessions_delete(args: argparse.Namespace, store: Any, project_root: Path) -> int:
+def _sessions_rename(args: argparse.Namespace, store: Any, project_root: Path) -> int:
+    from ironclad.session_store.titles import normalize_title
+
     session = _find_session(store, project_root, args.session_id)
     session_id = str(session["id"])
-    if not store.delete_session(session_id):  # atomically refused while a live lock exists
+    name = normalize_title(args.name)
+    if not name:
+        raise UsageError("The new name needs at least one visible character.")
+    store.set_title(session_id, name)
+    if args.json:
+        _emit_json({"renamed": True, "id": session_id, "title": name})
+    else:
+        print(f"Renamed session {session_id[:SHORT_ID]} to {name}.")
+    return EXIT_OK
+
+
+def _session_delete_preview(store: Any, checkpoints: Any, session: Any) -> list[tuple[str, str]]:
+    """Rows for the delete preview: identity, last update, message count and checkpoint count."""
+    session_id = str(session["id"])
+    counter = getattr(checkpoints, "checkpoint_count", None)
+    return [
+        ("session", session_id),
+        ("title", _display_title(store, session_id, session.get("title", ""))),
+        ("updated", _stamp(session["updated_ns"])),
+        ("messages", str(len(store.messages(session_id)))),
+        ("checkpoints", str(counter(session_id) if callable(counter) else 0)),
+    ]
+
+
+def _print_delete_preview(fields: list[tuple[str, str]]) -> None:
+    width = max(len(name) for name, _ in fields)
+    for name, value in fields:
+        print(f"{name:<{width}}  {value}")
+
+
+def _sessions_delete(args: argparse.Namespace, store: Any, project_root: Path, checkpoints: Any) -> int:
+    from ironclad.session_store.checkpoints import delete_session_cascade
+
+    session = _find_session(store, project_root, args.session_id)
+    session_id = str(session["id"])
+    fields = _session_delete_preview(store, checkpoints, session)
+    if args.dry_run:
+        if args.json:
+            _emit_json({"dry_run": True, "deleted": False, "session": dict(fields)})
+        else:
+            _print_delete_preview(fields)
+            print("Dry run: nothing deleted.")
+        return EXIT_OK
+    if args.json and not args.yes:
+        raise UsageError("--json needs --yes: machine output cannot be confirmed interactively.")
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise UsageError(
+                "Refusing to delete without confirmation in a non-interactive shell. Re-run with --yes."
+            )
+        _print_delete_preview(fields)
+        if not _ask_yes_no("Delete this conversation and its saved checkpoints?", default=False):
+            print("Cancelled; nothing was deleted.")
+            return EXIT_OK
+    if not delete_session_cascade(store, checkpoints, session_id):  # refused while a live lock exists
         _err(f"nedster: session {session_id} is active (locked); close it in the other Nedster and retry")
         return EXIT_RUNTIME
     if args.json:
@@ -714,18 +872,50 @@ def _sessions(args: argparse.Namespace) -> int:
 
     config, _ = _resolve(args)
     project_root = Path(config.runtime.project_root)
-    store = SqliteSessionStore(Path(config.runtime.state_dir) / "sessions.sqlite3")
+    db_path = Path(config.runtime.state_dir) / "sessions.sqlite3"
+    store = SqliteSessionStore(db_path)
+    if str(getattr(args, "action", None) or "list") == "delete":
+        from ironclad.session_store.checkpoints import CheckpointStore
+
+        checkpoints = CheckpointStore(db_path)  # same file: checkpoints are purged in one transaction
+    else:
+        checkpoints = None
     try:
         action = str(getattr(args, "action", None) or "list")
         if action == "show":
             return _sessions_show(args, store, project_root)
+        if action == "rename":
+            return _sessions_rename(args, store, project_root)
         if action == "delete":
-            return _sessions_delete(args, store, project_root)
+            return _sessions_delete(args, store, project_root, checkpoints)
         if action == "prune":
             return _sessions_prune(args, store, project_root)
         if action == "list":
             return _sessions_list(args, store, project_root)
         raise UsageError(f"unknown sessions action: {action}")
+    finally:
+        if checkpoints is not None:
+            checkpoints.close()
+        store.close()
+
+
+def _tui_session_ref(config: Any, ref: str) -> str:
+    """Resolve ``tui --session`` / ``resume <ref>`` up front so a bad reference is a usage error (exit 2)."""
+    from ironclad.session_store.sqlite_store import SqliteSessionStore
+
+    store = SqliteSessionStore(Path(config.runtime.state_dir) / "sessions.sqlite3")
+    try:
+        return str(_find_session(store, Path(config.runtime.project_root), ref)["id"])
+    finally:
+        store.close()
+
+
+def _latest_non_empty(config: Any) -> str | None:
+    from ironclad.session_store.sqlite_store import SqliteSessionStore
+
+    store = SqliteSessionStore(Path(config.runtime.state_dir) / "sessions.sqlite3")
+    try:
+        return store.latest_non_empty(str(config.runtime.project_root))
     finally:
         store.close()
 
@@ -745,8 +935,34 @@ def _tui_or_help(args: argparse.Namespace) -> int:
     from .tui import run_tui
 
     config, _ = _resolve(args)
+    ref = getattr(args, "session", None)
+    if ref is not None:
+        ref = _tui_session_ref(config, ref)
     run_tui(config, ascii_only=args.ascii,
-            no_color=args.no_color or (not args.color and bool(os.getenv("NO_COLOR"))))
+            no_color=args.no_color or (not args.color and bool(os.getenv("NO_COLOR"))),
+            session_ref=ref,
+            resume_latest=bool(getattr(args, "resume_latest", False)))
+    return EXIT_OK
+
+
+def _resume(args: argparse.Namespace) -> int:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        _err('nedster resume needs an interactive terminal; for scripts use: nedster run --session <ref> "..."')
+        return EXIT_USAGE
+    from .tui import run_tui
+
+    config, _ = _resolve(args)
+    no_color = args.no_color or (not args.color and bool(os.getenv("NO_COLOR")))
+    ref = getattr(args, "ref", None)
+    if ref is not None:
+        run_tui(config, ascii_only=args.ascii, no_color=no_color, session_ref=_tui_session_ref(config, ref))
+        return EXIT_OK
+    if getattr(args, "last", False):
+        latest = _latest_non_empty(config)
+        if latest is not None:
+            run_tui(config, ascii_only=args.ascii, no_color=no_color, session_ref=latest)
+            return EXIT_OK
+    run_tui(config, ascii_only=args.ascii, no_color=no_color, open_picker_on_start=True)
     return EXIT_OK
 
 
@@ -766,6 +982,8 @@ def _dispatch(args: argparse.Namespace) -> int:
         return _permissions(args)
     if command == "sessions":
         return _sessions(args)
+    if command == "resume":
+        return _resume(args)
     if command == "run":
         import asyncio
 

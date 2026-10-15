@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import AcceptanceResult, EngineEvent
+from .session_store.titles import normalize_title
 
 DEFAULT_WORKER = "nedster-worker"
 FALLBACK_CONTEXT_TOKENS = 32_768
@@ -124,6 +125,7 @@ class NativeSession:
         session_id: str | None = None,
         resume_latest: bool = False,
         title: str = "",
+        lazy: bool = False,
     ) -> None:
         from .engine.loop import Engine
         from .session_store.checkpoints import CheckpointStore
@@ -139,9 +141,34 @@ class NativeSession:
         self.checkpoints = CheckpointStore(db_path)
         self.recovery_notes = self.checkpoints.recover()
         root = str(self.project_root)
-        if session_id is None and resume_latest:
-            session_id = self.store.latest_session(root)
-        self.session_id = session_id or self.store.create(root, title)
+        name = normalize_title(title)
+        self._pending_title = ""  # stored when a lazily-created session is finally written
+        self.started_new = False
+        if session_id is not None:
+            # A full id, a unique prefix or an exact title, scoped to this project (F01/F02/F07).
+            session_id = str(self.store.resolve_session(root, session_id)["id"])
+            self.session_id = session_id
+            if name:  # an explicit --name renames the session it resumes
+                self.store.set_title(self.session_id, name)
+        elif resume_latest:
+            latest = self.store.latest_non_empty(root)  # never continue an empty launch artifact (F06)
+            if latest is None:
+                self.started_new = True
+                self.session_id = None if lazy else self.store.create(root, name)
+                self._pending_title = name
+            else:
+                self.session_id = latest
+                if name:
+                    self.store.set_title(self.session_id, name)
+        elif lazy:
+            # No session row until the first submitted prompt (F06): opening and closing the UI
+            # leaves nothing behind.
+            self.started_new = True
+            self.session_id = None
+            self._pending_title = name
+        else:
+            self.started_new = True
+            self.session_id = self.store.create(root, name)
         self.model = worker_model(config, model)
         self.tools, self.executor = build_tools(self.project_root, config, self.checkpoints)
         self.checkpoints.on_undone.append(self.tools.invalidate_after_undo)
@@ -169,11 +196,36 @@ class NativeSession:
 
     async def run(self, text: str, *, intent: Any = None) -> AcceptanceResult:
         """``intent``: an ``engine.intent.Intent`` that overrides the classifier (``nedster run --expect``)."""
+        self.ensure_session_id()
+        self._auto_title(text)
         self.checkpoints.begin_turn(self.session_id, self.project_root)
         try:
             return await self.engine.run(self.session_id, text, intent=intent)
         finally:
             self.checkpoints.end_turn()  # also on cancel/error: stores post-images of partial writes
+
+    def ensure_session_id(self) -> str:
+        """Persist the session row if lazy creation still owes one; always return the id.
+
+        Called at the first submitted prompt (and by the TUI, so it can take the activity lock
+        *before* the turn runs). Idempotent.
+        """
+        if not self.session_id:
+            self.session_id = self.store.create(str(self.project_root), self._pending_title)
+            self._pending_title = ""
+        return str(self.session_id)
+
+    def _auto_title(self, text: str) -> None:
+        """Name a still-unnamed session from its first user turn (one place for CLI and TUI).
+
+        Never overwrites a name; for an old blank-title session the first stored message wins.
+        """
+        session = self.store.get_session(self.session_id)
+        if session is None or str(session.get("title") or "").strip():
+            return
+        name = normalize_title(self.store.first_user_text(self.session_id) or text)
+        if name:
+            self.store.set_title(self.session_id, name)
 
     def undo_last(self) -> Any:
         """Undo the last turn's file-tool changes (UndoReport; ``str()`` is the user message). Command side
