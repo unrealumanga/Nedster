@@ -460,7 +460,7 @@ def _doctor(args: argparse.Namespace) -> int:
             mark = "ready" if tier["ready"] else "NOT READY"
             console.print(_ascii(f"{label:<16}{mark} · {tier.get('detail', '')}", args.ascii), highlight=False, markup=False)
         if context:
-            kv = f"KV {context['kv_cache_type']}, flash attention {'on' if context['flash_attention'] else 'off'}"
+            kv = f"KV {context['kv_cache_type']} / flash attention {'on' if context['flash_attention'] else 'off'} (as seen by this shell; server unknown)"
             line = f"{'context':<16}model {context['num_ctx'] or '?'} tokens · engine budget {context['engine_budget']} · {kv}"
             console.print(_ascii(line, args.ascii), highlight=False, markup=False)
             for tip in context["advice"]:  # type: ignore[union-attr]
