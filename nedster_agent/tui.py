@@ -51,6 +51,7 @@ COMMANDS: dict[str, str] = {
     "/help": "show commands and keys",
     "/new": "start a new conversation",
     "/clear": "clear the display (conversation is kept)",
+    "/init": "write a starter AGENTS.md from repository facts (/init --print to preview)",
     "/sessions": "list saved sessions for this project",
     "/resume": "resume a session: /resume [id]",
     "/model": "show or switch the model: /model [name]",
@@ -114,6 +115,7 @@ def native_session(config: NedsterConfig, emit: EventCallback) -> EngineSession:
     session.session_id = core.session_id
     session.project_root = info["project_root"]
     session.sandbox, session.isolation = info["sandbox"], info["isolation"]
+    session.instructions = info.get("instructions")
     return session
 
 
@@ -334,6 +336,17 @@ class NedsterApp(App[None]):
         self._acquire_lock(str(getattr(self.session, "session_id", "")))
         self._set_state("idle")
         self._message("Ready")
+        self._announce_instructions()
+
+    def _announce_instructions(self) -> None:
+        """One-line notice about the project instruction file that was loaded for this session."""
+        info = self.session.info() if self.session is not None else {}
+        loaded = info.get("instructions")
+        if not isinstance(loaded, Mapping) or not loaded.get("name"):
+            return
+        size = int(loaded.get("size") or 0)
+        note = " [truncated]" if loaded.get("truncated") else ""
+        self._line(f"Loaded {loaded['name']} ({size / 1024:.1f} KB){note}", "muted")
 
     def _refresh_info(self) -> None:
         if self.session is None:
@@ -747,6 +760,7 @@ class NedsterApp(App[None]):
             "/exit": lambda _a: self.exit(),
             "/help": self._cmd_help,
             "/clear": lambda _a: self.action_clear(),
+            "/init": self._cmd_init,
             "/new": self._cmd_new,
             "/sessions": self._cmd_sessions,
             "/resume": self._cmd_resume,
@@ -772,6 +786,30 @@ class NedsterApp(App[None]):
         self._line("  Enter send · Shift+Enter/Ctrl+J newline · Up/Down history · @ file · / command")
         self._line("  Esc stop the running turn · Ctrl+C twice exit · F2 raw events · Ctrl+L clear")
         self._line("  Tool rows: focus with Tab/click, Enter expands argv, output and diff")
+
+    def _cmd_init(self, args: list[str]) -> None:
+        from ironclad.scaffold import AGENTS_FILENAME, line_count, starter_agents_md, write_agents_md
+
+        root = Path(self.config.runtime.project_root)
+        preview = bool(args) and args[0] in ("--print", "-p", "print")
+        try:
+            content = starter_agents_md(root, self.config)
+        except Exception as exc:  # noqa: BLE001 - shown in the transcript, never fatal
+            self._line(f"init failed: {exc}", "fail")
+            return
+        if preview:
+            self.transcript.add(Static(self._text(content)))
+            self._line(f"{AGENTS_FILENAME} preview ({line_count(content)} lines, nothing written)", "accent")
+            return
+        try:
+            path = write_agents_md(root, content)
+        except FileExistsError:
+            self._line(f"{AGENTS_FILENAME} already exists in {root}; not overwritten.", "warn")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._line(f"init failed: {exc}", "fail")
+            return
+        self._line(f"Wrote {path.name} ({line_count(content)} lines). Edit it to describe this project.", "accent")
 
     def _cmd_new(self, _args: list[str]) -> None:
         new = getattr(self.session, "new", None)

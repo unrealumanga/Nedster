@@ -155,6 +155,9 @@ class NativeSession:
             emit=emit,
             project_root=self.project_root,
         )
+        from .engine.prompt import session_instructions
+
+        self.instructions = session_instructions(self.store, self.session_id, self.project_root)
 
     def info(self) -> dict[str, Any]:
         status = self.executor.backend_status()
@@ -165,6 +168,15 @@ class NativeSession:
             "project_root": str(self.project_root),
             "sandbox": status.name if status else "none",
             "isolation": status.isolation if status else "none",
+            "instructions": (
+                {
+                    "name": self.instructions.name,
+                    "size": self.instructions.size,
+                    "truncated": self.instructions.truncated,
+                }
+                if self.instructions.present
+                else None
+            ),
         }
 
     async def run(self, text: str, *, intent: Any = None) -> AcceptanceResult:

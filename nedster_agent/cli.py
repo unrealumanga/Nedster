@@ -90,6 +90,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--continue", dest="resume_latest", action="store_true", help="Continue the latest session here")
     run.add_argument("--session", default=None, help="Continue a specific session id")
+    init = subcommands.add_parser("init", help="Write a starter AGENTS.md from repository facts")
+    accept_global_options(init)
+    init.add_argument(
+        "--print", dest="print_only", action="store_true",
+        help="Show the starter file without writing it",
+    )
     tui = subcommands.add_parser("tui", help="Open the interactive terminal interface")
     accept_global_options(tui)
     ledger = subcommands.add_parser("verify-ledger", help="Verify the local event chain")
@@ -192,10 +198,18 @@ def _config_dict(config: Any) -> dict[str, Any]:
 
 
 def _config_show(args: argparse.Namespace) -> int:
+    from ironclad.engine.prompt import load_project_instructions
+
     config, provenance = _resolve(args)
     data = _config_dict(config)
+    instructions = load_project_instructions(config.runtime.project_root)
     if args.json:
-        _emit_json({"config": data, "provenance": provenance})
+        payload = {
+            "config": data,
+            "provenance": provenance,
+            "project_instructions": instructions.to_dict() if instructions else None,
+        }
+        _emit_json(payload)
         return EXIT_OK
     from ironclad.config import config_dir
 
@@ -206,8 +220,39 @@ def _config_show(args: argparse.Namespace) -> int:
             node = node[part]
         value = json.dumps(node) if not isinstance(node, str) else node
         print(f"{key} = {value}  [{provenance[key]}]")
+    if instructions is None:
+        print("project instructions: none (no AGENTS.md or NEDSTER.md in the project root)")
+    else:
+        note = " (truncated)" if instructions.truncated else ""
+        print(
+            f"project instructions: {instructions.name} "
+            f"({instructions.size / 1024:.1f} KB, sha256 {instructions.sha256[:12]}){note}"
+        )
     for warning in config.warnings:
         print(f"# warning: {warning}")
+    return EXIT_OK
+
+
+def _init(args: argparse.Namespace) -> int:
+    from ironclad.scaffold import AGENTS_FILENAME, line_count, starter_agents_md, write_agents_md
+
+    config, _ = _resolve(args)
+    root = Path(config.runtime.project_root)
+    content = starter_agents_md(root, config)
+    if args.print_only:
+        print(content, end="")
+        return EXIT_OK
+    try:
+        path = write_agents_md(root, content)
+    except FileExistsError:
+        _err(f"nedster: {AGENTS_FILENAME} already exists in {root}; not overwritten.")
+        return EXIT_RUNTIME
+    if args.json:
+        _emit_json({"path": str(path), "lines": line_count(content), "bytes": len(content.encode("utf-8"))})
+    elif args.plain:
+        print(f"path\t{path}")
+    else:
+        print(f"Wrote {path} ({line_count(content)} lines). Review and edit it to describe this project.")
     return EXIT_OK
 
 
@@ -754,6 +799,8 @@ def _dispatch(args: argparse.Namespace) -> int:
     command = args.command
     if command == "config":
         return _config_show(args)
+    if command == "init":
+        return _init(args)
     if command == "setup":
         return _setup(args)
     if command == "doctor":

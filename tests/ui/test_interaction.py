@@ -412,3 +412,29 @@ async def test_minimum_size_keeps_composer_status_and_transcript_usable(tmp_path
             assert h.app.query_one(selector).display
         assert h.app.query_one("#work").size.height >= 10
         assert h.app.query_one("#status").size.height == 1
+
+
+async def test_startup_announces_loaded_project_instructions(tmp_path):
+    info = {"instructions": {"name": "AGENTS.md", "size": 1229, "truncated": False}}
+    h = Harness(tmp_path, info=info)
+    async with h.app.run_test(size=(100, 30)) as pilot:
+        await ready(pilot, h.app)
+        assert "Loaded AGENTS.md (1.2 KB)" in transcript(h.app)
+
+
+async def test_slash_init_writes_and_refuses_to_overwrite(tmp_path):
+    h = Harness(tmp_path)
+    async with h.app.run_test(size=(100, 30)) as pilot:
+        await ready(pilot, h.app)
+        h.app._command("/init")
+        await settle(pilot)
+        path = h.project / "AGENTS.md"
+        assert path.is_file()
+        content = path.read_text(encoding="utf-8")
+        assert "Project instructions" in content
+
+        h.app._command("/init")
+        await settle(pilot)
+        assert "already exists" in transcript(h.app)
+        assert path.read_text(encoding="utf-8") == content
+

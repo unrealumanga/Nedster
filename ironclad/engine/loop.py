@@ -56,7 +56,12 @@ from ironclad.engine.context import (
     tool_message,
 )
 from ironclad.engine.intent import Intent, classify
-from ironclad.engine.prompt import build_system_prompt, project_facts
+from ironclad.engine.prompt import (
+    ProjectInstructions,
+    build_system_prompt,
+    project_facts,
+    session_instructions,
+)
 from ironclad.engine.state import Budget, TaskState, ToolRecord
 
 REPEAT_LIMIT = 3
@@ -198,6 +203,7 @@ class Engine:
         self.completion_reserve_tokens = completion_reserve_tokens
         self.auto_verify = max(0, auto_verify)  # max engine-run validations per run when the model skips them
         self.last_answer = ""
+        self.instructions: ProjectInstructions = ProjectInstructions()
         self._sessions: dict[str, _Session] = {}
         self._running: set[JobHandle] = set()
         self._task: asyncio.Task[Stop] | None = None
@@ -246,9 +252,11 @@ class Engine:
             facts = project_facts(self.project_root)
             if store:
                 store.set_state(session_id, "project_facts", facts)
+        instructions = session_instructions(store, session_id, self.project_root)
+        self.instructions = instructions
         vault = OutputVault(session_id, store)
         messages = [
-            ChatMessage(role="system", content=build_system_prompt(facts)),
+            ChatMessage(role="system", content=build_system_prompt(facts, instructions)),
             ChatMessage(role="system", content=state.render()),
             *history,
         ]

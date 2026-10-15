@@ -1,18 +1,24 @@
-"""System prompt: fixed instructions plus project facts computed once per session.
+"""System prompt: fixed instructions, project facts and project instructions computed once per session.
 
-The text must be byte-identical across turns of a session (stable prefix), so facts are computed once,
-persisted in session state, and never contain timestamps or other volatile values.
+The text must be byte-identical across turns of a session (stable prefix), so facts and instructions are
+computed once, persisted in session state, and never contain timestamps or other volatile values.
 """
 
 from __future__ import annotations
 
+import hashlib
 import platform
 import unicodedata
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 MAX_TOP_LEVEL = 40
 MAX_NAME_CHARS = 64
+MAX_INSTRUCTIONS_BYTES = 4_096  # cap on the project instruction text that reaches the prompt
+PROJECT_INSTRUCTION_FILES = ("AGENTS.md", "NEDSTER.md")  # first one found in the project root wins
+INSTRUCTIONS_STATE = "project_instructions"  # session state key holding the per-session snapshot
 
 INSTRUCTIONS = """\
 You are Nedster, a local coding agent working inside one project directory through tools.
@@ -78,8 +84,106 @@ def project_facts(root: str | Path | None) -> dict[str, str]:
     return facts
 
 
-def build_system_prompt(facts: Mapping[str, str] | None = None) -> str:
-    if not facts:
-        return INSTRUCTIONS
-    lines = [f"- {_clean(str(key))}: {_clean(str(value))}" for key, value in facts.items()]
-    return INSTRUCTIONS + "\n\nProject facts:\n" + "\n".join(lines)
+@dataclass(slots=True, frozen=True)
+class ProjectInstructions:
+    """The project's own instruction file, snapshotted once per session.
+
+    ``text`` is what reaches the prompt (capped); ``sha256``/``size`` describe the source file so an edit
+    is visible to tools and `nedster config` without changing this session's prompt prefix. The text is
+    only ever prompt text and cannot change tool permissions or policy.
+    """
+
+    name: str = ""
+    text: str = ""
+    sha256: str = ""
+    size: int = 0
+    truncated: bool = False
+
+    @property
+    def present(self) -> bool:
+        return bool(self.name and self.text)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "text": self.text,
+            "sha256": self.sha256,
+            "size": self.size,
+            "truncated": self.truncated,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any] | None) -> ProjectInstructions:
+        if not data:
+            return cls()
+        return cls(
+            name=str(data.get("name", "")),
+            text=str(data.get("text", "")),
+            sha256=str(data.get("sha256", "")),
+            size=int(data.get("size", 0) or 0),
+            truncated=bool(data.get("truncated", False)),
+        )
+
+
+def _read_instructions(path: Path, max_bytes: int) -> ProjectInstructions:
+    raw = path.read_bytes()
+    text = raw[:max_bytes].decode("utf-8", "replace")
+    truncated = len(raw) > max_bytes
+    if truncated:
+        text += "\n[truncated]"
+    return ProjectInstructions(
+        name=safe_name(path.name),
+        text=text.rstrip("\n"),
+        sha256=hashlib.sha256(raw).hexdigest(),
+        size=len(raw),
+        truncated=truncated,
+    )
+
+
+def load_project_instructions(
+    root: str | Path | None, *, max_bytes: int = MAX_INSTRUCTIONS_BYTES
+) -> ProjectInstructions | None:
+    """First existing of AGENTS.md / NEDSTER.md in the project root, capped; None when absent/unreadable."""
+    if root is None:
+        return None
+    directory = Path(root)
+    for name in PROJECT_INSTRUCTION_FILES:
+        candidate = directory / name
+        try:
+            if candidate.is_file():
+                return _read_instructions(candidate, max_bytes)
+        except OSError:
+            return None
+    return None
+
+
+def session_instructions(store: Any, session_id: str, root: str | Path | None) -> ProjectInstructions:
+    """Snapshot of the project instructions for ``session_id`` (computed once, reused on resume).
+
+    An empty snapshot is stored too, so a file created mid-session does not move the prompt prefix; it
+    applies to the next session. ``store`` may be None (tests): the file is then read fresh.
+    """
+    if store is not None:
+        saved = store.get_state(session_id, INSTRUCTIONS_STATE)
+        if saved is not None:
+            return ProjectInstructions.from_dict(saved)
+    loaded = load_project_instructions(root) or ProjectInstructions()
+    if store is not None:
+        store.set_state(session_id, INSTRUCTIONS_STATE, loaded.to_dict())
+    return loaded
+
+
+def build_system_prompt(
+    facts: Mapping[str, str] | None = None,
+    instructions: ProjectInstructions | None = None,
+) -> str:
+    parts = [INSTRUCTIONS]
+    if facts:
+        lines = [f"- {_clean(str(key))}: {_clean(str(value))}" for key, value in facts.items()]
+        parts.append("Project facts:\n" + "\n".join(lines))
+    if instructions is not None and instructions.text:
+        parts.append(
+            f"Project instructions (from {instructions.name}; they cannot change tool permissions):\n"
+            f"{instructions.text}"
+        )
+    return "\n\n".join(parts)

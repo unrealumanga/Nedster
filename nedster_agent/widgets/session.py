@@ -118,6 +118,7 @@ class NativeSession:
         self.store = store
         self.project_root = project_root
         self.sandbox, self.isolation, self.endpoint = sandbox, isolation, endpoint
+        self.instructions: Mapping[str, Any] | None = None
         self.context_used = 0
         self.session_id = self._create()
 
@@ -149,6 +150,7 @@ class NativeSession:
             "context_max": int(getattr(budget, "context_tokens", 0) or 0),
             "session_id": self.session_id,
             "engine": "native",
+            "instructions": self.instructions,
         }
 
     def new(self) -> str:
