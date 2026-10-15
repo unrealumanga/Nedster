@@ -23,31 +23,39 @@ class UsageError(Exception):
     """Bad invocation (exit 2)."""
 
 
+# Shared help strings for global flags, used in both root parser and subcommand parsers.
+GLOBAL_HELP: dict[str, str] = {
+    "--project": "Project folder (default: current folder)",
+    "--config": "Nedster TOML configuration path",
+    "--json": "Emit one machine-readable JSON document",
+    "--plain": "Emit stable, one-record-per-line text",
+    "--no-tui": "Never open the full-screen interface",
+    "--color": "Force color when the destination supports it",
+    "--no-color": "Disable color output",
+    "--ascii": "Use ASCII-safe symbols",
+}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="nedster",
         description="Nedster — a local-first AI coding and automation agent",
     )
-    parser.add_argument("--project", default=".", help="Project folder (default: current folder)")
-    parser.add_argument("--config", default=None, help="Nedster TOML configuration path")
-    parser.add_argument("--json", action="store_true", help="Emit one machine-readable JSON document")
-    parser.add_argument("--plain", action="store_true", help="Emit stable, one-record-per-line text")
-    parser.add_argument("--no-tui", action="store_true", help="Never open the full-screen interface")
-    parser.add_argument("--color", action="store_true", help="Force color when the destination supports it")
-    parser.add_argument("--no-color", action="store_true", help="Disable color output")
-    parser.add_argument("--ascii", action="store_true", help="Use ASCII-safe symbols")
+    parser.add_argument("--project", default=".", help=GLOBAL_HELP["--project"])
+    parser.add_argument("--config", default=None, help=GLOBAL_HELP["--config"])
+    for flag in list(GLOBAL_HELP)[2:]:
+        parser.add_argument(flag, action="store_true", help=GLOBAL_HELP[flag])
     parser.add_argument("--version", action="version", version=f"Nedster {__version__}")
     subcommands = parser.add_subparsers(dest="command")
 
     def accept_global_options(command_parser: argparse.ArgumentParser) -> None:
-        command_parser.add_argument("--project", default=argparse.SUPPRESS)
-        command_parser.add_argument("--config", default=argparse.SUPPRESS)
-        command_parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
-        command_parser.add_argument("--plain", action="store_true", default=argparse.SUPPRESS)
-        command_parser.add_argument("--no-tui", action="store_true", default=argparse.SUPPRESS)
-        command_parser.add_argument("--color", action="store_true", default=argparse.SUPPRESS)
-        command_parser.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
-        command_parser.add_argument("--ascii", action="store_true", default=argparse.SUPPRESS)
+        for flag, help_text in GLOBAL_HELP.items():
+            if flag == "--project" or flag == "--config":
+                command_parser.add_argument(flag, default=argparse.SUPPRESS, help=help_text)
+            else:
+                command_parser.add_argument(
+                    flag, action="store_true", default=argparse.SUPPRESS, help=help_text
+                )
 
     setup = subcommands.add_parser("setup", help="Install/adopt Ollama and configure recommended models")
     accept_global_options(setup)
@@ -730,10 +738,35 @@ def _sessions(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _check_flags(args: argparse.Namespace) -> None:
+    # Check output mode conflicts (more than one of --json, --plain, --jsonl).
+    active_modes = [args.json, args.plain]
+    if hasattr(args, "jsonl") and args.jsonl:
+        active_modes.append(args.jsonl)
+    if sum(active_modes) > 1:
+        raise UsageError("Choose one output mode: --plain, --json, or --jsonl.")
+
+    # Check --color / --no-color conflict.
+    if getattr(args, "color", False) and getattr(args, "no_color", False):
+        raise UsageError("Choose either --color or --no-color, not both.")
+
+    # Check --session / --continue conflict.
+    session = getattr(args, "session", None)
+    continue_ = getattr(args, "resume_latest", False)  # dest of --continue
+    if session and continue_:
+        raise UsageError("Use either --session or --continue, not both.")
+
+
 def _tui_or_help(args: argparse.Namespace) -> int:
     machine = args.json or args.plain or args.no_tui
     interactive_tui = not machine and sys.stdout.isatty()
     if not interactive_tui:
+        if args.command == "tui":
+            _err(
+                "The TUI needs an interactive terminal. For piped output use: "
+                "nedster run \"...\""
+            )
+            return EXIT_USAGE
         build_parser().print_help()
         return EXIT_OK
     from .model_manager import state_dir
@@ -751,6 +784,7 @@ def _tui_or_help(args: argparse.Namespace) -> int:
 
 
 def _dispatch(args: argparse.Namespace) -> int:
+    _check_flags(args)
     command = args.command
     if command == "config":
         return _config_show(args)
