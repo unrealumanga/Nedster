@@ -127,7 +127,12 @@ class NativeSession:
         title: str = "",
         lazy: bool = False,
         role: str | None = None,
+        admit: Callable[[Any, str], Any] | None = None,
     ) -> None:
+        """``admit(store, session_id)`` takes ownership of the chosen session (the CLI's activity lock).
+        It runs before any constructor-side write to that session (title, instruction/soul snapshots)
+        and refuses by raising; the store is then closed and the error propagates, so a refused run
+        leaves the session untouched. A lazy session is admitted when its row is first created."""
         from .engine.loop import Engine
         from .session_store.checkpoints import CheckpointStore
         from .session_store.sqlite_store import SqliteSessionStore
@@ -143,33 +148,41 @@ class NativeSession:
         self.recovery_notes = self.checkpoints.recover()
         root = str(self.project_root)
         name = normalize_title(title)
+        self._admit = admit
         self._pending_title = ""  # stored when a lazily-created session is finally written
         self.started_new = False
-        if session_id is not None:
-            # A full id, a unique prefix or an exact title, scoped to this project (F01/F02/F07).
-            session_id = str(self.store.resolve_session(root, session_id)["id"])
-            self.session_id = session_id
-            if name:  # an explicit --name renames the session it resumes
-                self.store.set_title(self.session_id, name)
-        elif resume_latest:
-            latest = self.store.latest_non_empty(root)  # never continue an empty launch artifact (F06)
-            if latest is None:
+        rename = ""  # an explicit --name for a resumed session, written only after admission
+        try:
+            if session_id is not None:
+                # A full id, a unique prefix or an exact title, scoped to this project (F01/F02/F07).
+                self.session_id = str(self.store.resolve_session(root, session_id)["id"])
+                rename = name  # an explicit --name renames the session it resumes
+            elif resume_latest:
+                latest = self.store.latest_non_empty(root)  # never continue an empty launch artifact (F06)
+                if latest is None:
+                    self.started_new = True
+                    self.session_id = None if lazy else self.store.create(root, name)
+                    self._pending_title = name
+                else:
+                    self.session_id = latest
+                    rename = name
+            elif lazy:
+                # No session row until the first submitted prompt (F06): opening and closing the UI
+                # leaves nothing behind.
                 self.started_new = True
-                self.session_id = None if lazy else self.store.create(root, name)
+                self.session_id = None
                 self._pending_title = name
             else:
-                self.session_id = latest
-                if name:
-                    self.store.set_title(self.session_id, name)
-        elif lazy:
-            # No session row until the first submitted prompt (F06): opening and closing the UI
-            # leaves nothing behind.
-            self.started_new = True
-            self.session_id = None
-            self._pending_title = name
-        else:
-            self.started_new = True
-            self.session_id = self.store.create(root, name)
+                self.started_new = True
+                self.session_id = self.store.create(root, name)
+            if self.session_id and admit is not None:
+                admit(self.store, str(self.session_id))
+        except BaseException:
+            self.checkpoints.close()
+            self.store.close()
+            raise
+        if rename:
+            self.store.set_title(str(self.session_id), rename)
         self.model = worker_model(config, model)
         self.tools, self.executor = build_tools(self.project_root, config, self.checkpoints)
         self.checkpoints.on_undone.append(self.tools.invalidate_after_undo)
@@ -245,9 +258,30 @@ class NativeSession:
         *before* the turn runs). Idempotent.
         """
         if not self.session_id:
-            self.session_id = self.store.create(str(self.project_root), self._pending_title)
+            created = self.store.create(str(self.project_root), self._pending_title)
+            if self._admit is not None:
+                self._admit(self.store, created)
+            self.session_id = created
             self._pending_title = ""
         return str(self.session_id)
+
+    def switch_session(self, session_id: str | None) -> None:
+        """Make ``session_id`` the one conversation this session runs, records and checkpoints
+        (None: a fresh lazily-created one). The TUI's /resume and /new go through here so the
+        adapter, the lock and the engine can never disagree about the current conversation."""
+        if session_id != self.session_id:
+            self._pending_title = ""
+            self.started_new = session_id is None
+        self.session_id = session_id
+
+    def new_session(self, title: str = "") -> str:
+        """Start (and persist) a new conversation and make it current."""
+        created = self.store.create(str(self.project_root), normalize_title(title))
+        if self._admit is not None:
+            self._admit(self.store, created)
+        self.switch_session(created)
+        self.started_new = True
+        return created
 
     def _auto_title(self, text: str) -> None:
         """Name a still-unnamed session from its first user turn (one place for CLI and TUI).

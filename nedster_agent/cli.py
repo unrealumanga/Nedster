@@ -823,21 +823,30 @@ class _SessionHeartbeat:
             self._store.release_lock(self._session_id, self._owner)
 
 
-def _lock_run_session(session: Any) -> _SessionHeartbeat | None:
-    """Take the activity lock for a CLI run; ``SessionActive`` (exit 1) when another live
-    Nedster holds it, so a lock conflict is refused instead of silently writing (F03)."""
+def _lock_run_session(store: Any, session_id: str) -> _SessionHeartbeat | None:
+    """Take the activity lock for a CLI run, failing closed (B3).
+
+    ``SessionActive`` (exit 1) when another live Nedster holds it, when the session no longer
+    exists, or when the lock layer itself fails: a run is never admitted without ownership.
+    ``None`` only for a store with no lock layer at all.
+    """
     from ironclad.session_store.sqlite_store import make_owner
 
-    store = getattr(session, "store", None)
     acquire = getattr(store, "acquire_lock", None)
-    session_id = str(getattr(session, "session_id", ""))
-    if not callable(acquire) or not session_id:
+    if not callable(acquire):
         return None
+    session_id = str(session_id or "")
+    if not session_id:
+        raise SessionActive("No session to run in; nothing was written.")
     owner = make_owner("run")
     try:
         acquired = bool(acquire(session_id, owner))
-    except Exception:  # noqa: BLE001 - never block a run on the lock layer
-        return None
+    except KeyError as exc:
+        raise SessionActive(
+            f"Session {session_id[:SHORT_ID]} no longer exists (deleted?). Nothing was written."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - mapped to one refusal line, never a silent run
+        raise SessionActive(f"Could not lock session {session_id[:SHORT_ID]}: {exc}") from exc
     if not acquired:
         raise SessionActive(
             f"Session {session_id[:SHORT_ID]} is active in another Nedster. Close it there and retry."
@@ -871,19 +880,33 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str, bri
                 _err(msg)
 
     model = _validate_requested_model(args.model, config)
-    session = NativeSession(
-        config,
-        emit=emit,
-        model=model,
-        session_id=args.session,
-        resume_latest=args.resume_latest,
-        title=getattr(args, "name", "") or "",
-        role=args.role,
-    )
+    admitted: list[_SessionHeartbeat | None] = []
+
+    def admit(store: Any, session_id: str) -> None:
+        # Ownership before any constructor-side write (title, snapshots): a refused run writes nothing.
+        admitted.append(_lock_run_session(store, session_id))
+
+    try:
+        session = NativeSession(
+            config,
+            emit=emit,
+            model=model,
+            session_id=args.session,
+            resume_latest=args.resume_latest,
+            title=getattr(args, "name", "") or "",
+            role=args.role,
+            admit=admit,
+        )
+    except BaseException:
+        for held in admitted:
+            if held is not None:
+                held.close()
+        raise
     if args.resume_latest and getattr(session, "started_new", False):
         _err("No previous conversation here; starting a new one.")  # F06: never silently continue an empty launch
     try:
-        heartbeat = _lock_run_session(session)
+        # A session class that did not call ``admit`` (a lazy row, or a test double) is admitted here.
+        heartbeat = admitted[0] if admitted else _lock_run_session(getattr(session, "store", None), session.session_id)
     except SessionActive:
         await session.aclose()
         raise
