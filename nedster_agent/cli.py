@@ -137,6 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DAYS",
         help="Only outputs older than DAYS are candidates (required)",
     )
+    sessions_prune.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be deleted; change nothing",
+    )
     return parser
 
 
@@ -757,21 +762,40 @@ def _sessions_prune(args: argparse.Namespace, store: Any, project_root: Path) ->
     if not 0 < days < 1_000_000:  # positive, finite, and never older than the store itself
         raise UsageError("--older-than must be a positive number of days")
     cutoff_ns = time.time_ns() - int(days * 86_400 * 1e9)
-    stats = store.prune_outputs(str(project_root), cutoff_ns=cutoff_ns)
-    payload = {"project_root": str(project_root), "older_than_days": days, "cutoff_ns": cutoff_ns, **stats}
+    stats = store.prune_outputs(str(project_root), cutoff_ns=cutoff_ns, dry_run=args.dry_run)
+    removable = stats["deleted"]
+    payload = {
+        "project_root": str(project_root),
+        "older_than_days": days,
+        "cutoff_ns": cutoff_ns,
+        **stats,
+    }
+    if args.dry_run:
+        payload["dry_run"] = True
     if args.json:
         _emit_json(payload)
         return EXIT_OK
     if args.plain:
         for key in ("sessions", "outputs", "deleted", "retained_referenced", "retained_recent"):
             print(f"{key}\t{stats[key]}")
+        print(f"dry_run\t{1 if args.dry_run else 0}")
         return EXIT_OK
-    print(f"Scanned {stats['sessions']} session(s), {stats['outputs']} output(s) older than {days:g} day(s).")
-    print(f"Deleted {stats['deleted']} unreferenced output(s).")
-    print(f"Kept {stats['retained_referenced']} referenced by a message or task state.")
-    print(f"Kept {stats['retained_recent']} newer than the cutoff.")
-    if stats["outputs"] == stats["retained_referenced"] + stats["retained_recent"]:
+    # human output – fix the summary line to report removable count
+    print(
+        f"Scanned {stats['outputs']} output(s) in {stats['sessions']} session(s): "
+        f"{removable} removable, {stats['retained_referenced']} referenced, "
+        f"{stats['retained_recent']} newer than {days:g} day(s)."
+    )
+    if removable == 0:
         print("Nothing was prunable.")
+    elif args.dry_run:
+        print(
+            f"Dry run: nothing was deleted. Run again without --dry-run to delete "
+            f"{removable} output(s)."
+        )
+    else:
+        print(f"Deleted {removable} unreferenced output(s).")
+    print("This prunes stored tool output only; conversations are kept.")
     return EXIT_OK
 
 
