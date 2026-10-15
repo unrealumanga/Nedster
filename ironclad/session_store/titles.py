@@ -7,6 +7,8 @@ user message. Everything here is pure text so every surface shows the same name.
 from __future__ import annotations
 
 import re
+import time
+from datetime import datetime
 
 #: Longest stored/displayed title, ellipsis included.
 TITLE_LIMIT = 80
@@ -46,3 +48,21 @@ def display_title(title: str, first_user_text: str = "") -> str:
     """Title for display: the name when set, else the first message, else ``UNTITLED``."""
     name = (title or "").strip()
     return name or normalize_title(first_user_text) or UNTITLED
+
+
+def relative_age(ns: int, now: float | None = None) -> str:
+    """Compact age for a listing: "just now", "5m ago", "yesterday", a date when older than a week."""
+    if not ns:
+        return ""
+    seconds = max(0.0, (time.time() if now is None else now) - int(ns) / 1e9)
+    if seconds < 90:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 86_400:
+        return f"{int(seconds // 3600)}h ago"
+    if seconds < 172_800:
+        return "yesterday"
+    if seconds < 7 * 86_400:
+        return f"{int(seconds // 86_400)}d ago"
+    return datetime.fromtimestamp(int(ns) / 1e9).strftime("%Y-%m-%d")

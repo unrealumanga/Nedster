@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ironclad.contracts import ChatMessage
 from ironclad.session_store.sqlite_store import SqliteSessionStore
-from ironclad.session_store.titles import TITLE_LIMIT, UNTITLED, display_title, normalize_title
+from ironclad.session_store.titles import TITLE_LIMIT, UNTITLED, display_title, normalize_title, relative_age
 
 
 def test_normalize_collapses_whitespace_and_takes_the_first_non_empty_line():
@@ -37,6 +37,18 @@ def test_display_title_falls_back_to_the_first_message_then_untitled():
     assert display_title("", "do the thing\nand more") == "do the thing"
     assert display_title("", "") == UNTITLED
     assert display_title("", "\x00\x07") == UNTITLED
+
+
+def test_relative_age_buckets_by_elapsed_time():
+    now = 2_000_000_000.0
+    ns = lambda seconds: int((now - seconds) * 1e9)  # noqa: E731 - tiny helper for readability
+    assert relative_age(0) == ""
+    assert relative_age(ns(10), now=now) == "just now"
+    assert relative_age(ns(5 * 60), now=now) == "5m ago"
+    assert relative_age(ns(3 * 3600), now=now) == "3h ago"
+    assert relative_age(ns(86_400 + 60), now=now) == "yesterday"
+    assert relative_age(ns(3 * 86_400), now=now) == "3d ago"
+    assert relative_age(ns(30 * 86_400), now=now).count("-") == 2  # a date when older than a week
 
 
 def test_store_set_title_first_user_text_and_message_count(tmp_path: Path):

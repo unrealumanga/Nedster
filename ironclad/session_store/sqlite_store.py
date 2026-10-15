@@ -196,6 +196,15 @@ def _handle_numbers(text: str) -> set[int]:
     return found
 
 
+def _search_hit(record: Mapping[str, Any], needle: str) -> bool:
+    """Picker filter: id prefix, title substring or first user message substring (all case-insensitive)."""
+    if str(record.get("id", "")).lower().startswith(needle):
+        return True
+    if needle in str(record.get("title", "")).lower():
+        return True
+    return needle in str(record.get("first_user_text", "")).lower()
+
+
 def _serialize_tool_calls(tool_calls: list[ToolCall]) -> str:
     payload = [
         {"id": call.id, "name": call.name, "arguments": dict(call.arguments)}
@@ -351,6 +360,65 @@ class SqliteSessionStore:
                 (root,),
             ).fetchone()
         return str(row[0]) if row else None
+
+    def latest_non_empty(self, project_root: str) -> str | None:
+        """Newest session of the project that has at least one stored message (``None`` when none)."""
+        root = normalize_project_root(project_root)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT id FROM sessions WHERE project_root = ?"
+                " AND (SELECT COUNT(*) FROM messages WHERE session_id = sessions.id) > 0"
+                " ORDER BY updated_ns DESC, id DESC LIMIT 1",
+                (root,),
+            ).fetchone()
+        return str(row[0]) if row else None
+
+    def search_sessions(
+        self,
+        project_root: str,
+        query: str = "",
+        *,
+        exclude_empty: bool = True,
+        limit: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Every session of the project, newest first, with counts and first/last user text.
+
+        Searches *all* sessions of the project (never a capped page) so older conversations
+        stay reachable. ``query`` matches the display title, the first user message or an id
+        prefix when non-empty; ``exclude_empty`` drops sessions that have no messages at all;
+        ``limit <= 0`` returns everything.
+        """
+        root = normalize_project_root(project_root)
+        needle = (query or "").strip().lower()
+        sql = (
+            "SELECT s.id, s.project_root, s.title, s.created_ns, s.updated_ns,"
+            " (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,"
+            " (SELECT m.content FROM messages m WHERE m.session_id = s.id AND m.role = 'user'"
+            "  AND TRIM(m.content) <> '' ORDER BY m.seq ASC LIMIT 1) AS first_user_text,"
+            " (SELECT m.content FROM messages m WHERE m.session_id = s.id AND m.role = 'user'"
+            "  AND TRIM(m.content) <> '' ORDER BY m.seq DESC LIMIT 1) AS last_user_text"
+            " FROM sessions s WHERE s.project_root = ? ORDER BY s.updated_ns DESC, s.id DESC"
+        )
+        with self._lock:
+            rows = self._connection.execute(sql, (root,)).fetchall()
+        found: list[dict[str, Any]] = []
+        for row in rows:
+            record = {
+                "id": row[0],
+                "project_root": row[1],
+                "title": row[2],
+                "created_ns": row[3],
+                "updated_ns": row[4],
+                "message_count": int(row[5]),
+                "first_user_text": str(row[6] or ""),
+                "last_user_text": str(row[7] or ""),
+            }
+            if exclude_empty and record["message_count"] <= 0:
+                continue
+            if needle and not _search_hit(record, needle):
+                continue
+            found.append(record)
+        return found[:limit] if limit and limit > 0 else found
 
     def _touch(self, session_id: str, now: int) -> None:
         self._connection.execute(

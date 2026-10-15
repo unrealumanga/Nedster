@@ -107,6 +107,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tui = subcommands.add_parser("tui", help="Open the interactive terminal interface")
     accept_global_options(tui)
+    tui_open = tui.add_mutually_exclusive_group()
+    tui_open.add_argument("--session", default=None, help="Open on a session by id, unique id prefix or exact title")
+    tui_open.add_argument(
+        "--continue", dest="resume_latest", action="store_true", help="Open the most recent conversation"
+    )
+    resume_command = subcommands.add_parser(
+        "resume", help="Open the interface on a saved conversation (picker when no reference is given)"
+    )
+    accept_global_options(resume_command)
+    resume_choice = resume_command.add_mutually_exclusive_group()
+    resume_choice.add_argument("ref", nargs="?", default=None, help="Session id, unique id prefix or exact title")
+    resume_choice.add_argument(
+        "--last", action="store_true", help="Resume the most recent non-empty conversation here"
+    )
     ledger = subcommands.add_parser("verify-ledger", help="Verify the local event chain")
     accept_global_options(ledger)
     permissions = subcommands.add_parser("permissions", help="Show the active tool permission policy")
@@ -574,6 +588,8 @@ async def _run_native(args: argparse.Namespace, config: Any, objective: str) -> 
         resume_latest=args.resume_latest,
         title=getattr(args, "name", "") or "",
     )
+    if args.resume_latest and getattr(session, "started_new", False):
+        _err("No previous conversation here; starting a new one.")  # F06: never silently continue an empty launch
     try:
         heartbeat = _lock_run_session(session)
     except SessionActive:
@@ -645,24 +661,6 @@ def _stamp(ns: int) -> str:
     return datetime.fromtimestamp(int(ns) / 1e9).strftime("%Y-%m-%d %H:%M") if ns else ""
 
 
-def _relative_stamp(ns: int, now: float | None = None) -> str:
-    """Compact age for the list: "5m ago", "yesterday", a date when older than a week."""
-    if not ns:
-        return ""
-    seconds = max(0.0, (time.time() if now is None else now) - int(ns) / 1e9)
-    if seconds < 90:
-        return "just now"
-    if seconds < 3600:
-        return f"{int(seconds // 60)}m ago"
-    if seconds < 86_400:
-        return f"{int(seconds // 3600)}h ago"
-    if seconds < 172_800:
-        return "yesterday"
-    if seconds < 7 * 86_400:
-        return f"{int(seconds // 86_400)}d ago"
-    return datetime.fromtimestamp(int(ns) / 1e9).strftime("%Y-%m-%d")
-
-
 def _clip(text: str, limit: int = SHOW_ENTRY_CHARS) -> str:
     flat = " ".join(str(text).split())
     return flat if len(flat) <= limit else flat[: limit - 3] + "..."
@@ -720,11 +718,13 @@ def _sessions_list(args: argparse.Namespace, store: Any, project_root: Path) -> 
             print(f"{row['id']}\t{_stamp(row['updated_ns'])}\t{flag}\t{row['title']}")
         return EXIT_OK
     print(f"{'id':<10}{'updated':<12}{'messages':<10}title")
+    from ironclad.session_store.titles import relative_age
+
     for row in rows:
         sid = str(row["id"])
         flag = "  [active]" if row["active"] else ""
         title = _display_title(store, sid, row.get("title", ""))
-        print(f"{_short(sid):<10}{_relative_stamp(row['updated_ns']):<12}{int(row.get('message_count', 0)):<10}{title}{flag}")
+        print(f"{_short(sid):<10}{relative_age(int(row['updated_ns'])):<12}{int(row.get('message_count', 0)):<10}{title}{flag}")
     print(f"{len(rows)} session(s).")
     print('Resume: nedster run --session <id or title> "..."')
     return EXIT_OK
@@ -846,6 +846,27 @@ def _sessions(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _tui_session_ref(config: Any, ref: str) -> str:
+    """Resolve ``tui --session`` / ``resume <ref>`` up front so a bad reference is a usage error (exit 2)."""
+    from ironclad.session_store.sqlite_store import SqliteSessionStore
+
+    store = SqliteSessionStore(Path(config.runtime.state_dir) / "sessions.sqlite3")
+    try:
+        return str(_find_session(store, Path(config.runtime.project_root), ref)["id"])
+    finally:
+        store.close()
+
+
+def _latest_non_empty(config: Any) -> str | None:
+    from ironclad.session_store.sqlite_store import SqliteSessionStore
+
+    store = SqliteSessionStore(Path(config.runtime.state_dir) / "sessions.sqlite3")
+    try:
+        return store.latest_non_empty(str(config.runtime.project_root))
+    finally:
+        store.close()
+
+
 def _tui_or_help(args: argparse.Namespace) -> int:
     machine = args.json or args.plain or args.no_tui
     interactive_tui = not machine and sys.stdout.isatty()
@@ -861,8 +882,34 @@ def _tui_or_help(args: argparse.Namespace) -> int:
     from .tui import run_tui
 
     config, _ = _resolve(args)
+    ref = getattr(args, "session", None)
+    if ref is not None:
+        ref = _tui_session_ref(config, ref)
     run_tui(config, ascii_only=args.ascii,
-            no_color=args.no_color or (not args.color and bool(os.getenv("NO_COLOR"))))
+            no_color=args.no_color or (not args.color and bool(os.getenv("NO_COLOR"))),
+            session_ref=ref,
+            resume_latest=bool(getattr(args, "resume_latest", False)))
+    return EXIT_OK
+
+
+def _resume(args: argparse.Namespace) -> int:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        _err('nedster resume needs an interactive terminal; for scripts use: nedster run --session <ref> "..."')
+        return EXIT_USAGE
+    from .tui import run_tui
+
+    config, _ = _resolve(args)
+    no_color = args.no_color or (not args.color and bool(os.getenv("NO_COLOR")))
+    ref = getattr(args, "ref", None)
+    if ref is not None:
+        run_tui(config, ascii_only=args.ascii, no_color=no_color, session_ref=_tui_session_ref(config, ref))
+        return EXIT_OK
+    if getattr(args, "last", False):
+        latest = _latest_non_empty(config)
+        if latest is not None:
+            run_tui(config, ascii_only=args.ascii, no_color=no_color, session_ref=latest)
+            return EXIT_OK
+    run_tui(config, ascii_only=args.ascii, no_color=no_color, open_picker_on_start=True)
     return EXIT_OK
 
 
@@ -882,6 +929,8 @@ def _dispatch(args: argparse.Namespace) -> int:
         return _permissions(args)
     if command == "sessions":
         return _sessions(args)
+    if command == "resume":
+        return _resume(args)
     if command == "run":
         import asyncio
 

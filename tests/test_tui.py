@@ -552,17 +552,176 @@ async def test_rename_command_sets_the_title_identity_and_usage_hint(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_sessions_command_shows_first_message_when_title_is_empty(tmp_path):
+async def test_sessions_command_opens_the_picker_with_first_message_titles(tmp_path):
+    from textual.widgets import OptionList
+
+    from nedster_agent.widgets.session_picker import SessionPicker
+
     app = _resume_app(tmp_path)
     async with app.run_test(size=(120, 40)) as pilot:
         await _ready(pilot, app)
         store = app.session.store
+        empty = app.session.session_id  # the launch session has no messages yet
         blank = store.create(app.session.project_root)
         store.append_message(blank, ChatMessage(role="user", content="explain the widget"))
 
         app._command("/sessions")
         await _settle(pilot)
 
-        text = _transcript(app)
-        assert blank[:8] in text and "explain the widget" in text
+        assert isinstance(app.screen, SessionPicker)
+        rows = app.screen.query_one("#session-rows", OptionList)
+        ids = [str(rows.get_option_at_index(i).id) for i in range(rows.option_count)]
+        labels = [str(rows.get_option_at_index(i).prompt) for i in range(rows.option_count)]
+        assert blank in ids
+        assert any(blank[:8] in label for label in labels)
+        assert any("explain the widget" in label for label in labels)
+        assert empty not in ids  # 0-message sessions are hidden
+
+
+# --- BP1-S3: picker, lazy startup, session reference CLI ------------------------------------------
+
+
+def _picker(app):
+    from nedster_agent.widgets.session_picker import SessionPicker
+
+    assert isinstance(app.screen, SessionPicker)
+    return app.screen
+
+
+def _row_ids(picker) -> list[str]:
+    from textual.widgets import OptionList
+
+    rows = picker.query_one("#session-rows", OptionList)
+    return [str(rows.get_option_at_index(i).id) for i in range(rows.option_count)]
+
+
+def _seed_conversation(store, root: str, title: str, first: str) -> str:
+    session = store.create(root, title)
+    store.append_message(session, ChatMessage(role="user", content=first))
+    store.append_message(session, ChatMessage(role="assistant", content="ok"))
+    return session
+
+
+@pytest.mark.asyncio
+async def test_ctrl_s_opens_the_picker(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        _seed_conversation(app.session.store, app.session.project_root, "an old one", "hello there")
+
+        await pilot.press("ctrl+s")
+        await _settle(pilot)
+
+        assert _picker(app) is not None
+
+
+@pytest.mark.asyncio
+async def test_picker_reaches_a_session_older_than_the_list_page_and_resumes_on_enter(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        store = app.session.store
+        root = app.session.project_root
+        ids = [_seed_conversation(store, root, f"conversation {index:02d}", f"message {index}") for index in range(25)]
+        oldest = ids[0]
+        # the newest-20 page the TUI used to search never contains the oldest session
+        assert oldest not in {entry["id"] for entry in app.session.list_sessions()}
+
+        app._command("/sessions")
+        await _settle(pilot)
+        from textual.widgets import Input
+
+        app.screen.query_one("#session-filter", Input).value = "conversation 00"
+        await _settle(pilot)
+        assert _row_ids(_picker(app)) == [oldest]
+
+        await pilot.press("enter")
+        await _settle(pilot)
+
+        assert app.session.session_id == oldest
+        assert f"Resumed session {oldest[:8]}" in _transcript(app)
+
+
+@pytest.mark.asyncio
+async def test_picker_marks_sessions_locked_by_another_window_and_refuses_them(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        store = app.session.store
+        root = app.session.project_root
+        other = _seed_conversation(store, root, "in use elsewhere", "busy work")
+        owner = make_owner("tui")
+        assert store.acquire_lock(other, owner)
+
+        app._command("/sessions")
+        await _settle(pilot)
+        from textual.widgets import Input
+
+        app.screen.query_one("#session-filter", Input).value = "in use elsewhere"
+        await _settle(pilot)
+        picker = _picker(app)
+        current = app.session.session_id
+
+        await pilot.press("enter")
+        await _settle(pilot)
+
+        assert app.session.session_id == current  # stayed put
+        assert isinstance(app.screen, type(picker))  # picker still open
+        assert "active in another Nedster" in str(app.screen.query_one("#session-preview").render())
+
+
+@pytest.mark.asyncio
+async def test_picker_opens_read_only_while_a_turn_is_running(tmp_path):
+    app = _resume_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _ready(pilot, app)
+        _seed_conversation(app.session.store, app.session.project_root, "a session", "hi")
+        app.busy = True
+
+        app._command("/sessions")
+        await _settle(pilot)
+
+        picker = _picker(app)
+        assert "read-only" in str(picker.query_one("#session-head").render())
+
+
+@pytest.mark.asyncio
+async def test_opening_and_closing_the_tui_leaves_no_session_row(tmp_path):
+    config = NedsterConfig()
+    config.runtime.project_root = tmp_path
+    config.runtime.state_dir = tmp_path / "state"
+    config.engine = "native"
+    app = NedsterApp(config)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await _ready(pilot, app)
+        assert str(getattr(app.session, "session_id", "")) in {"", "None"}  # lazy: no row yet
+
+    store = SqliteSessionStore(tmp_path / "state" / "sessions.sqlite3")
+    try:
+        assert store.list_sessions(str(tmp_path.resolve())) == []
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_lazy_session_row_is_created_on_the_first_submitted_prompt(tmp_path):
+    from nedster_agent.tui import native_session
+    from tests.engine.fakes import ScriptedTransport, Turn
+
+    config = NedsterConfig()
+    config.runtime.project_root = tmp_path
+    config.runtime.state_dir = tmp_path / "state"
+    config.runtime.context_tokens = 8192
+    session = native_session(config, lambda event: None)
+    try:
+        assert session.session_id is None
+        assert session.store.list_sessions(str(tmp_path.resolve())) == []
+        session.core.engine.transport = ScriptedTransport([Turn("hi there")])
+        await session.submit("name it for me")
+        assert session.session_id
+        assert len(session.store.list_sessions(str(tmp_path.resolve()))) == 1
+        assert session.store.get_session(session.session_id)["title"] == "name it for me"
+    finally:
+        await session.close()
+
 

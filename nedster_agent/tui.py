@@ -7,7 +7,6 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +34,7 @@ from .widgets.session import (
     SessionNote,
     failure_reason,
 )
+from .widgets.session_picker import SessionOption, SessionPicker
 from .widgets.status import StatusBar, isolation_label
 from .widgets.transcript import (
     RESUME_BANNER,
@@ -52,8 +52,8 @@ COMMANDS: dict[str, str] = {
     "/help": "show commands and keys",
     "/new": "start a new conversation",
     "/clear": "clear the display (conversation is kept)",
-    "/sessions": "list saved sessions for this project",
-    "/resume": "resume a session: /resume [id]",
+    "/sessions": "browse saved sessions (Ctrl+S)",
+    "/resume": "resume a session: /resume [id] (no id opens the picker)",
     "/model": "show or switch the model: /model [name]",
     "/status": "model, context, sandbox, session",
     "/rename": "rename this session: /rename <name>",
@@ -81,12 +81,20 @@ class _WiredNativeSession(NativeSession):
 
     core: Any = None
 
+    def ensure_session(self) -> str:
+        """Persist the (lazy) session row so the activity lock can be taken before the turn runs."""
+        if self.core is None:
+            return str(self.session_id)
+        self.session_id = self.core.ensure_session_id()
+        return str(self.session_id)
+
     async def submit(self, text: str) -> None:
         # Through the core session, not the bare engine: it opens the checkpoint turn that file mutations need
         # (and that /undo restores). /resume may have switched session_id, so the core follows it.
         if self.core is None:
             await super().submit(text)
             return
+        self.ensure_session()
         self.core.session_id = self.session_id
         await self.core.run(text)
 
@@ -99,13 +107,26 @@ class _WiredNativeSession(NativeSession):
             await self.core.aclose()
 
 
-def native_session(config: NedsterConfig, emit: EventCallback) -> EngineSession:
+def native_session(
+    config: NedsterConfig,
+    emit: EventCallback,
+    *,
+    session_id: str | None = None,
+    resume_latest: bool = False,
+    lazy: bool = True,
+) -> EngineSession:
     from ironclad.native import NativeSession as CoreSession
 
     holder: dict[str, CoreSession] = {}
 
     def build(engine_emit: Callable[[Any], None]) -> Any:
-        holder["core"] = CoreSession(config, emit=engine_emit, resume_latest=False)
+        holder["core"] = CoreSession(
+            config,
+            emit=engine_emit,
+            session_id=session_id,
+            resume_latest=resume_latest,
+            lazy=lazy,
+        )
         return holder["core"].engine
 
     session = _WiredNativeSession(build, emit, endpoint=config.models.ollama_url)
@@ -114,6 +135,7 @@ def native_session(config: NedsterConfig, emit: EventCallback) -> EngineSession:
     session.core = core
     session.store = core.store
     session.session_id = core.session_id
+    session.started_new = core.started_new
     session.project_root = info["project_root"]
     session.sandbox, session.isolation = info["sandbox"], info["isolation"]
     return session
@@ -190,6 +212,7 @@ class NedsterApp(App[None]):
     BINDINGS = [
         Binding("escape", "escape", "Stop", priority=True),
         Binding("ctrl+c", "interrupt", "Quit (x2)", priority=True),
+        Binding("ctrl+s", "session_picker", "Sessions"),
         Binding("f2", "details", "Events"),
         Binding("ctrl+l", "clear", "Clear"),
     ]
@@ -203,6 +226,9 @@ class NedsterApp(App[None]):
         session_factory: SessionFactoryFor | None = None,
         doctor: DoctorProvider | None = None,
         files: Callable[[], Sequence[str]] | None = None,
+        session_ref: str | None = None,
+        resume_latest: bool = False,
+        open_picker_on_start: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -211,6 +237,9 @@ class NedsterApp(App[None]):
         self.glyphs = Glyphs(ascii_only=ascii_only, no_color=no_color)
         self.session_factory = session_factory
         self.doctor = doctor or _default_doctor
+        self.session_ref = session_ref
+        self.resume_latest = resume_latest
+        self.open_picker_on_start = open_picker_on_start
         root = Path(config.runtime.project_root)
         self.files_source = files or (lambda: project_files(root))
         self.history = History.for_project(Path(config.runtime.state_dir), root)
@@ -315,7 +344,13 @@ class NedsterApp(App[None]):
     def _make_session(self) -> EngineSession:
         if self.session_factory is not None:
             return self.session_factory(self.config, self.handle_event)
-        return native_session(self.config, self.handle_event)
+        return native_session(
+            self.config,
+            self.handle_event,
+            session_id=self.session_ref,
+            resume_latest=self.resume_latest,
+            lazy=self.session_ref is None and not self.resume_latest,
+        )
 
     async def _initialize(self) -> None:
         g = self.glyphs
@@ -333,9 +368,15 @@ class NedsterApp(App[None]):
             self.status_bar.set_state("setup needed")
             return
         self._refresh_info()
-        self._acquire_lock(str(getattr(self.session, "session_id", "")))
+        session_id = str(getattr(self.session, "session_id", "") or "")
+        if session_id:  # a lazily-created session has no id yet and needs no lock
+            self._acquire_lock(session_id)
+            if not bool(getattr(self.session, "started_new", True)):
+                self._replay_session(session_id)  # opened straight on an existing conversation
         self._set_state("idle")
         self._message("Ready")
+        if self.open_picker_on_start:
+            self._open_session_picker()
 
     def _refresh_info(self) -> None:
         if self.session is None:
@@ -447,6 +488,21 @@ class NedsterApp(App[None]):
             recovered = False
         self._message("" if recovered else "Session lock lost - another Nedster may have taken over")
 
+    def _activate_session(self) -> None:
+        """Create the lazily-held session row and take its activity lock before the first turn runs."""
+        if self.session is None:
+            return
+        ensure = getattr(self.session, "ensure_session", None)
+        if not callable(ensure):
+            return
+        try:
+            session_id = str(ensure() or "")
+        except Exception as exc:  # noqa: BLE001 - the turn itself will surface the real failure
+            self._line(f"Could not prepare the session: {exc}", "warn")
+            return
+        if session_id and self._locked is None:
+            self._acquire_lock(session_id)
+
     def _resolve_session_id(self, wanted: str | None) -> str:
         """Resolve ``/resume`` so the lock is taken *before* switching.
 
@@ -496,6 +552,60 @@ class NedsterApp(App[None]):
             self._line("No saved transcript for this session.", "muted")
         self.transcript.add(Banner(self.glyphs, RESUME_BANNER))
         self._refresh_info()
+
+    # ------------------------------------------------------------------ picker
+
+    def _picker_options(self, store: Any) -> list[SessionOption]:
+        """Every non-empty conversation of the project (never a capped page), annotated for the picker."""
+        root = str(self.config.runtime.project_root)
+        searcher = getattr(store, "search_sessions", None)
+        if callable(searcher):
+            rows = list(searcher(root, exclude_empty=True))
+        else:  # a store double without search_sessions: fall back to the list page
+            rows = [row for row in store.list_sessions(root) if int(row.get("message_count", 1)) > 0]
+        current = str(getattr(self.session, "session_id", "") or "")
+        held = self._locked[1] if self._locked is not None else ""
+        is_active = getattr(store, "is_active", None)
+        options: list[SessionOption] = []
+        for row in rows:
+            session_id = str(row["id"])
+            active = bool(is_active(session_id)) if callable(is_active) else False
+            options.append(
+                SessionOption(
+                    id=session_id,
+                    title=str(row.get("title") or ""),
+                    message_count=int(row.get("message_count") or 0),
+                    updated_ns=int(row.get("updated_ns") or 0),
+                    first_user_text=str(row.get("first_user_text") or ""),
+                    last_user_text=str(row.get("last_user_text") or ""),
+                    current=session_id == current,
+                    locked=active and session_id != held,
+                )
+            )
+        return options
+
+    def _open_session_picker(self) -> None:
+        """Open the conversation picker (``/sessions``, bare ``/resume``, Ctrl+S and ``--continue``)."""
+        if self.session is None:
+            self._line("Saved sessions are not available with this session.", "warn")
+            return
+        store = self._session_store()
+        if store is None or not callable(getattr(store, "list_sessions", None)):
+            self._line("Saved sessions are not available with this session.", "warn")
+            return
+        options = self._picker_options(store)
+        if not options:
+            self._line("No saved conversations for this project.")
+            return
+        self.push_screen(
+            SessionPicker(options, busy=self.busy, ascii_only=self.ascii_only),
+            self._picker_chosen,
+        )
+
+    def _picker_chosen(self, session_id: str | None) -> None:
+        if session_id is None:  # Esc: the composer draft is untouched
+            return
+        self._cmd_resume([session_id])
 
     # ------------------------------------------------------------------ events
 
@@ -668,6 +778,7 @@ class NedsterApp(App[None]):
         self._start_turn(value)
 
     def _start_turn(self, value: str) -> None:
+        self._activate_session()
         self.busy = True
         self.turn_closed = False
         self.status_bar.start_turn()
@@ -762,6 +873,9 @@ class NedsterApp(App[None]):
         self.transcript.remove_children()
         self.tool_rows = {k: v for k, v in self.tool_rows.items() if v.finished is None}
 
+    def action_session_picker(self) -> None:
+        self._open_session_picker()
+
     # ------------------------------------------------------------------ commands
 
     def _command(self, value: str) -> None:
@@ -798,7 +912,7 @@ class NedsterApp(App[None]):
             self._line(f"  {name:<13}{text}")
         self._line("Keys", "accent")
         self._line("  Enter send · Shift+Enter/Ctrl+J newline · Up/Down history · @ file · / command")
-        self._line("  Esc stop the running turn · Ctrl+C twice exit · F2 raw events · Ctrl+L clear")
+        self._line("  Ctrl+S switch conversation · Esc stop the running turn · Ctrl+C twice exit · F2 raw events · Ctrl+L clear")
         self._line("  Tool rows: focus with Tab/click, Enter expands argv, output and diff")
 
     def _cmd_new(self, _args: list[str]) -> None:
@@ -815,22 +929,7 @@ class NedsterApp(App[None]):
         self._refresh_info()
 
     def _cmd_sessions(self, _args: list[str]) -> None:
-        lister = getattr(self.session, "list_sessions", None)
-        if lister is None:
-            self._line("Saved sessions are not available with this session.", "warn")
-            return
-        sessions = list(lister())
-        if not sessions:
-            self._line("No saved sessions for this project.")
-            return
-        current = self.status_bar.info.get("session_id")
-        self._line("Sessions (newest first) · /resume <id>", "accent")
-        for item in sessions:
-            sid = str(item.get("id", ""))
-            updated = item.get("updated_ns")
-            when = datetime.fromtimestamp(int(updated) / 1e9).strftime("%Y-%m-%d %H:%M") if updated else ""
-            marker = "*" if sid == current else " "
-            self._line(f" {marker} {sid[:SHORT_ID]}  {when}  {self._title_of(sid, str(item.get('title') or ''))}")
+        self._open_session_picker()
 
     def _cmd_rename(self, name: str) -> None:
         store = self._session_store()
@@ -847,6 +946,9 @@ class NedsterApp(App[None]):
         self._refresh_info()
 
     def _cmd_resume(self, args: list[str]) -> None:
+        if not args:  # bare /resume: choose from the picker
+            self._open_session_picker()
+            return
         resume = getattr(self.session, "resume", None)
         if resume is None:
             self._line("Resuming a saved session is not available with this session.", "warn")
@@ -988,5 +1090,16 @@ def run_tui(
     ascii_only: bool = False,
     no_color: bool = False,
     session_factory: SessionFactoryFor | None = None,
+    session_ref: str | None = None,
+    resume_latest: bool = False,
+    open_picker_on_start: bool = False,
 ) -> None:
-    NedsterApp(config, ascii_only=ascii_only, no_color=no_color, session_factory=session_factory).run()
+    NedsterApp(
+        config,
+        ascii_only=ascii_only,
+        no_color=no_color,
+        session_factory=session_factory,
+        session_ref=session_ref,
+        resume_latest=resume_latest,
+        open_picker_on_start=open_picker_on_start,
+    ).run()

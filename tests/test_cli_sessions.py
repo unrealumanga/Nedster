@@ -590,3 +590,140 @@ def test_run_empty_name_is_a_usage_error(clean_env, capsys):
     assert main(["run", "--name", "   ", "--project", str(clean_env), "hi"]) == EXIT_USAGE
     assert "--name needs at least one visible character" in capsys.readouterr().err
 
+
+# --- BP1-S3: `nedster resume`, lazy `run --continue`, tui session flags ---------------------------
+
+
+def _accept_ok():
+    from ironclad.contracts import AcceptanceResult, Outcome
+
+    return AcceptanceResult(outcome=Outcome.ANSWERED, answer="ok")
+
+
+def test_resume_non_interactive_exits_2_with_a_script_hint(clean_env, capsys):
+    assert main(["resume", "--project", str(clean_env)]) == EXIT_USAGE
+    err = capsys.readouterr().err
+    assert 'nedster resume needs an interactive terminal; for scripts use: nedster run --session <ref> "..."' in err
+
+
+def _force_interactive(monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+
+
+def _capture_run_tui(monkeypatch) -> dict:
+    import nedster_agent.tui as tui
+
+    calls: dict = {}
+    monkeypatch.setattr(tui, "run_tui", lambda config, **kwargs: calls.update(kwargs))
+    return calls
+
+
+def test_resume_with_a_ref_resolves_and_opens_that_session(clean_env, monkeypatch):
+    store, session = _seed(clean_env, _root(clean_env), title="resume me")
+    store.close()
+    _force_interactive(monkeypatch)
+    calls = _capture_run_tui(monkeypatch)
+
+    assert main(["resume", session[:8], "--project", str(clean_env)]) == EXIT_OK
+    assert calls["session_ref"] == session
+    assert calls.get("open_picker_on_start", False) is False
+
+
+def test_resume_without_a_ref_opens_the_picker_first(clean_env, monkeypatch):
+    _force_interactive(monkeypatch)
+    calls = _capture_run_tui(monkeypatch)
+
+    assert main(["resume", "--project", str(clean_env)]) == EXIT_OK
+    assert calls.get("open_picker_on_start") is True
+    assert calls.get("session_ref") is None
+
+
+def test_resume_last_picks_the_most_recent_non_empty_session(clean_env, monkeypatch):
+    store = _store(clean_env)
+    older = store.create(_root(clean_env), "older")
+    store.append_message(older, ChatMessage(role="user", content="older work"))
+    empty = store.create(_root(clean_env))  # newer but empty: must never be chosen
+    store.close()
+    _set_updated(clean_env, older, seconds_ago=3600)
+    _set_updated(clean_env, empty, seconds_ago=1)
+    _force_interactive(monkeypatch)
+    calls = _capture_run_tui(monkeypatch)
+
+    assert main(["resume", "--last", "--project", str(clean_env)]) == EXIT_OK
+    assert calls["session_ref"] == older
+
+
+def test_resume_ref_and_last_are_mutually_exclusive(clean_env, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["resume", "deadbeef", "--last", "--project", str(clean_env)])
+    assert exit_info.value.code == EXIT_USAGE
+    assert "not allowed with" in capsys.readouterr().err
+
+
+def test_resume_unknown_ref_is_a_usage_error(clean_env, monkeypatch, capsys):
+    store, session = _seed(clean_env, _root(clean_env), title="the only one")
+    store.close()
+    _force_interactive(monkeypatch)
+
+    assert main(["resume", "deadbeef", "--project", str(clean_env)]) == EXIT_USAGE
+    assert "No session matches 'deadbeef'" in capsys.readouterr().err
+
+
+def test_tui_session_and_continue_are_mutually_exclusive(clean_env, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["tui", "--session", "deadbeef", "--continue", "--project", str(clean_env)])
+    assert exit_info.value.code == EXIT_USAGE
+    assert "not allowed with" in capsys.readouterr().err
+
+
+def test_tui_session_flag_opens_that_conversation(clean_env, monkeypatch):
+    store, session = _seed(clean_env, _root(clean_env), title="open me")
+    store.close()
+    _force_interactive(monkeypatch)
+    calls = _capture_run_tui(monkeypatch)
+
+    assert main(["tui", "--session", session[:8], "--project", str(clean_env)]) == EXIT_OK
+    assert calls["session_ref"] == session
+
+
+def test_tui_continue_flag_resumes_latest(clean_env, monkeypatch):
+    _force_interactive(monkeypatch)
+    calls = _capture_run_tui(monkeypatch)
+
+    assert main(["tui", "--continue", "--project", str(clean_env)]) == EXIT_OK
+    assert calls.get("resume_latest") is True
+
+
+def test_run_continue_without_history_prints_a_notice(clean_env, capsys):
+    class _FakeSession:
+        def __init__(self, config, *, emit=None, model=None, session_id=None, resume_latest=False, title="", **_):
+            self.session_id = session_id or "new"
+            self.started_new = True  # no non-empty session in this project
+
+        async def run(self, text, *, intent=None):
+            return _accept_ok()
+
+        async def aclose(self): ...
+
+    with patch("ironclad.native.NativeSession", _FakeSession):
+        assert main(["run", "--continue", "--project", str(clean_env), "hi"]) == EXIT_OK
+    assert "No previous conversation here; starting a new one." in capsys.readouterr().err
+
+
+def test_run_continue_with_history_has_no_notice(clean_env, capsys):
+    class _FakeSession:
+        def __init__(self, config, *, emit=None, model=None, session_id=None, resume_latest=False, title="", **_):
+            self.session_id = session_id or "existing"
+            self.started_new = False  # resumed a real conversation
+
+        async def run(self, text, *, intent=None):
+            return _accept_ok()
+
+        async def aclose(self): ...
+
+    with patch("ironclad.native.NativeSession", _FakeSession):
+        assert main(["run", "--continue", "--project", str(clean_env), "hi"]) == EXIT_OK
+    assert "No previous conversation here" not in capsys.readouterr().err
+
+
