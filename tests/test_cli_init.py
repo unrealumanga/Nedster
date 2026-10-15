@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -30,7 +31,8 @@ def test_init_writes_starter_and_refuses_to_overwrite(project: Path, capsys) -> 
     content = path.read_text(encoding="utf-8")
     assert len(content.splitlines()) < 40
     assert "Project instructions" in content
-    assert "- Test: `python -m pytest -q`" in content
+    # the interpreter name follows the platform (python on Windows, python3 on POSIX)
+    assert re.search(r"^- Test: `\S*python[\d.]*(\.exe)? -m pytest -q`$", content, re.M), content
 
     assert main(["init", "--project", str(project)]) == 1
     assert "already exists" in capsys.readouterr().err
