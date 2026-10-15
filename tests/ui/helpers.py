@@ -54,6 +54,9 @@ class FakeSession:
         self._info["session_id"] = f"sess-{self.new_calls + 1}"
         return self._info["session_id"]
 
+    def set_model(self, name: str) -> None:
+        self._info["model"] = name
+
     # ------------------------------------------------------------------ test controls
 
     def event(self, kind: str, /, **data: Any) -> None:

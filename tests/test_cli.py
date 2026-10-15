@@ -140,6 +140,115 @@ def test_models_list_uses_resolved_endpoint(clean_env, monkeypatch):
     assert seen == ["http://example:9"]
 
 
+# --- model picker + truthful model handling (BP2) ---------------------------------------------
+
+
+class _FleetManager:
+    """OllamaManager double exposing /api/tags details and one /api/show context."""
+
+    url = "http://fake"
+
+    def __init__(self, *_a, **_k): ...
+    def api_available(self):
+        return True
+
+    def list_model_details(self):
+        return [
+            {"name": "nedster-worker:latest", "size": 9_000_000_000,
+             "details": {"parameter_size": "9B", "quantization_level": "Q4_K_M"}},
+            {"name": "qwen3.6:27b", "size": 18_000_000_000,
+             "details": {"parameter_size": "27B", "quantization_level": "Q4_K_M"}},
+        ]
+
+    def list_models(self):
+        return [entry["name"] for entry in self.list_model_details()]
+
+    def context_window(self, model):
+        return (40960, None) if model == "nedster-worker:latest" else (None, None)
+
+
+def _model_fleet(monkeypatch):
+    monkeypatch.setattr("nedster_agent.model_manager.OllamaManager", _FleetManager)
+
+
+def test_models_list_marks_current_in_json_and_keeps_names(clean_env, monkeypatch, capsys):
+    _model_fleet(monkeypatch)
+    assert main(["models", "--json", "--project", str(clean_env)]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["models"] == ["nedster-worker:latest", "qwen3.6:27b"]  # machine contract unchanged
+    assert doc["current"] == "nedster-worker"
+    current = next(row for row in doc["installed"] if row["name"] == "nedster-worker:latest")
+    assert current["current"] is True and current["context_length"] == 40960
+    assert current["parameter_size"] == "9B" and current["quantization"] == "Q4_K_M"
+
+
+def test_models_list_marks_current_in_the_human_table(clean_env, monkeypatch, capsys):
+    _model_fleet(monkeypatch)
+    assert main(["models", "--project", str(clean_env)]) == 0
+    out = capsys.readouterr().out
+    assert "* nedster-worker:latest" in out
+    assert "current: nedster-worker" in out
+
+
+def test_models_use_persists_the_worker_model(clean_env, monkeypatch, capsys):
+    _model_fleet(monkeypatch)
+    assert main(["models", "use", "qwen3.6:27b", "--project", str(clean_env)]) == 0
+    path = clean_env / "cfg" / "config.toml"
+    assert tomllib.loads(path.read_text(encoding="utf-8"))["models"]["coder"] == "qwen3.6:27b"
+    assert "Default worker model set to qwen3.6:27b" in capsys.readouterr().out
+
+
+def test_models_use_a_typo_changes_nothing(clean_env, monkeypatch, capsys):
+    _model_fleet(monkeypatch)
+    assert main(["models", "use", "qwen3.6:2", "--project", str(clean_env)]) == 2
+    err = capsys.readouterr().err
+    assert "Model 'qwen3.6:2' is not installed" in err and "qwen3.6:27b" in err
+    assert not (clean_env / "cfg" / "config.toml").exists()
+
+
+def test_models_use_without_a_name_is_a_usage_error(clean_env, monkeypatch, capsys):
+    _model_fleet(monkeypatch)
+    assert main(["models", "use", "--project", str(clean_env)]) == 2
+    assert "needs a model name" in capsys.readouterr().err
+
+
+def test_run_with_a_typo_model_fails_before_any_turn(clean_env, monkeypatch, capsys):
+    _model_fleet(monkeypatch)
+    created = []
+
+    def _explode(*_a, **_k):
+        created.append(True)
+        raise AssertionError("NativeSession must not be built for an uninstalled model")
+
+    with patch("ironclad.native.NativeSession", _explode):
+        code = main(["run", "--model", "qwen3.6:2", "--project", str(clean_env), "hello"])
+    assert code == 2 and created == []
+    err = capsys.readouterr().err
+    assert "Model 'qwen3.6:2' is not installed" in err and "qwen3.6:27b" in err
+
+
+def test_run_with_an_installed_model_resolves_the_implicit_latest(clean_env, monkeypatch):
+    _model_fleet(monkeypatch)
+    seen = {}
+
+    class _FakeSession:
+        def __init__(self, config, *, emit=None, model=None, **_k):
+            seen["model"] = model
+            self.session_id = "0123456789abcdef"
+            self.model = model
+
+        async def run(self, text, *, intent=None):
+            from ironclad.contracts import AcceptanceResult, Outcome
+
+            return AcceptanceResult(outcome=Outcome.ANSWERED, answer="ok")
+
+        async def aclose(self): ...
+
+    with patch("ironclad.native.NativeSession", _FakeSession), patch("sys.stdin", io.StringIO("hi\n")):
+        assert main(["run", "--model", "nedster-worker", "--project", str(clean_env)]) == 0
+    assert seen["model"] == "nedster-worker:latest"
+
+
 def test_cli_module_import_is_lazy():
     # Stub the package so the test covers only cli's own imports (no eager package-level work).
     code = (

@@ -58,12 +58,12 @@ COMMANDS: dict[str, str] = {
     "/diff": "diff of files changed in this session",
     "/undo": "undo the last edit (when the engine supports it)",
     "/doctor": "readiness check (inference / read-only / execution)",
-    "/models": "list the active model fleet",
+    "/models": "browse and switch installed models",
     "/permissions": "show the autonomy policy",
     "/quit": "exit Nedster",
 }
 # Commands that change engine/session state wait for the running turn (the text is kept).
-IDLE_ONLY = {"/new", "/resume", "/model", "/undo", "/sessions"}
+IDLE_ONLY = {"/new", "/resume", "/model", "/models", "/undo", "/sessions"}
 
 #: How much stored history /resume replays into the view (display only, never re-executed).
 RESUME_REPLAY_LIMIT = 200
@@ -91,6 +91,17 @@ class _WiredNativeSession(NativeSession):
     def undo_last(self) -> Any:
         self.core.session_id = self.session_id
         return self.core.undo_last()
+
+    def set_model(self, name: str) -> None:
+        super().set_model(name)
+        if self.core is None:
+            return
+        from ironclad.native import context_budget
+
+        self.core.model = name
+        budget = getattr(self.core.engine, "budget", None)
+        if budget is not None:  # a switch must rebuild the compaction budget for the new window
+            budget.context_tokens = context_budget(self.core.config, name)
 
     async def close(self) -> None:
         if self.core is not None:
@@ -189,6 +200,7 @@ class NedsterApp(App[None]):
         Binding("escape", "escape", "Stop", priority=True),
         Binding("ctrl+c", "interrupt", "Quit (x2)", priority=True),
         Binding("f2", "details", "Events"),
+        Binding("f4", "models", "Models"),
         Binding("ctrl+l", "clear", "Clear"),
     ]
 
@@ -201,6 +213,7 @@ class NedsterApp(App[None]):
         session_factory: SessionFactoryFor | None = None,
         doctor: DoctorProvider | None = None,
         files: Callable[[], Sequence[str]] | None = None,
+        model_source: Callable[[str], Sequence[Any]] | None = None,
     ):
         super().__init__()
         self.config = config
@@ -211,6 +224,7 @@ class NedsterApp(App[None]):
         self.doctor = doctor or _default_doctor
         root = Path(config.runtime.project_root)
         self.files_source = files or (lambda: project_files(root))
+        self.model_source = model_source or self._default_model_source
         self.history = History.for_project(Path(config.runtime.state_dir), root)
         self.session: EngineSession | None = None
         self.busy = False
@@ -253,6 +267,13 @@ class NedsterApp(App[None]):
 
     def _project_name(self) -> str:
         return Path(self.config.runtime.project_root).name or str(self.config.runtime.project_root)
+
+    def _default_model_source(self, current: str) -> Sequence[Any]:
+        """Installed Ollama models; runs in a worker thread so the UI never blocks on the network."""
+        from .model_manager import OllamaManager, list_installed_models
+
+        manager = OllamaManager(self.config.models.ollama_url)
+        return list_installed_models(manager, current)
 
     async def on_mount(self) -> None:
         self._loop_thread = threading.get_ident()
@@ -683,6 +704,13 @@ class NedsterApp(App[None]):
     # ------------------------------------------------------------------ actions
 
     def action_escape(self) -> None:
+        from textual.screen import ModalScreen
+
+        if isinstance(self.screen, ModalScreen):  # app-level Esc has priority; let the modal handle it
+            cancel = getattr(self.screen, "action_cancel", None)
+            if cancel is not None:
+                cancel()
+            return
         composer = self.query_one("#prompt", Composer)
         if composer.completion is not None:
             composer.close_completion()
@@ -737,6 +765,9 @@ class NedsterApp(App[None]):
         self.transcript.remove_children()
         self.tool_rows = {k: v for k, v in self.tool_rows.items() if v.finished is None}
 
+    def action_models(self) -> None:
+        self._open_model_picker()
+
     # ------------------------------------------------------------------ commands
 
     def _command(self, value: str) -> None:
@@ -771,7 +802,7 @@ class NedsterApp(App[None]):
         self._line("Keys", "accent")
         self._line("  Enter send · Shift+Enter/Ctrl+J newline · Up/Down history · @ file · / command")
         self._line("  Esc stop the running turn · Ctrl+C twice exit · F2 raw events · Ctrl+L clear")
-        self._line("  Tool rows: focus with Tab/click, Enter expands argv, output and diff")
+        self._line("  F4 models · Tool rows: focus with Tab/click, Enter expands argv, output and diff")
 
     def _cmd_new(self, _args: list[str]) -> None:
         new = getattr(self.session, "new", None)
@@ -833,25 +864,88 @@ class NedsterApp(App[None]):
             self._acquire_lock(session_id, warn=False)
         self._replay_session(session_id)
 
+    def _cmd_models(self, _args: list[str]) -> None:
+        self._open_model_picker()
+
     def _cmd_model(self, args: list[str]) -> None:
-        info = self.session.info() if self.session else {}
         if not args:
-            self._line(f"Model: {info.get('model') or 'none'} ({info.get('provider') or 'LOCAL'})")
+            self._open_model_picker()
             return
+        self.run_worker(self._switch_model(args[0]), group="command")
+
+    def _current_model(self) -> str:
+        return str(self.session.info().get("model") or "") if self.session is not None else ""
+
+    def _open_model_picker(self) -> None:
+        if self.session is None:
+            self._line("Runtime unavailable · run nedster setup", "warn")
+            return
+        if self.busy:
+            self._message(f"Models waits for the running turn {self.glyphs.sep} Esc stops it")
+            return
+        self.run_worker(self._load_models_and_pick(), group="command")
+
+    async def _load_models_and_pick(self) -> None:
+        from .widgets.model_picker import ModelPicker
+
+        current = self._current_model()
+        try:
+            models = await asyncio.to_thread(self.model_source, current)
+        except Exception:  # noqa: BLE001 - a dead endpoint is explained, never a crash
+            self._line(self._models_unreachable(), "warn")
+            return
+        if not models:
+            self._line("No models are installed. Add one with: ollama pull <model>", "warn")
+            return
+        self.push_screen(ModelPicker(models, current=current, glyphs=self.glyphs), self._on_model_picked)
+
+    def _on_model_picked(self, name: str | None) -> None:
+        self._message("")
+        if not name or self.session is None:
+            return
+        if name == self._current_model():
+            self._message(f"{name} is already the active model")
+            return
+        self._apply_model(name)
+
+    async def _switch_model(self, name: str) -> None:
+        if self.session is None:
+            self._line("Runtime unavailable · run nedster setup", "warn")
+            return
+        from .model_manager import match_installed_model, model_not_installed_message
+
+        current = self._current_model()
+        try:
+            models = await asyncio.to_thread(self.model_source, current)
+        except Exception:  # noqa: BLE001 - cannot validate offline; keep the previous model
+            self._line(self._models_unreachable(), "warn")
+            return
+        installed = [model.name for model in models]
+        canonical = match_installed_model(name, installed)
+        if canonical is None:
+            self._line(model_not_installed_message(name, installed), "warn")
+            return
+        self._apply_model(canonical)
+
+    def _apply_model(self, name: str) -> None:
         setter = getattr(self.session, "set_model", None)
         if setter is None:
             self._line("This engine picks models from the fleet; change models.coder in config.toml.", "warn")
             return
-        setter(args[0])
-        self._line(f"Model set to {args[0]}", "accent")
+        try:
+            setter(name)
+        except Exception as exc:  # noqa: BLE001 - shown, never fatal
+            self._line(f"Could not switch model: {exc}", "fail")
+            return
+        self._line(f"Model set to {name}", "accent")
         self._refresh_info()
 
-    def _cmd_models(self, _args: list[str]) -> None:
-        rows = getattr(self.session, "models", lambda: [])()
-        if not rows:
-            self._line("No model fleet is active. Run `nedster setup`.")
-        for role, model, backend in rows:
-            self._line(f"{role}: {model} ({backend})")
+    def _models_unreachable(self) -> str:
+        g = self.glyphs
+        return (
+            f"{g.icon('fail')} Ollama is not reachable at {self.config.models.ollama_url}. "
+            "Start it (`ollama serve`), then retry."
+        )
 
     def _cmd_status(self, _args: list[str]) -> None:
         if self.session is None:

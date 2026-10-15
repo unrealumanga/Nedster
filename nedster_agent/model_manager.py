@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import difflib
 import json
 import os
 import platform
@@ -10,7 +11,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,24 @@ class ModelPlan:
     context_tokens: int
     estimated_download_gb: float
     notes: str
+
+
+@dataclass(frozen=True, slots=True)
+class InstalledModel:
+    """One model present in the local Ollama store, as shown by the picker and `models list`."""
+
+    name: str
+    size_gb: float | None = None
+    parameter_size: str = ""
+    quantization: str = ""
+    context_length: int | None = None
+    current: bool = False
+
+    def size_label(self) -> str:
+        return f"{self.size_gb:.1f} GB" if self.size_gb is not None else "?"
+
+    def context_label(self) -> str:
+        return "unknown" if self.context_length is None else str(self.context_length)
 
 
 MODEL_PLANS: dict[str, dict[str, ModelPlan]] = {
@@ -209,10 +228,13 @@ class OllamaManager:
         except httpx.HTTPError:
             return False
 
-    def list_models(self) -> list[str]:
+    def list_model_details(self) -> list[dict[str, Any]]:
         response = httpx.get(f"{self.url}/api/tags", timeout=10)
         response.raise_for_status()
-        return [str(item["name"]) for item in response.json().get("models", [])]
+        return [dict(item) for item in response.json().get("models", [])]
+
+    def list_models(self) -> list[str]:
+        return [str(item["name"]) for item in self.list_model_details()]
 
     def context_window(self, model: str) -> tuple[int | None, int | None]:
         """(configured num_ctx, trained context length) from /api/show; None when unknown."""
@@ -494,6 +516,22 @@ def activate_config(config_dir: Path, text: str, *, stamp: str | None = None) ->
     return backup
 
 
+def set_default_worker(config_path: Path, name: str) -> Path | None:
+    """Persist ``models.coder = name`` in ``config.toml``, returning the backup path (None when new).
+
+    Only the worker key changes; every other user value and section is preserved.
+    """
+    existing: dict[str, Any] = {}
+    if config_path.is_file():
+        existing = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    models = existing.get("models")
+    if not isinstance(models, dict):
+        models = {}
+        existing["models"] = models
+    models["coder"] = name
+    return activate_config(config_path.parent, _dump_toml(existing))
+
+
 STAGED_ALIASES = {"nedster-worker": "nedster-worker-next", "nedster-router": "nedster-router-next"}
 
 
@@ -620,6 +658,69 @@ def _trained_ctx(model_info: dict[str, Any]) -> int | None:
         if key.endswith(".context_length") and isinstance(value, int) and not isinstance(value, bool):
             return value
     return None
+
+
+def match_installed_model(name: str, installed: Sequence[str]) -> str | None:
+    """The installed name matching ``name`` (exact, or with an implicit ``:latest``), else None."""
+    wanted = name.strip()
+    if not wanted:
+        return None
+    for candidate in installed:
+        if candidate == wanted or candidate == f"{wanted}:latest" or wanted == f"{candidate}:latest":
+            return candidate
+    return None
+
+
+def model_not_installed_message(name: str, installed: Sequence[str], *, suggestions: int = 3) -> str:
+    """The one remedy the TUI and CLI print for a model that is not installed."""
+    message = f"Model '{name}' is not installed. Choose one with /models, or run: ollama pull {name}"
+    closest = difflib.get_close_matches(name, list(installed), n=suggestions, cutoff=0.4)
+    if closest:
+        message += f". Closest installed: {', '.join(closest)}"
+    return message
+
+
+def is_model_missing_error(text: str) -> bool:
+    """True when a transport error looks like Ollama rejecting an unknown model."""
+    lowered = text.lower()
+    return "404" in lowered or "not found" in lowered
+
+
+def list_installed_models(
+    manager: OllamaManager, current: str = "", *, with_context: bool = True
+) -> list[InstalledModel]:
+    """Installed models with size, parameters, quantization and (cheap) context.
+
+    Context comes from ``/api/show``; a model whose probe fails is reported as ``unknown`` rather
+    than guessed. A dead endpoint raises the underlying ``httpx`` error so the caller can explain it.
+    """
+    models: list[InstalledModel] = []
+    probe = getattr(manager, "context_window", None)
+    for entry in manager.list_model_details():
+        name = str(entry.get("name") or "")
+        if not name:
+            continue
+        details = entry.get("details")
+        details = details if isinstance(details, Mapping) else {}
+        size = entry.get("size")
+        context: int | None = None
+        if with_context and callable(probe):
+            try:
+                configured, trained = probe(name)
+            except (httpx.HTTPError, ValueError):
+                configured = trained = None
+            context = configured or trained
+        models.append(
+            InstalledModel(
+                name=name,
+                size_gb=round(float(size) / 1_000_000_000, 1) if isinstance(size, (int, float)) else None,
+                parameter_size=str(details.get("parameter_size") or ""),
+                quantization=str(details.get("quantization_level") or ""),
+                context_length=context,
+                current=match_installed_model(current, [name]) is not None,
+            )
+        )
+    return models
 
 
 KV_CACHE_TYPES = ("f16", "q8_0", "q4_0")

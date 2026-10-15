@@ -251,7 +251,29 @@ async def test_native_engine_is_wired_and_uses_the_session_store(tmp_path):
         assert isinstance(app.session, _WiredNativeSession)
         assert app.session.session_id == app.session.core.session_id
         assert "SETUP NEEDED" not in str(app.query_one("#identity").render())
-    assert (tmp_path / "state" / "sessions.sqlite3").exists()
+        assert (tmp_path / "state" / "sessions.sqlite3").exists()
+
+
+@pytest.mark.asyncio
+async def test_switching_the_model_rebuilds_the_compaction_budget(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from nedster_agent.tui import _WiredNativeSession
+
+    config = NedsterConfig()
+    config.runtime.project_root = tmp_path
+    config.runtime.context_tokens = 0  # follow the served window, not a fixed override
+
+    engine = SimpleNamespace(model="old", budget=SimpleNamespace(context_tokens=32768))
+    session = _WiredNativeSession(lambda emit: engine, lambda event: None)
+    session.core = SimpleNamespace(config=config, engine=engine, model="old")
+
+    monkeypatch.setattr("ironclad.native.context_budget", lambda cfg, model: 40960)
+    session.set_model("qwen3.6:27b")
+
+    assert session.engine.model == "qwen3.6:27b"
+    assert session.core.model == "qwen3.6:27b"
+    assert engine.budget.context_tokens == 40960
 
 
 # --- /resume replay, activity locks, interrupted-call repair (W2-RESUME) ---------------------
