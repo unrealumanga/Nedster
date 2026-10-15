@@ -106,7 +106,8 @@ def build_parser() -> argparse.ArgumentParser:
     accept_global_options(permissions)
     config = subcommands.add_parser("config", help="Inspect the effective configuration")
     accept_global_options(config)
-    config.add_argument("action", nargs="?", choices=("show",), default="show")
+    config.add_argument("action", nargs="?", choices=("show", "get", "path"), default="show")
+    config.add_argument("key", nargs="?", default=None, help="Dotted key for get, e.g. models.coder")
 
     sessions = subcommands.add_parser(
         "sessions", help="List, show, delete or prune the saved sessions of this project"
@@ -216,6 +217,63 @@ def _config_show(args: argparse.Namespace) -> int:
         print(f"{key} = {value}  [{provenance[key]}]")
     for warning in config.warnings:
         print(f"# warning: {warning}")
+    return EXIT_OK
+
+
+def _config(args: argparse.Namespace) -> int:
+    action = getattr(args, "action", None) or "show"
+    if action == "show":
+        return _config_show(args)
+    if action == "get":
+        return _config_get(args)
+    if action == "path":
+        return _config_path(args)
+    raise UsageError(f"unknown config action: {action}")
+
+
+def _config_get(args: argparse.Namespace) -> int:
+    key = getattr(args, "key", None)
+    if not key:
+        raise UsageError("Usage: nedster config get <section.field>, e.g. models.coder")
+    config, provenance = _resolve(args)
+    data = _config_dict(config)
+    node: Any = data
+    for part in key.split("."):
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        else:
+            raise UsageError(f"Unknown config key {key!r}. See: nedster config show")
+    if args.json:
+        source = provenance.get(key, "default")
+        _emit_json({"key": key, "value": node, "source": source})
+    else:
+        if isinstance(node, str):
+            print(node)
+        else:
+            print(json.dumps(node))
+    return EXIT_OK
+
+
+def _config_path(args: argparse.Namespace) -> int:
+    from ironclad.config import config_dir, data_dir
+
+    user_cfg = config_dir() / "config.toml"
+    state_d = data_dir()
+    project_root = Path(args.project or ".").resolve()
+    proj_cfg = project_root / ".nedster" / "config.toml"
+
+    if args.json:
+        _emit_json({
+            "user_config": str(user_cfg),
+            "project_config": str(proj_cfg),
+            "data_dir": str(state_d),
+        })
+        return EXIT_OK
+    user_suffix = " (exists)" if user_cfg.exists() else " (not created yet)"
+    proj_suffix = " (exists)" if proj_cfg.exists() else " (not created yet)"
+    print(f"user config: {user_cfg}{user_suffix}")
+    print(f"project config: {proj_cfg}{proj_suffix}")
+    print(f"data dir: {state_d}")
     return EXIT_OK
 
 
@@ -787,7 +845,7 @@ def _dispatch(args: argparse.Namespace) -> int:
     _check_flags(args)
     command = args.command
     if command == "config":
-        return _config_show(args)
+        return _config(args)
     if command == "setup":
         return _setup(args)
     if command == "doctor":
