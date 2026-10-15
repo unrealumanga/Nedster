@@ -99,26 +99,47 @@ class _WiredNativeSession(NativeSession):
     """TUI adapter over ``ironclad.native.NativeSession``: shares its store/session and closes its resources."""
 
     core: Any = None
+    _own_session_id: str | None = None
+
+    # One authoritative session id (B2): with a core attached, the adapter's id *is* the core's, so
+    # /resume, /new, the lazy first-turn row, the lock, the engine's transcript and the checkpoint
+    # turn can never point at different conversations.
+    @property  # type: ignore[override]
+    def session_id(self) -> str | None:
+        if self.core is not None:
+            return self.core.session_id
+        return self._own_session_id
+
+    @session_id.setter
+    def session_id(self, value: str | None) -> None:
+        if self.core is not None:
+            self.core.switch_session(value)
+        else:
+            self._own_session_id = value
 
     def ensure_session(self) -> str:
-        """Persist the (lazy) session row so the activity lock can be taken before the turn runs."""
+        """Persist the (lazy) session row so the activity lock can be taken before the turn runs.
+
+        Only fills an absent id; a chosen (resumed / new) session is never replaced."""
         if self.core is None:
             return str(self.session_id)
-        self.session_id = self.core.ensure_session_id()
-        return str(self.session_id)
+        return str(self.core.ensure_session_id())
+
+    def new(self) -> str:
+        if self.core is None:
+            return super().new()
+        self.context_used = 0
+        return str(self.core.new_session())
 
     async def submit(self, text: str) -> None:
         # Through the core session, not the bare engine: it opens the checkpoint turn that file mutations need
-        # (and that /undo restores). /resume may have switched session_id, so the core follows it.
+        # (and that /undo restores).
         if self.core is None:
             await super().submit(text)
             return
-        self.ensure_session()
-        self.core.session_id = self.session_id
         await self.core.run(text)
 
     def undo_last(self) -> Any:
-        self.core.session_id = self.session_id
         return self.core.undo_last()
 
     def set_model(self, name: str) -> None:
@@ -162,9 +183,8 @@ def native_session(
     session = _WiredNativeSession(build, emit, endpoint=config.models.ollama_url)
     core = holder["core"]
     info = core.info()
-    session.core = core
+    session.core = core  # from here on session.session_id reads and writes core.session_id
     session.store = core.store
-    session.session_id = core.session_id
     session.started_new = core.started_new
     session.project_root = info["project_root"]
     session.sandbox, session.isolation = info["sandbox"], info["isolation"]
@@ -446,7 +466,8 @@ class NedsterApp(App[None]):
         self._refresh_info()
         session_id = str(getattr(self.session, "session_id", "") or "")
         if session_id:  # a lazily-created session has no id yet and needs no lock
-            self._acquire_lock(session_id)
+            if not self._acquire_lock(session_id):  # B3: shown, and every turn is refused until it is free
+                self._line("Turns are not sent while another window holds this conversation.", "warn")
             if not bool(getattr(self.session, "started_new", True)):
                 self._replay_session(session_id)  # opened straight on an existing conversation
         self._set_state("idle")
@@ -585,8 +606,11 @@ class NedsterApp(App[None]):
     def _release_lock(self) -> None:
         if self._locked is None:
             return
-        store, session_id = self._locked
-        self._locked = None
+        entry, self._locked = self._locked, None
+        self._release_entry(entry)
+
+    def _release_entry(self, entry: tuple[Any, str]) -> None:
+        store, session_id = entry
         release = getattr(store, "release_lock", None)
         if callable(release):
             with suppress(Exception):
@@ -615,22 +639,34 @@ class NedsterApp(App[None]):
             recovered = bool(acquire(session_id, self._lock_owner)) if callable(acquire) else False
         except Exception:  # noqa: BLE001
             recovered = False
+        if not recovered:
+            self._locked = None  # B3: the next turn must re-acquire (or be refused), never write unowned
         self._message("" if recovered else "Session lock lost - another Nedster may have taken over")
 
-    def _activate_session(self) -> None:
-        """Create the lazily-held session row and take its activity lock before the first turn runs."""
+    def _activate_session(self) -> bool:
+        """Create the lazily-held session row and hold its activity lock before a turn runs.
+
+        True only when this window holds the lock of exactly the current session id (or the
+        session has no lock layer at all); False refuses the turn (B3: admission fails closed).
+        """
         if self.session is None:
-            return
+            return False
         ensure = getattr(self.session, "ensure_session", None)
-        if not callable(ensure):
-            return
         try:
-            session_id = str(ensure() or "")
-        except Exception as exc:  # noqa: BLE001 - the turn itself will surface the real failure
+            session_id = str((ensure() if callable(ensure) else getattr(self.session, "session_id", "")) or "")
+        except Exception as exc:  # noqa: BLE001 - shown; the turn is refused
             self._line(f"Could not prepare the session: {exc}", "warn")
-            return
-        if session_id and self._locked is None:
-            self._acquire_lock(session_id)
+            return False
+        store = self._session_store()
+        if not callable(getattr(store, "acquire_lock", None)):
+            return True  # an engine without session locks (nothing to own)
+        if not session_id:
+            self._line("No session to lock; the turn was not sent.", "warn")
+            return False
+        if self._locked is not None and self._locked[1] == session_id:
+            return True
+        self._release_lock()  # held for another id: never let a turn run under a stale lock
+        return self._acquire_lock(session_id)
 
     def _resolve_session_id(self, wanted: str | None) -> str:
         """Resolve ``/resume`` so the lock is taken *before* switching.
@@ -1075,7 +1111,12 @@ class NedsterApp(App[None]):
         self._start_turn(value)
 
     def _start_turn(self, value: str) -> None:
-        self._activate_session()
+        if not self._activate_session():
+            composer = self.query_one("#prompt", Composer)
+            draft = composer.text
+            composer.set_text(f"{value}\n{draft}" if draft.strip() else value)
+            self._message("Not sent: this conversation is not available here (your text was kept)")
+            return
         self.busy = True
         self.turn_closed = False
         self._turn_started = time.monotonic()
@@ -1352,16 +1393,25 @@ class NedsterApp(App[None]):
             except LookupError as exc:
                 self._line(str(exc), "warn")
                 return
+        previous = self._locked
+        if target is not None:
+            self._locked = None  # take the target's lock first; the current one is released on success
             if not self._acquire_lock(target):  # active elsewhere: keep the current conversation
+                self._locked = previous
                 return
         try:
             session_id = str(resume(wanted if target is None else target))
-        except LookupError as exc:
-            self._line(str(exc), "warn")
-            return
         except Exception as exc:  # noqa: BLE001 - shown in the transcript, never fatal
-            self._line(f"Resume failed: {exc}", "fail")
+            if target is not None and (previous is None or previous[1] != target):
+                self._release_lock()  # the switch did not happen: drop the target's lock, keep ours
+            self._locked = previous
+            if isinstance(exc, LookupError):
+                self._line(str(exc), "warn")
+            else:
+                self._line(f"Resume failed: {exc}", "fail")
             return
+        if previous is not None and target is not None and previous[1] != target:
+            self._release_entry(previous)  # switched: the old conversation is free for other windows
         if target is not None and session_id != target:
             self._release_lock()
             self._acquire_lock(session_id, warn=False)

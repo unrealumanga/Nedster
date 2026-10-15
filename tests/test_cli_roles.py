@@ -96,7 +96,7 @@ def test_run_brief_with_valid_content_used_as_objective(clean_env, capsys):
     tmpfile.write_text("from brief file", encoding="utf-8")
 
     class FakeSession:
-        def __init__(self, config, *, emit=None, model=None, session_id=None, resume_latest=False, title="", role=None):
+        def __init__(self, config, *, emit=None, model=None, session_id=None, resume_latest=False, title="", role=None, admit=None):
             self.session_id = "abc123"
         async def run(self, text, *, intent=None):
             from ironclad.contracts import AcceptanceResult, Outcome
