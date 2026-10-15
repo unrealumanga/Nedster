@@ -7,14 +7,19 @@ computed once, persisted in session state, and never contain timestamps or other
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 import platform
+import stat
 import unicodedata
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from ironclad.config import config_dir
+
+_log = logging.getLogger(__name__)
 
 MAX_TOP_LEVEL = 40
 MAX_NAME_CHARS = 64
@@ -115,7 +120,9 @@ class ProjectInstructions:
 
     ``text`` is what reaches the prompt (capped); ``sha256``/``size`` describe the source file so an edit
     is visible to tools and `nedster config` without changing this session's prompt prefix. The text is
-    only ever prompt text and cannot change tool permissions or policy.
+    only ever prompt text and cannot change tool permissions or policy. ``sha256`` follows
+    :func:`snapshot_digest`. ``warning`` is a visible notice about an instruction file that was skipped
+    (a link, junction or reparse point, or a path whose real location is outside the project).
     """
 
     name: str = ""
@@ -123,6 +130,7 @@ class ProjectInstructions:
     sha256: str = ""
     size: int = 0
     truncated: bool = False
+    warning: str = ""
 
     @property
     def present(self) -> bool:
@@ -135,6 +143,7 @@ class ProjectInstructions:
             "sha256": self.sha256,
             "size": self.size,
             "truncated": self.truncated,
+            "warning": self.warning,
         }
 
     @classmethod
@@ -147,20 +156,76 @@ class ProjectInstructions:
             sha256=str(data.get("sha256", "")),
             size=int(data.get("size", 0) or 0),
             truncated=bool(data.get("truncated", False)),
+            warning=str(data.get("warning", "")),
         )
 
 
-def _read_instructions(path: Path, max_bytes: int) -> ProjectInstructions:
-    raw = path.read_bytes()
-    text = raw[:max_bytes].decode("utf-8", "replace")
-    truncated = len(raw) > max_bytes
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400  # Windows: symlinks, junctions and other reparse points
+
+
+class _RejectedFile(Exception):
+    """An instruction file that must not be read (link, reparse point, not regular, outside the project)."""
+
+
+def _is_link(info: os.stat_result) -> bool:
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    return bool(getattr(info, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def snapshot_digest(accepted: bytes, source_size: int) -> str:
+    """SHA-256 identifying a capped snapshot without reading the whole source file.
+
+    The digest covers the accepted bytes (at most the cap). When the source is larger than what was
+    accepted (truncated), the source size is mixed in as ``b"\\0source-size=<n>"`` so a change in the
+    unread tail's length still changes the digest. For an untruncated file this is the plain SHA-256
+    of the file's bytes.
+    """
+    digest = hashlib.sha256(accepted)
+    if source_size != len(accepted):
+        digest.update(b"\0source-size=%d" % source_size)
+    return digest.hexdigest()
+
+
+def _read_capped(path: Path, max_bytes: int, *, expect: os.stat_result | None = None) -> tuple[bytes, int, bool]:
+    """Read at most ``max_bytes + 1`` bytes; the source size comes from metadata, never a full read.
+
+    With ``expect`` (an earlier ``lstat``), the open refuses to follow a final link where the OS supports
+    it, and the opened handle must still be that same regular file (a swap after the check is refused).
+    Returns ``(accepted_bytes, source_size, truncated)``.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    if expect is not None:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(path, flags), "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if expect is not None:
+            if not stat.S_ISREG(info.st_mode):
+                raise _RejectedFile("is not a regular file")
+            if expect.st_ino and info.st_ino and (expect.st_ino, expect.st_dev) != (info.st_ino, info.st_dev):
+                raise _RejectedFile("changed while it was being opened")
+        data = handle.read(max_bytes + 1)
+    size = max(info.st_size, len(data))
+    return data[:max_bytes], size, size > max_bytes
+
+
+def _read_instructions(path: Path, real_root: Path, max_bytes: int) -> ProjectInstructions:
+    info = os.lstat(path)
+    if _is_link(info):
+        raise _RejectedFile("is a symbolic link, junction or reparse point")
+    if not stat.S_ISREG(info.st_mode):
+        raise _RejectedFile("is not a regular file")
+    if not path.resolve(strict=True).is_relative_to(real_root):
+        raise _RejectedFile("resolves outside the project")
+    accepted, size, truncated = _read_capped(path, max_bytes, expect=info)
+    text = accepted.decode("utf-8", "replace")
     if truncated:
         text += "\n[truncated]"
     return ProjectInstructions(
         name=safe_name(path.name),
         text=text.rstrip("\n"),
-        sha256=hashlib.sha256(raw).hexdigest(),
-        size=len(raw),
+        sha256=snapshot_digest(accepted, size),
+        size=size,
         truncated=truncated,
     )
 
@@ -168,18 +233,38 @@ def _read_instructions(path: Path, max_bytes: int) -> ProjectInstructions:
 def load_project_instructions(
     root: str | Path | None, *, max_bytes: int = MAX_INSTRUCTIONS_BYTES
 ) -> ProjectInstructions | None:
-    """First existing of AGENTS.md / NEDSTER.md in the project root, capped; None when absent/unreadable."""
+    """First usable of AGENTS.md / NEDSTER.md in the project root, capped; None when none exists.
+
+    A file that is a link/junction/reparse point, is not a regular file, or whose real path is outside
+    the resolved project root is never read: it is skipped, logged and reported in ``warning`` (startup
+    continues). When every candidate was skipped the result carries only the warning (not ``present``).
+    """
     if root is None:
         return None
-    directory = Path(root)
+    try:
+        real_root = Path(root).resolve(strict=True)
+    except OSError:
+        return None
+    warnings: list[str] = []
+    loaded: ProjectInstructions | None = None
     for name in PROJECT_INSTRUCTION_FILES:
-        candidate = directory / name
+        candidate = Path(root) / name
         try:
-            if candidate.is_file():
-                return _read_instructions(candidate, max_bytes)
+            os.lstat(candidate)
         except OSError:
-            return None
-    return None
+            continue  # absent
+        try:
+            loaded = _read_instructions(candidate, real_root, max_bytes)
+            break
+        except _RejectedFile as exc:
+            warnings.append(f"Skipped {name}: it {exc}; project instructions are never read through links.")
+        except OSError as exc:
+            warnings.append(f"Skipped {name}: it could not be read ({type(exc).__name__}).")
+    for message in warnings:
+        _log.warning("%s", message)
+    if not warnings:
+        return loaded
+    return replace(loaded or ProjectInstructions(), warning=" ".join(warnings))
 
 
 def session_instructions(store: Any, session_id: str, root: str | Path | None) -> ProjectInstructions:
@@ -203,7 +288,8 @@ class SoulText:
     """The user's ``soul.md`` snapshotted once per session in ``full`` mode.
 
     ``mode`` is the effective mode frozen for the session; ``text`` is what reaches the prompt (capped).
-    ``sha256``/``size`` describe the source file. The text is style only and cannot change permissions.
+    ``sha256`` (see :func:`snapshot_digest`) and ``size`` describe the source file. The text is style only
+    and cannot change permissions.
     """
 
     mode: str = "off"
@@ -267,18 +353,17 @@ def load_soul(path: str | Path | None = None, *, mode: str = "full", max_bytes: 
         return SoulText(mode=mode)
     target = Path(path) if path is not None else soul_path()
     try:
-        raw = target.read_bytes()
+        accepted, size, truncated = _read_capped(target, max_bytes)
     except OSError:
         return SoulText(mode=mode)
-    text = raw[:max_bytes].decode("utf-8", "replace")
-    truncated = len(raw) > max_bytes
+    text = accepted.decode("utf-8", "replace")
     if truncated:
         text += "\n[truncated]"
     return SoulText(
         mode=mode,
         text=text.rstrip("\n"),
-        sha256=hashlib.sha256(raw).hexdigest(),
-        size=len(raw),
+        sha256=snapshot_digest(accepted, size),
+        size=size,
         truncated=truncated,
     )
 

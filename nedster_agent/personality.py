@@ -19,6 +19,9 @@ LINES: dict[str, tuple[str, ...]] = {
         "Working on it. The code has opinions.",
         "On it. Keeping the commentary to a minimum.",
     ),
+    # Only "done_ok" may mention passing checks: it is shown solely for the test-backed "completed" outcome.
+    # Every other moment is evidence-neutral; deterministic acceptance/evidence rendering alone describes
+    # what was actually run.
     "done_ok": (
         "Tests passed. I'm as surprised as you.",
         "Done and verified. Enjoy it while it lasts.",
@@ -26,17 +29,22 @@ LINES: dict[str, tuple[str, ...]] = {
         "It works. Statistically speaking.",
         "All checks passed. Suspiciously smooth.",
     ),
+    "done_answered": (
+        "Answered. Citations are in the text, opinions are my own.",
+        "That's my answer. Weigh it like you would anyone's.",
+        "Done talking. The details are above.",
+    ),
     "done_unvalidated": (
-        "Changed files, ran nothing. Trust me? Neither would I.",
-        "Edits made, tests untouched. That's on the record.",
-        "I changed things. The tests are a rumour at this point.",
-        "Written, not verified. The suite is still asleep.",
+        "Changed things, verified nothing. Trust me? Neither would I.",
+        "Edits made, not verified. That's on the record.",
+        "I changed things. Verification is a rumour at this point.",
+        "Written, not verified. Read it before you trust it.",
     ),
     "done_failed": (
-        "That didn't work. My confidence was misplaced.",
-        "Failed. On the bright side, it failed honestly.",
-        "No luck. The code won this round.",
-        "Broken. Not the first time.",
+        "Didn't land. My confidence was misplaced.",
+        "Not done. On the bright side, it stopped honestly.",
+        "No luck this round.",
+        "Stopped short. Not the first time.",
     ),
     "idle": (
         "Idle. Nothing is on fire.",
@@ -45,6 +53,23 @@ LINES: dict[str, tuple[str, ...]] = {
         "Idle. No opinions pending.",
     ),
 }
+
+
+#: Turn outcome -> personality moment. Only the test-backed "completed" outcome maps to "done_ok".
+OUTCOME_MOMENTS: dict[str, str] = {
+    "completed": "done_ok",
+    "answered": "done_answered",
+    "no_change_needed": "done_answered",
+    "unvalidated": "done_unvalidated",
+    "incomplete": "done_failed",
+    "failed": "done_failed",
+    "cancelled": "done_failed",
+}
+
+
+def moment_for_outcome(outcome: str) -> str:
+    """The personality moment for a finished turn's outcome ("" when none applies)."""
+    return OUTCOME_MOMENTS.get(outcome, "")
 
 
 def lines(moment: str) -> tuple[str, ...]:

@@ -44,7 +44,9 @@ def test_truncates_at_cap_with_visible_note(tmp_path: Path) -> None:
     assert loaded is not None
     assert loaded.truncated and loaded.text.endswith("[truncated]")
     assert loaded.size == len(body)
-    assert loaded.sha256 == hashlib.sha256(body).hexdigest()
+    # truncated: digest over the accepted bytes plus the source size (see snapshot_digest)
+    expected = hashlib.sha256(body[:MAX_INSTRUCTIONS_BYTES] + b"\0source-size=%d" % len(body)).hexdigest()
+    assert loaded.sha256 == expected
 
 
 # --- prompt ------------------------------------------------------------------------------------

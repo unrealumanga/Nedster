@@ -288,7 +288,7 @@ def _config_show(args: argparse.Namespace) -> int:
             node = node[part]
         value = json.dumps(node) if not isinstance(node, str) else node
         print(f"{key} = {value}  [{provenance[key]}]")
-    if instructions is None:
+    if instructions is None or not instructions.present:
         print("project instructions: none (no AGENTS.md or NEDSTER.md in the project root)")
     else:
         note = " (truncated)" if instructions.truncated else ""
@@ -296,6 +296,8 @@ def _config_show(args: argparse.Namespace) -> int:
             f"project instructions: {instructions.name} "
             f"({instructions.size / 1024:.1f} KB, sha256 {instructions.sha256[:12]}){note}"
         )
+    if instructions is not None and instructions.warning:
+        print(f"# warning: {instructions.warning}")
     for warning in config.warnings:
         print(f"# warning: {warning}")
     return EXIT_OK
@@ -1362,10 +1364,18 @@ def _check_flags(args: argparse.Namespace) -> None:
     # --session / --continue are a mutually exclusive argparse group (exit 2 before dispatch).
 
 
+def _admits_interactive_ui(args: argparse.Namespace) -> bool:
+    """The one admission rule for every full-screen entry (`tui`, `resume`, bare launch).
+
+    Both stdin and stdout must be terminals, and no machine-output or no-TUI flag may be set.
+    """
+    if getattr(args, "json", False) or getattr(args, "plain", False) or getattr(args, "no_tui", False):
+        return False
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
 def _tui_or_help(args: argparse.Namespace) -> int:
-    machine = args.json or args.plain or args.no_tui
-    interactive_tui = not machine and sys.stdout.isatty()
-    if not interactive_tui:
+    if not _admits_interactive_ui(args):
         if args.command == "tui":
             _err(
                 "The TUI needs an interactive terminal. For piped output use: "
@@ -1376,7 +1386,7 @@ def _tui_or_help(args: argparse.Namespace) -> int:
         return EXIT_OK
     from .model_manager import state_dir
 
-    if args.command is None and not (state_dir() / "config.toml").exists() and sys.stdin.isatty():
+    if args.command is None and not (state_dir() / "config.toml").exists():
         setup_args = build_parser().parse_args(["--project", args.project, "setup"])
         if _setup(setup_args):
             return EXIT_RUNTIME
@@ -1394,7 +1404,7 @@ def _tui_or_help(args: argparse.Namespace) -> int:
 
 
 def _resume(args: argparse.Namespace) -> int:
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if not _admits_interactive_ui(args):
         _err('nedster resume needs an interactive terminal; for scripts use: nedster run --session <ref> "..."')
         return EXIT_USAGE
     from .tui import run_tui

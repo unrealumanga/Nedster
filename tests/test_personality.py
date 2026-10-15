@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from nedster_agent import personality
 
-MOMENTS = ("thinking", "done_ok", "done_unvalidated", "done_failed", "idle")
+MOMENTS = ("thinking", "done_ok", "done_answered", "done_unvalidated", "done_failed", "idle")
 
 
 def test_every_moment_has_lines_and_total_is_about_twenty():
@@ -12,7 +12,7 @@ def test_every_moment_has_lines_and_total_is_about_twenty():
         assert options, f"{moment} has no lines"
         assert all(line.strip() == line and line for line in options)
         total += len(options)
-    assert 18 <= total <= 24
+    assert 18 <= total <= 28
     assert personality.lines("nonsense") == ()
 
 
