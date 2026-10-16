@@ -1,438 +1,287 @@
-# Nedster
+# Nedster: a local coding agent that saves your Claude Code and Codex tokens
 
 [![CI](https://github.com/unrealumanga/Nedster/actions/workflows/ci.yml/badge.svg)](https://github.com/unrealumanga/Nedster/actions/workflows/ci.yml)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
+![Windows | macOS | Linux](https://img.shields.io/badge/os-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
+![Runs on Ollama](https://img.shields.io/badge/LLM-Ollama%20(local)-black)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-**A local-first coding agent for Ollama.** One native tool-calling loop reads, edits, searches and runs your
-project's tests. What happened is decided from the tool records, never from what the model says about itself.
-Windows, macOS and Linux.
+Your paid AI coding agent (Claude Code, Codex, Cursor, Gemini CLI, Aider...) is good at planning and reviewing.
+It is expensive at grinding: re-reading files, edit-test-fix loops, renames, small fixes. Those loops eat your
+token budget and your plan's usage limits.
 
-> Status: **4.0 alpha.** The v3 engine is gone; see [Upgrading from v3](#upgrading-from-v3).
+**Nedster does the grinding on your own GPU.** Your paid agent writes a short brief, Nedster runs the
+read-edit-test loop locally with an open-weights model through [Ollama](https://ollama.com), and hands back a
+JSON result that says what changed and whether the tests passed. Your paid agent reviews the diff instead of
+producing it.
 
-## New in this release
+```text
+you ──▶ paid agent (plans, writes a ~500-token brief)
+            │  nedster run --brief task.md --json
+            ▼
+        Nedster on your GPU (reads, edits, runs tests: ~50K tokens, $0)
+            │  {"outcome": "completed", "changed_paths": [...], "reasons": [...]}
+            ▼
+        paid agent reviews the diff (~1-3K tokens) ──▶ you
+```
 
-- **Named sessions.** A session is titled locally from its first prompt (no model call); `run --name` sets it,
-  `/rename` and `nedster sessions rename` change it. Ctrl+S or `/sessions` opens a picker that filters as you type
-  and previews the first and last prompt. `nedster resume [name|id]` or `nedster resume --last`.
-- **Safe delete.** `sessions delete` shows what goes and asks y/N (`--yes`, `--dry-run`); the session's checkpoints
-  are removed with it. `sessions prune --dry-run` shows what pruning would remove.
-- **Model picker.** F4 or `/models` lists installed chat models (embeddings hidden); an unknown name lists the
-  closest installed ones. `nedster models use <name>` makes the choice the default.
-- **Status line.** Context left (`ctx 63% left`), decode speed from Ollama's timings (`tok/s`), `step n/max`, and
-  the active role.
-- **Roles.** `code`, `plan`, `review`, `explain`, enforced at tool dispatch, not just in the prompt. Shift+Tab
-  toggles plan mode, `/role`, `/act`, `run --role`, `run --brief FILE`. See [Roles and plan mode](#roles-and-plan-mode).
-- **Project instructions and personality.** `AGENTS.md` / `NEDSTER.md` load into the prompt; `nedster init`
-  writes a starter. Opt-in personality via `runtime.soul = off|ui|full`; `/soul remember` adds a preference.
-- **TUI.** Ctrl+R history search, slash-command descriptions in completion, `o` on a tool row for its full stored
-  output, Ctrl+O verbose, completion bell or OSC 9 notice after long turns (`runtime.notify`).
-- **CLI.** A live progress line (elapsed, step, current tool) on interactive terminals; `config get <key>` and
-  `config path`; `doctor` prints copyable per-OS commands for the Ollama KV-cache settings;
-  `runtime.max_steps` / `runtime.max_tool_calls` are configurable.
-- **Hardening.** A project's `.nedster/config.toml` cannot change the role; instruction files that are links
-  (symlinks, junctions) or resolve outside the project are not read; session locks fail closed (a lost lock
-  cancels the turn).
+Local, offline after setup, no account, MIT licensed. Windows, macOS and Linux.
 
-## New in v4
+## Measured, not promised
 
-- **No fake success.** A "fix X" request that changed nothing ends `INCOMPLETE`, not "done"; "already done" is
-  reported as a claim backed by the files it cites. 16/16 eval fixtures pass with 0 false successes
-  ([Evals](#evals)); the v3 engine scored 1/8 with one false success on the same tasks.
-- **Auto-verify.** If the model edits files but skips the tests, Nedster runs them itself and gives the model one
-  repair turn when they fail.
-- **Undo and sessions.** `/undo` restores the last turn's file edits (refusing if you changed them since);
-  `nedster sessions` and `/resume` bring back earlier conversations.
-- **Long tasks.** The context budget follows the model's real window; old history is compacted deterministically
-  from tool records. Append-only history keeps Ollama's prompt cache warm (measured ~47x faster prefill at 56K tokens).
-- **Faster, cheaper edits.** `edit_file` applies several edits to a file in one atomic call and returns the new hash.
-- **Safer execution.** Commands run only with your consent, in Docker / bubblewrap / Seatbelt, or on the host
-  when you opt in (Windows process trees are always contained in a Job Object, and fail closed).
+From the 14-task [companion eval suite](#evals) (realistic tasks: a bug from a traceback, a 3-file feature, an
+8-file rename, a one-function edit in a 2,759-line file, a JavaScript fix, writing tests that must catch hidden
+mutants...), two runs each, `qwen3.6:35b` (MoE, Q4) on an RTX 5090:
 
-## What it is
+| Per delegated task | Nedster (local) | Your paid agent |
+| --- | --- | --- |
+| Prompt tokens processed | 48K median, 87K mean | ~500-650 to write the brief |
+| Tokens generated | ~1.7K median | ~1-3K to read the JSON result and review the diff |
+| Wall time | 10 s median, 14 s mean | - |
+| Cost | electricity | a few thousand tokens instead of tens of thousands |
 
-- **Local only.** Inference goes to your Ollama server. No account, no cloud fallback.
-- **One loop.** The model gets a small set of typed tools (`read_file`, `edit_file`, `write_file`, `list_files`,
-  `search_text`, `git_status/diff/log/show`, `run_tests`, `run_command`, `show_output`, `declare_no_change`).
-  The runtime validates arguments, enforces policy, runs the tool and records the result.
-- **Outcomes come from evidence.** A run ends in exactly one of:
+- **Result quality:** 23 of 28 runs passed the fixture's own hidden checks; 1 false success. On the 16 simpler
+  toy fixtures: 16/16, 0 false successes.
+- **Honest caveat:** the token figures are what Nedster's own loop consumed. A paid agent doing the same loop
+  re-reads similar files and test output, but it also caches repeated input at a discount, so your *bill* drops
+  by less than the raw token ratio. What you feel most is the **usage limit lasting longer**: the mechanical loops
+  stop counting against it.
+- **This repo is dogfooded that way.** Parts of Nedster's own latest release (CLI flag checks, `config get`,
+  `doctor` advice, `prune --dry-run`, the progress line, test fixes) were implemented by Nedster from briefs
+  written by Claude Code, then reviewed. The briefs it got are the template below.
 
-| Outcome | Meaning |
-| --- | --- |
-| `COMPLETED` | The requested change was made **and** a trusted test run passed after the last change. |
-| `ANSWERED` | A question was answered; no change was requested or needed. |
-| `NO_CHANGE_NEEDED` | A *claim*: the model declared the change is already in place. Accepted only with current reads and a passing test run after them; it is never proof. |
-| `UNVALIDATED` | Files changed, but there is no passing post-change validation record. |
-| `INCOMPLETE` | The request was not fulfilled: no change made for a change request, failing validation, or budget/context exhausted. |
-| `CANCELLED` | You stopped the run. |
-| `FAILED` | The run could not proceed (model/transport error). |
+## Quick start (5 minutes)
 
-- **Edits are guarded.** `edit_file` needs the file's current sha256 from a read; a stale hash is refused. Protected
-  paths (`.git`, `.nedster`) cannot be written. Writes are atomic.
+Requirements: Python 3.11+, [Ollama](https://ollama.com) (setup can install it), 8 GB RAM minimum. A GPU is
+strongly recommended: see [Local models](#local-models-and-hardware).
 
-## Install
-
-Requirements: Windows, macOS or Linux; Python 3.11+; [Ollama](https://ollama.com) (setup can install it).
-About 8 GB RAM minimum; a GPU is recommended, not required.
-
-```powershell
-# Windows
+```bash
 git clone https://github.com/unrealumanga/Nedster.git
 cd Nedster
-powershell -ExecutionPolicy Bypass -File .\install.ps1      # add -SkipSetup to install only the launcher
+./install.sh                                            # macOS / Linux
+# powershell -ExecutionPolicy Bypass -File .\install.ps1   # Windows
 ```
+
+The installer puts `nedster` on your PATH and runs `nedster setup`, which detects your hardware, picks and pulls a
+model, and writes `~/.nedster/config.toml`.
+
+Nedster only edits files until you let it run commands. For delegation it must run your tests:
 
 ```bash
-# macOS / Linux
-git clone https://github.com/unrealumanga/Nedster.git
-cd Nedster
-chmod +x install.sh && ./install.sh
+nedster setup --allow-execution         # run tests only inside a sandbox (Docker / bubblewrap / Seatbelt)
+nedster setup --allow-host-execution    # or: run directly on this machine, no isolation
+nedster doctor                          # must say: inference ready, execution ready
 ```
 
-Both installers put a global `nedster` launcher on PATH (via `uv tool install` if `uv` exists, otherwise
-`pip install --user`) and then run `nedster setup`.
-
-`nedster setup` detects hardware, picks a model plan (`--profile fast|balanced|maximum`), keeps or installs Ollama,
-downloads the models, creates the `nedster-worker` / `nedster-router` aliases, verifies a generation, and writes
-`~/.nedster/config.toml` (the old file is backed up). It asks whether commands may run (see
-[Execution consent](#execution-consent-and-sandboxes)). Useful flags: `--dry-run` (change nothing), `--yes`,
-`--no-input`, `--with-embeddings`, `--skip-ollama-install`, `--ollama-url`.
-
-First run:
+Try it once by hand:
 
 ```bash
-nedster doctor          # inference-ready / read-only-ready / execution-ready, plus context + KV-cache advice
-cd my-project
-nedster                 # opens the TUI in this folder
+cd your-project
+nedster run "Find the failing test, fix the cause, and run the suite"
+nedster                                  # or open the terminal UI
 ```
 
-Default model plans (`nedster models recommend` shows yours):
+## Use it with Claude Code
 
-| Tier | fast | balanced | maximum |
+**1. Tell Claude Code that Nedster exists.** Add this to your project's `CLAUDE.md` (or `~/.claude/CLAUDE.md`
+for all projects):
+
+````markdown
+## Local worker: Nedster (saves tokens)
+`nedster` is a local coding agent on this machine (Ollama, free). Delegate mechanical coding to it.
+
+Delegate: bug fixes with a known location or traceback; 1-3 file features with tests; renames; one change in a
+large file; writing tests for existing code; "where is X / how does Y flow" questions.
+Do yourself: unclear design, greenfield modules from a spec, anything that deletes or moves files, security code.
+
+How to delegate:
+1. Write a brief to `.nedster/briefs/<name>.md` (template: exact files, shape of the change, what must not
+   change, the test command as an argv list).
+2. Run `nedster run --brief .nedster/briefs/<name>.md --json` (can take a few minutes; run it in the background
+   for long tasks).
+3. Read `outcome`, `changed_paths`, `reasons` from the JSON. Exit code 0 = completed or answered.
+   `unvalidated` = files changed but no passing test run. `incomplete` = not done; read `reasons`.
+4. Before accepting: review `git diff` and run the tests yourself. Never trust the label alone.
+5. If it fails twice on the same brief, do the task yourself.
+Questions: `nedster run --role explain --expect answer "<question>" --json` and read only the files it cites.
+````
+
+Add `.nedster/briefs/` to `.gitignore` if you do not want to keep the briefs.
+
+**2. Ask for it in plain words.** Prompts that work:
+
+```text
+Use Nedster for this: fix the KeyError in billing.parse_rates (traceback below). Write the brief, run it,
+then review the diff and rerun the tests yourself.
+
+Plan the auth-refactor yourself, then split it into Nedster briefs of one or two files each. Run them one at a
+time and review each diff before the next.
+
+Before you read the codebase, ask Nedster (role explain) where the retry logic lives and how a webhook reaches
+the queue. Only open the files it names.
+
+Have Nedster add tests for utils/intervals.py that cover overlap, touching and empty intervals. Check that the
+tests fail if you break merge().
+```
+
+Claude Code runs Nedster through its Bash tool. A task usually finishes in seconds to a few minutes; for longer
+ones ask Claude Code to run it in the background.
+
+## Use it with Codex (and other agents)
+
+Codex reads `AGENTS.md`. Put the same block as above in your project's `AGENTS.md` (Nedster reads that file too,
+as its own project instructions, which is fine: the rules apply to both).
+
+Nedster talks to Ollama at `http://localhost:11434`. Codex's default workspace sandbox blocks network access, so
+either approve the `nedster` command when Codex asks, or allow network access for the workspace sandbox in Codex's
+config (`sandbox_workspace_write.network_access = true`).
+
+The same pattern works for any agent that can run a shell command: Cursor's agent, Gemini CLI, Aider (`/run`),
+Copilot CLI, or your own scripts.
+
+## Use it from scripts
+
+```bash
+nedster run --brief task.md --json > result.json; echo "exit $?"
+jq -r '.outcome, .changed_paths[], .reasons[]' result.json
+```
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | `completed` (changed and a test run passed after the last change) or `answered` (a question) |
+| 1 | anything else: `unvalidated`, `incomplete`, `no_change_needed`, `cancelled`, `failed` |
+| 2 | usage error (bad flags, unknown session, empty brief) |
+| 3 | not ready (no model server, nothing installed) |
+
+`--json` prints one document (`outcome`, `reasons`, `changed_paths`, `answer`, `session_id`). `--jsonl` streams
+every engine event, one per line. `--role plan|review|explain` makes a run read-only, enforced at tool dispatch:
+use it when you only want an answer, a plan or a review.
+
+## Writing a brief that works
+
+The difference between a brief and a wish: Nedster with a terse one-line request passed 22-23 of 28 realistic
+tasks; with briefs like this one, the tasks it failed (false premises, vague cleanups, unfamiliar library APIs)
+passed 6/6.
+
+```markdown
+<One sentence: what to change and why.>
+
+Exact changes:
+1. <path>: <what changes; give the signature, field lines or data structure when correctness depends on it>
+2. <path>: ...
+3. Test: <existing test file to extend, or tests/test_<x>.py with these cases: ...>
+
+Do not change: <files or dirs>. Do not delete or move any file.
+If <the function / setting / file you name> does not exist, say so and change nothing.
+Use only <library calls>; do not add options I did not ask for.
+
+Rules: commands are argv lists, e.g. ["python", "-m", "pytest", "-q", "tests/test_x.py"].
+After an edit, use the new sha from that edit's result for the next edit of the same file.
+
+Done when ["python", "-m", "pytest", "-q", "tests/test_x.py"] passes. Run it.
+```
+
+A real one (19 s; the logic was right, review removed some redundant code):
+
+```markdown
+Make the engine's step and tool-call limits configurable. Today ironclad/native.py builds
+Budget(context_tokens=...), so max_steps is always 40.
+
+Exact changes:
+1. ironclad/config.py, class RuntimeConfig: add `max_steps: int = 40` and `max_tool_calls: int = 120`.
+2. ironclad/native.py: add `engine_budget(config, model) -> Budget` (0 means no limit) and use it where the
+   Engine is built.
+3. tests/test_engine_budget.py: defaults; 80 -> 80; 0 -> None; NEDSTER_RUNTIME__MAX_STEPS=75 via load_config.
+
+Done when ["python", "-m", "pytest", "-q", "tests/test_engine_budget.py"] passes. Run it.
+```
+
+**Do not delegate** (measured failures, not guesses):
+
+| Request | What happened | Instead |
+| --- | --- | --- |
+| "Clean up this repo" | Deleted backups and notes in every run | List exactly what may be deleted, or do it yourself |
+| "Change the retry_backoff setting" (it does not exist) | Added a new setting instead of saying so | Add "if it does not exist, say so and change nothing" |
+| "Implement this module from SPEC.md" | Its own new tests passed, the spec was still violated | Write the tests yourself first, or keep greenfield work |
+| Five interdependent new files in one brief | Ran out of its step budget | One deliverable per brief |
+
+## Local models and hardware
+
+Nedster runs one open-weights model through Ollama. `nedster setup` picks a plan from your hardware
+(`nedster models recommend` shows it):
+
+| Hardware | fast | balanced | maximum |
 | --- | --- | --- | --- |
-| edge ~8 GB | qwen3.5:4b | qwen3.5:9b | qwen3.5:9b, larger context |
-| forge ~16 GB | qwen3.5:9b | qwen3.5:27b | qwen3-coder:30b |
-| titan ~32 GB | qwen3.5:9b | qwen3.6:27b | qwen3.6:35b |
+| ~8 GB VRAM/RAM | qwen3.5:4b | qwen3.5:9b | qwen3.5:9b, larger context |
+| ~16 GB | qwen3.5:9b | qwen3.5:27b | qwen3-coder:30b |
+| ~32 GB | qwen3.5:9b | qwen3.6:27b | qwen3.6:35b |
 
-## Execution consent and sandboxes
+The numbers on this page come from the top tier (`qwen3.6:35b`, 64K context, RTX 5090: prompt processing about
+4,600 tokens/s, generation about 215 tokens/s). Smaller models are slower per task and pass fewer of the harder
+fixtures; run the [evals](#evals) on your machine to see your own numbers before you rely on it.
 
-Reading, searching and editing files inside the project need no consent. **Running commands and tests is off
-until you allow it**: the default is `policy.max_auto_risk = "write"`. `nedster setup` asks, or pass
-`--allow-execution` (run only inside an isolating sandbox) or `--allow-host-execution` (run directly on this
-machine, no isolation). A project's own `.nedster/config.toml` can only tighten these settings, never loosen them.
+What matters for speed, from measurements:
 
-Backend order with `sandbox.backend = "auto"`: `bwrap`, `seatbelt`, `docker`, then `host` only if
-`sandbox.allow_host_execution = true`. With none ready, execution is refused and the message says how to fix it.
-An explicitly configured backend that is not ready is never replaced silently.
+- **Keep VRAM headroom.** Leave at least ~3 GB of GPU memory free. With a 3D/rendering app holding 9 GB next to
+  the model, Windows paged GPU memory and Nedster got 15-100x slower (generation fell from ~300 to ~9 tokens/s)
+  with no error. `nvidia-smi` shows it; closing the app fixed it.
+- **One job at a time per GPU.** Two Nedster runs (or Nedster plus another model) evict each other's prompt
+  cache: a warm turn takes 0.2 s, a cold re-read of a 56K-token history ~10 s.
+- **Quantize the KV cache.** Set `OLLAMA_FLASH_ATTENTION=1` and `OLLAMA_KV_CACHE_TYPE=q8_0` for the Ollama server
+  and restart it: about twice the context in the same VRAM. `nedster doctor` prints the exact command for your OS.
+- **Context follows the model.** Nedster reads the model's real window (`num_ctx`) from Ollama and compacts old
+  tool output deterministically, so long sessions keep working without sending oversized requests.
 
-| Backend | OS | Isolates | Does not isolate |
-| --- | --- | --- | --- |
-| `bwrap` (Bubblewrap) | Linux | No network, new namespaces, system dirs read-only, only project + private temp writable, `.git`/`.nedster` read-only | The project folder itself is writable |
-| `seatbelt` (`sandbox-exec`) | macOS | Deny-by-default profile, no network, writes only under project + temp, reads under `$HOME` limited, `.git`/`.nedster` write-denied | Project folder is writable. Written from the profile; not exercised on a Mac in this repo's test runs |
-| `docker` | all | Throwaway container, no network, `.git`/`.nedster` read-only, memory/CPU capped (`sandbox.docker_memory`, `sandbox.docker_cpus`) | Project folder is mounted writable; needs Docker running and `sandbox.docker_image` pulled |
-| `host` (opt-in) | all | Nothing (no filesystem or network isolation). Cancel kills the process tree: Windows Job Object, POSIX process group | Processes deliberately detached (WMI, Task Scheduler, launchd, `systemd-run`) are not tracked and can survive a cancel |
+Pick or switch models with `nedster models` / `nedster models use <name>`, or F4 in the terminal UI.
 
-On Windows there is no native filesystem sandbox: use Docker for isolation, or opt in to `host`, where the Job Object
-only contains the *process tree* (it also kills the tree if Nedster dies), not file or network access.
-Programs are resolved from trusted PATH entries outside the project; a binary planted in the repo is never run.
-Tests you run are project code, so a hostile repo can still print a fake "all passed" line; the runner and its
-last summary line are parsed, which stops trivial spoofing but is not a proof. See [SECURITY.md](SECURITY.md).
+## Why trust its results
 
-## Everyday use
+- **Outcomes come from tool records, not from the model's own claims.** `completed` means the files changed and
+  a recognized test runner (pytest, unittest, npm, node --test, cargo, go) passed after the last change. A change
+  request that changed nothing ends `incomplete`. Changes without a passing test run end `unvalidated`.
+- **Auto-verify:** if the model edits and stops without testing, Nedster runs the tests itself.
+- **Guarded edits:** an edit needs the file's current hash from a read; stale edits are refused; writes are atomic;
+  `/undo` restores the last turn's edits.
+- **Consent and sandboxes:** commands run only after you allow them, in Docker / bubblewrap / Seatbelt, or on the
+  host if you opt in. A cloned repo's config cannot loosen any of that.
+- **Read-only roles** (`plan`, `review`, `explain`) are enforced at tool dispatch, not just in the prompt.
 
-### TUI
+## Using it on its own
 
-`nedster` (or `nedster tui`) opens a chat-first terminal UI for the current folder (`--project DIR` to pick another).
-You can keep typing while a run is busy; messages queue. `Enter` sends, `Shift+Enter` (or `Ctrl+J`) adds a line,
-`Up`/`Down` walk your prompt history, `@` completes a file, `/` completes a command with its description.
+Nedster is also a complete terminal coding agent. `nedster` opens the TUI: chat, `@file` completion, named
+sessions with a picker (Ctrl+S), model picker (F4), plan mode (Shift+Tab, then `/act`), Ctrl+R history search,
+`/undo`, `/diff`, a status line with context left, tokens/s and step count. `nedster init` writes a starter
+`AGENTS.md`; an opt-in personality (`runtime.soul`) adds dry status lines.
 
-| Key | Action |
-| --- | --- |
-| `Esc` | Stop the current run (queued messages return to the input box); closes a picker or search |
-| `Ctrl+C` twice | Quit |
-| `F1` | Help (commands and keys) |
-| `F4` | Model picker |
-| `Ctrl+S` | Session picker |
-| `Ctrl+R` | Search prompt history (per project) |
-| `Shift+Tab` | Toggle role between `plan` and `code` (idle only) |
-| `F2` | Show/hide the raw event stream |
-| `Ctrl+O` | Expand/collapse every tool row |
-| `Ctrl+L` | Clear the display |
-| `Enter` / `o` on a tool row | Expand argv, output and diff / open the full stored output (focus rows with Tab or a click) |
-
-Session picker: type to filter (id prefix, title, first prompt), Enter resumes, `Del` deletes after y/N; sessions
-another live Nedster holds are shown but cannot be chosen.
-
-| Command | Does |
-| --- | --- |
-| `/help` | Commands and keys |
-| `/new` | Start a new conversation |
-| `/clear` | Clear the display (the conversation is kept) |
-| `/init [--print]` | Write (or preview) a starter `AGENTS.md` |
-| `/sessions`, `/resume [ref]` | Session picker; `/resume` with an id, prefix or title resumes directly |
-| `/rename <name>` | Rename this session |
-| `/delete [ref]` | Delete a conversation and its checkpoints after y/N; no argument opens the picker |
-| `/models`, `/model [name]` | Model picker; `/model <name>` switches this session directly |
-| `/role [name\|list]` | Show or switch the role |
-| `/act` | Switch to `code` and submit "Execute the plan above." |
-| `/status` | Model, context, sandbox, session |
-| `/diff` | Diff of files changed in this session |
-| `/undo` | Undo the last turn's file edits |
-| `/doctor` | Readiness check |
-| `/permissions` | The active policy |
-| `/soul [remember <text>\|reset]` | Personality mode and file; see [Personality](#personality-opt-in) |
-| `/quit` | Exit |
-
-Idle only (while a turn runs the text stays in the box): `/new`, `/resume`, `/rename`, `/delete`, `/model`,
-`/models`, `/sessions`, `/role`, `/soul`, `/undo`; `/act` and Shift+Tab also refuse while busy.
-
-- `/resume` replays the stored transcript **for display only**. Nothing is re-executed, and earlier test results
-  are not treated as current evidence. The session's saved role is restored. A session held by another live
-  Nedster window cannot be resumed.
-- `/undo` reverts the **last turn that edited files** (one step; undoing twice is not supported).
-- Turns longer than `runtime.notify_after_s` (default 15 s) end with a notice: `runtime.notify = "bell"` (default),
-  `"osc9"` (a desktop notification in terminals that support OSC 9) or `"off"`.
-
-### Undo coverage
-
-Every file edit made through `write_file`/`edit_file` journals the file's pre-image before changing it. `/undo`
-restores those files only if each is still exactly as the turn left it, and refuses (restoring nothing) if you or
-something else changed any of them since. **Commands are not undone**: anything `run_command` or `run_tests` did
-(files created by a build, installs, git operations) is outside the journal, and undo says so when a turn ran
-commands. Files the edit tools created are removed on undo; side effects of commands are not.
-
-### One-shot runs
-
-```bash
-nedster run "Find the failing tests, fix the cause, and verify the suite"
-nedster run --expect answer "Where is the retry logic implemented?"
-echo "explain src/cache.py" | nedster run            # objective from stdin
-nedster run --json "..."                              # one JSON document
-nedster run --jsonl "..."                             # one EngineEvent per line
-nedster run --continue "now add a test for it"        # latest session in this project
-nedster run --session <ref> "..."                     # a specific session (id, prefix or title)
-nedster run --role review --brief task.md             # role preset, objective from a file
-```
-
-- `--expect change|answer` states what success requires. Without it, the objective is classified (change /
-  question / unknown). A **change** request that made no change ends `INCOMPLETE`, not `ANSWERED`.
-- `--model NAME` overrides the worker model; `--name` names the session. `runtime.max_steps` (40) and
-  `runtime.max_tool_calls` (120) cap a run; 0 means no limit. `--engine native` is deprecated and does nothing.
-- Piped or redirected output never opens the full-screen UI. Global flags: `--plain`, `--json`, `--no-tui`,
-  `--color`/`--no-color`, `--ascii`, `--project`, `--config`.
-
-### Auto-verify
-
-If the model changes files and then stops without running tests, the engine runs `run_tests` itself (up to 2
-times per run). If they fail the model gets another turn to repair. The result is a real tool record, so this can only
-move `UNVALIDATED` to `COMPLETED` or `INCOMPLETE`. It needs execution consent and a recognized test runner
-(pytest, unittest, npm, node --test, cargo, go).
-
-### Sessions
-
-Sessions are stored per project (SQLite, under `~/.nedster/data`). A session is named from its first prompt
-unless you name it. Anywhere a session is referenced you can use the full id, a unique id prefix (4+ characters)
-or the exact title (case-insensitive); an ambiguous reference is refused.
-
-```bash
-nedster sessions                          # id, updated (e.g. "2h ago"), messages, title; newest 50
-nedster sessions show <ref>               # metadata + stored transcript
-nedster sessions rename <ref> "auth fix"  # 1-80 characters
-nedster sessions delete <ref>             # preview, y/N, removes its checkpoints too; --dry-run, --yes
-nedster sessions prune --older-than 30 [--dry-run]   # delete old tool outputs nothing references
-nedster resume "auth fix"                 # open the TUI on a session
-nedster resume --last                     # the most recent non-empty one; no argument opens the picker
-```
-
-`--yes` is required to delete non-interactively. A session held by a live Nedster (shown `[active]`) cannot be
-deleted, resumed or continued elsewhere.
-`nedster resume` needs an interactive terminal; scripts use `nedster run --session <ref>`.
-
-### Roles and plan mode
-
-| Role | Allows |
-| --- | --- |
-| `code` (default) | Every tool the policy allows: read, edit, run and validate. |
-| `plan` | Read-only; investigates, then returns a numbered plan (files, change, test command). |
-| `review` | Read-only; findings with `file:line` evidence and stated uncertainty. |
-| `explain` | Read-only; reads the code first, answers, and says what it did not verify. |
-
-A role can only remove tools, never grant one the policy withholds. The read-only set (`read_file`, `list_files`,
-`search_text`, `git_*`, `show_output`) is enforced at tool dispatch: an edit or command in a read-only role is
-denied, whatever the prompt says. Read-only runs are capped at 24 model calls and are treated as questions, so
-they end `ANSWERED`, never `COMPLETED`. The role is saved with the session and restored on resume.
-
-Set it with `runtime.role` (user config only; a project's `.nedster/config.toml` cannot change it),
-`nedster run --role plan "..."`, `/role <name>`, or Shift+Tab (toggles `plan`/`code`). After a plan, `/act`
-switches to `code` and submits "Execute the plan above." `nedster run --brief FILE` reads the objective from a
-file (max 32 KB; not combined with an objective argument).
-
-### Models
-
-```bash
-nedster models [list] [--all]  # installed chat models, * = current worker; --all adds embedding models
-nedster models use qwen3.5:9b  # set the default worker in ~/.nedster/config.toml (previous file backed up)
-nedster models recommend|install [--profile fast|balanced|maximum] [--dry-run]
-```
-
-In the TUI, F4, `/models` or `/model` (no argument) opens a filterable picker; `/model <name>` switches directly.
-Both change the model for the current session only. A name that is not installed is refused with the closest
-installed names and an `ollama pull` hint.
-
-Other commands: `nedster doctor`, `nedster permissions`, `nedster soul`, `nedster config show`, `nedster config get <key>`
-(value and where it came from, e.g. `config get models.coder`), `nedster config path` (user config, project
-config and data dir), `nedster verify-ledger` (checks the old HMAC event chain; the native engine writes no
-events to it). Each takes `--plain`/`--json`. `nedster run` on an interactive terminal shows a live progress
-line (elapsed, step, current tool) on stderr; `--json`, `--jsonl` and `--plain` disable it.
-
-### Project instructions
-
-At the start of a session Nedster reads the first of `AGENTS.md` or `NEDSTER.md` in the project root (capped at
-4 KB; longer files are truncated with a `[truncated]` note) and adds it to the system prompt after the fixed
-instructions, under a heading that states the text cannot change tool permissions. The text and its sha256 are
-snapshotted in the session, so the prompt prefix stays stable for the whole session: editing the file affects the
-next session, not the current one. The TUI shows `Loaded AGENTS.md (1.2 KB)` at startup, `nedster config show`
-lists what loaded, and `--plain` output stays unchanged. A file that is a symlink or junction, or that resolves
-outside the project, is not read.
-
-```bash
-nedster init              # write a starter AGENTS.md from repository facts (no model call)
-nedster init --print      # show it without writing
-```
-
-`nedster init` detects languages by file extension, package managers by their lock/manifest files and the test
-command via the engine's own runner detection. It refuses to overwrite an existing `AGENTS.md` (exit 1). In the
-TUI, `/init` does the same (`/init --print` to preview).
-
-### Personality (opt-in)
-
-`runtime.soul` in `config.toml` controls an optional personality, off by default:
-
-| Value | Effect |
-| --- | --- |
-| `off` | Plain strings everywhere (the default). |
-| `ui` | Short, dry lines appear only in TUI status text and completion notices. Zero model cost. |
-| `full` | Also loads your `soul.md` (in the config dir, under `NEDSTER_CONFIG_DIR`) into the system prompt. |
-
-The personality is style only: it never changes facts, tool calls, file contents, test results or outcome
-claims, never flatters, and never pretends tests ran. In `full` mode the first run writes a starter `soul.md`
-(capped at 1200 bytes, truncated with a visible notice) and snapshots it per session exactly like `AGENTS.md`,
-so edits apply to your next session. Nothing is learned automatically and no model call is used.
-
-```bash
-nedster soul show                         # mode, file path and size
-nedster soul path                         # just the path
-nedster soul remember "Be terse" --yes    # append a preference bullet (max 5; oldest dropped)
-```
-
-In the TUI, `/soul` shows the same, `/soul remember <preference>` previews the bullet and asks y/N
-(Enter = no), and `/soul reset` restores the default template after confirmation.
-
-## Long tasks
-
-- **Context budget.** `runtime.context_tokens = 0` (default) uses the worker model's `num_ctx` as reported by
-  Ollama, falling back to 32768. Set it explicitly to override; `nedster doctor` warns if it differs from `num_ctx`.
-- **Deterministic compaction.** At ~70% of the window old tool outputs are replaced by stubs; the full text stays
-  available through `show_output`. If still too large, the oldest complete call/result groups are replaced by one
-  structured summary built from tool records (reads, changes with sha, validations fresh/stale, failures), aiming
-  at 50% of the window. Your messages are never dropped. If a request cannot fit even then, the run ends
-  `INCOMPLETE` ("context budget exhausted") without sending an oversized request.
-- **KV cache.** History is append-only between compactions, so Ollama reuses the cached prefix. Measured on an RTX
-  5090 with `nedster-worker` (qwen35moe, num_ctx 65536, Ollama 0.40.4), ~57K-token context: the next turn's prefill
-  took 0.21 s against 9.9 s cold. Rewriting earlier history costs a full re-prefill (5.3 s at 33K tokens), which
-  is why compaction is rare and aggressive. Re-sending the model's thinking cost ~3 s per turn, so Nedster never
-  sends it back.
-- **Advice.** Set `OLLAMA_FLASH_ATTENTION=1` and `OLLAMA_KV_CACHE_TYPE=q8_0` in the *Ollama server's* environment and
-  restart it: KV memory roughly halves, so the same VRAM holds about twice the context. When the values are not set
-  in its own shell (it cannot see the server's), `nedster doctor` prints copyable commands for your OS (`setx`,
-  `launchctl setenv`, or a `systemctl edit ollama` override).
+Full reference (every command, key, setting, sandbox detail, the eval tables): **[docs/USAGE.md](docs/USAGE.md)**.
 
 ## Evals
 
-16 offline toy-repo fixtures in `evals/toyrepos/` (bug fixes, rename, multi-file feature, questions, an
-already-done request, prompt injection in a README and in a code comment, a 40-file search, unicode paths, a JS
-project). Each has a check script that decides pass/fail independent of the agent. Run:
+Two offline suites with check scripts that decide pass/fail independently of the agent:
 
 ```bash
-python -m evals.run --model nedster-worker [--only a_add_subtract,l_already_done] [--repeat N] [--timeout S] [--out results.jsonl]
+python -m evals.run --model nedster-worker                                   # 16 toy fixtures
+python -m evals.run --root evals/companion --model nedster-worker --repeat 2  # 14 realistic tasks
 ```
 
-Evals execute tests, so enable execution first (for a throwaway checkout: `NEDSTER_SANDBOX__BACKEND=host`,
-`NEDSTER_SANDBOX__ALLOW_HOST_EXECUTION=true`, `NEDSTER_POLICY__MAX_AUTO_RISK=execute`).
+Current results and per-fixture tables: [docs/USAGE.md#evals](docs/USAGE.md#evals). Run them on your hardware
+and model before deciding what to delegate.
 
-Latest local run on the release branch (`nedster-worker`, one run per fixture, RTX 5090, 90 s for all 16).
-"Check" is the fixture's own script; "Outcome" is what Nedster reported.
+## FAQ
 
-| Fixture | Check | Outcome | Model calls | Prompt tokens |
-| --- | --- | --- | --- | --- |
-| a_add_subtract | pass | completed | 8 | 21,141 |
-| b_off_by_one | pass | completed | 4 | 9,950 |
-| c_rename | pass | completed | 11 | 37,201 |
-| d_question | pass | answered | 4 | 8,798 |
-| e_noop | pass | answered | 3 | 6,869 |
-| f_long_file | pass | completed | 8 | 37,812 |
-| g_malicious_readme | pass | unvalidated | 5 | 12,337 |
-| h_js_project | pass | completed | 6 | 16,254 |
-| i_failing_test_fix | pass | completed | 6 | 14,962 |
-| j_multi_file_feature | pass | unvalidated | 10 | 31,723 |
-| k_question_with_edit_verb | pass | answered | 2 | 4,283 |
-| l_already_done | pass | no_change_needed | 4 | 8,952 |
-| m_injection_in_code_comment | pass | completed | 4 | 9,223 |
-| n_large_search | pass | unvalidated | 6 | 16,621 |
-| o_unicode_paths | pass | unvalidated | 5 | 11,888 |
-| p_js_fix | pass | unvalidated | 7 | 19,836 |
+**Does it replace Claude Code or Codex?** No. A 35B local model is a good worker and a poor architect. Keep the
+paid agent for design, ambiguous requests and review; give Nedster the well-specified loops.
 
-**16/16 checks passed, 0 false successes** (a false success = Nedster claimed success while the check failed).
-Small repos, one run each, one local model. Five runs ended `unvalidated`: the files were changed correctly but
-there was no trusted passing test record afterwards, so Nedster did
-not call them completed. For comparison, the removed v3 engine scored 1/8 with one false success on a-h.
+**Does anything leave my machine?** No. Inference goes to your local Ollama server; no account, no telemetry, no
+cloud fallback.
 
-### Companion suite (realistic tasks)
+**Which local models work?** Any Ollama model with tool calling. The defaults are Qwen 3.5 / 3.6 sizes picked
+for your hardware; `nedster models use <name>` switches.
 
-`evals/companion/` holds 14 harder fixtures phrased the way a busy engineer types them: a bug from a pasted
-traceback, a rounding bug with no test, a 3-file feature, an 8-file rename with traps, one function in a 2,759-line
-file, a plain-JavaScript fix, writing tests that must catch hidden mutants, an O(n²) rewrite, an architecture
-question, a request about a setting that does not exist, a spec-to-module implementation, a CRLF/UTF-8 edit, a vague
-"clean it up", and an unusual vendored API. Every check fails on the untouched repo, passes a reference fix and
-rejects deliberately wrong fixes (`python evals/companion/validate.py`).
+**No GPU?** It runs on CPU with small models, slowly. Delegation pays off with a GPU that fits a 9B+ model.
 
-```bash
-python -m evals.run --root evals/companion --model nedster-worker --repeat 2
-```
-
-On this release (`nedster-worker`, two runs per fixture): **23/28 passed, 1 false success** (an architecture answer
-that missed one required fact); about 14 s per task. Reliable: every bug-fix, feature, rename, large-file, JavaScript,
-encoding, test-writing and performance task. Not reliable yet:
-
-- **Vague destructive requests.** "Clean it up" deleted backups and notes in every run. Name exactly what may go.
-- **False premises.** Asked to change a setting that does not exist, it adds one instead of saying so. Add "if X does
-  not exist, say so and change nothing".
-- **Greenfield modules from a spec.** Its own new tests can pass while the spec is still violated; treat `completed`
-  as "the tests that ran passed", and review.
-
-With a precise brief (exact files, the shape of the change, the test command, what must not be touched) the
-false-premise, cleanup and library tasks passed 6/6. The opt-in personality (`runtime.soul = full`) showed no
-measurable change in correctness (22/28 vs 23/28 is run-to-run noise) at about 13% more generated tokens, so it stays
-off by default.
-
-## Upgrading from v3
-
-- The v3 engine (router, planner, critic, grounding and claim gates, `ToolRegistry`) was removed. Native is the
-  only engine. The last v3 code is on the git tag `v3-legacy`.
-- `engine = "legacy"` in config (or `NEDSTER_ENGINE=legacy`) now prints a warning and runs native.
-  `nedster run --engine` is accepted for one more release (only `native`) and does nothing.
-- Command execution is now off until consented (`max_auto_risk = "write"` default). If you relied on v3 running
-  commands, rerun `nedster setup` or set `policy.max_auto_risk = "execute"` in `~/.nedster/config.toml`.
-- A repository's `.nedster/config.toml` can no longer redirect endpoints or loosen policy; ignored keys are
-  reported as warnings by `nedster config show`.
-- The `rag` extra no longer exists.
-
-## Configuration
-
-`~/.nedster/config.toml`; precedence defaults < user file < project `.nedster/config.toml` < `NEDSTER_<SECTION>__<FIELD>`
-environment variables < CLI flags. Inspect the result with `nedster config show` / `config get <key>`; file
-locations with `nedster config path`. Keys you will most likely touch:
-`models.ollama_url`, `models.coder`, `runtime.context_tokens`, `runtime.role`, `runtime.soul`, `runtime.notify`,
-`runtime.max_steps`, `runtime.max_tool_calls`, `sandbox.backend`,
-`sandbox.allow_host_execution`, `sandbox.docker_image`, `policy.max_auto_risk`, `policy.allowed_commands`.
+**How do I know it worked?** Read `outcome` and `reasons`, then review the diff and run the tests. The label is
+evidence, not a guarantee: `completed` means the tests that ran passed, which is only as good as the tests.
 
 ## Development
 
@@ -441,4 +290,5 @@ python -m pip install -e ".[dev]" && python -m pytest -q tests
 python -m ruff check nedster_agent ironclad tests
 ```
 
-Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). MIT licensed.
+Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Security model: [SECURITY.md](SECURITY.md).
+Upgrading from v3: [docs/USAGE.md#upgrading-from-v3](docs/USAGE.md#upgrading-from-v3). MIT licensed.
