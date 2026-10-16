@@ -46,7 +46,7 @@ GLOBAL_HELP: dict[str, str] = {
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="nedster",
-        description="Nedster — a local-first AI coding and automation agent",
+        description="Nedster — a local coding agent for Ollama (works alone or as a token-saving worker for Claude Code / Codex)",
     )
     parser.add_argument("--project", default=".", help=GLOBAL_HELP["--project"])
     parser.add_argument("--config", default=None, help=GLOBAL_HELP["--config"])
