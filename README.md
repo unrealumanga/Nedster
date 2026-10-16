@@ -125,7 +125,66 @@ tests fail if you break merge().
 ```
 
 Claude Code runs Nedster through its Bash tool. A task usually finishes in seconds to a few minutes; for longer
-ones ask Claude Code to run it in the background.
+ones ask Claude Code to run it in the background, or in a terminal pane you can watch (next section).
+
+## Watch it live in a terminal pane (tmux / psmux)
+
+When the paid agent runs Nedster through its own shell tool you only see the result. Run it in a multiplexer pane
+instead and you watch every step live (elapsed time, step count, each tool call), while the agent still gets a
+clean JSON file. `--json` writes the document to stdout (redirect it to a file); the live progress goes to the
+pane's terminal.
+
+Install a multiplexer once: `tmux` (macOS: `brew install tmux`, Linux: your package manager) or, on Windows,
+[psmux](https://github.com/marlocarlo/psmux) (`winget install marlocarlo.psmux`; it provides a `tmux` command).
+
+**macOS / Linux (bash):**
+
+```bash
+tmux new-session -d -s nedster 2>/dev/null; tmux new-window -t nedster -n task1
+tmux send-keys -t nedster:task1 \
+  'nedster run --brief .nedster/briefs/task1.md --json > .nedster/briefs/task1.json; echo $? > .nedster/briefs/task1.exit' Enter
+until [ -f .nedster/briefs/task1.exit ]; do sleep 5; done      # the agent waits for the exit file
+cat .nedster/briefs/task1.exit .nedster/briefs/task1.json
+```
+
+**Windows (psmux panes run PowerShell 7):**
+
+```powershell
+tmux new-session -d -s nedster; tmux new-window -t nedster -n task1
+tmux send-keys -t nedster:task1 'nedster run --brief .nedster\briefs\task1.md --json > .nedster\briefs\task1.json; $LASTEXITCODE | Out-File .nedster\briefs\task1.exit' Enter
+while (-not (Test-Path .nedster\briefs\task1.exit)) { Start-Sleep 5 }
+```
+
+Watch it: `tmux attach -t nedster` in your own terminal (switch windows with `Ctrl+b` then `n` or a number,
+detach with `Ctrl+b d`). On Windows run the attach from Windows Terminal, not from inside another psmux pane.
+Use PowerShell 7 (`pwsh`) for the redirect: Windows PowerShell 5.1 writes `>` output as UTF-16.
+
+Rules that keep this fast and correct:
+
+- **One Nedster run per GPU at a time.** Queue tasks in one window; parallel runs evict each other's prompt
+  cache and get much slower.
+- **One window per task, one result file per task** (`task1.json` + `task1.exit`), so the agent never reads a
+  half-written result: the exit file appears only after the JSON is complete.
+- The agent can peek at progress without attaching: `tmux capture-pane -p -t nedster:task1 | tail -5`.
+
+Add this to the `CLAUDE.md` / `AGENTS.md` block above when you want panes:
+
+```markdown
+Run Nedster in a tmux window so I can watch: window name = brief name, command
+`nedster run --brief .nedster/briefs/<name>.md --json > .nedster/briefs/<name>.json; echo $? > .nedster/briefs/<name>.exit`
+(PowerShell: `...; $LASTEXITCODE | Out-File .nedster/briefs/<name>.exit`). Wait for the .exit file, then read the
+JSON. One run at a time.
+```
+
+And ask for it in plain words:
+
+```text
+Delegate the rename to Nedster in a tmux window called "rename" so I can watch it, wait for it to finish,
+then review the diff.
+
+Queue these three briefs for Nedster one after another in the "nedster" tmux session, one window each,
+and report each outcome as it finishes.
+```
 
 ## Use it with Codex (and other agents)
 

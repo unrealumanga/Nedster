@@ -114,3 +114,27 @@ class TestAsciiOnly:
         p.on_event(SimpleNamespace(kind="model.usage", data={}))
         output = stream.getvalue()
         assert " · " in output
+
+
+class _Stream:
+    def __init__(self, tty: bool) -> None:
+        self.tty = tty
+
+    def isatty(self) -> bool:
+        return self.tty
+
+
+def test_live_progress_gating() -> None:
+    from types import SimpleNamespace
+
+    from nedster_agent.cli import _live_progress
+
+    def args(**kw):
+        return SimpleNamespace(**{"json": False, "jsonl": False, "plain": False, **kw})
+
+    assert _live_progress(args(), _Stream(True))
+    assert _live_progress(args(json=True), _Stream(True))  # watch the pane while stdout goes to a file
+    assert not _live_progress(args(jsonl=True), _Stream(True))
+    assert not _live_progress(args(plain=True), _Stream(True))
+    assert not _live_progress(args(json=True), _Stream(False))  # pipes and captured stderr stay silent
+    assert not _live_progress(args(), _Stream(False))

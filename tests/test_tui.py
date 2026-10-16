@@ -164,8 +164,12 @@ async def test_tui_keeps_events_in_details_and_displays_the_real_answer(tmp_path
         assert "[ANSWERED]" in work_text
 
         app.action_details()
-        await pilot.pause()
-        detail_text = "\n".join(str(line) for line in app.query_one("#details").lines)
+        detail_text = ""
+        for _ in range(40):  # slow CI runners need more than one refresh before the panel has its lines
+            await pilot.pause(0.05)
+            detail_text = "\n".join(str(line) for line in app.query_one("#details").lines)
+            if "model.usage" in detail_text:
+                break
         assert "model.usage" in detail_text
         assert app.query_one("#details").display
         assert not app.query_one("#work").display
