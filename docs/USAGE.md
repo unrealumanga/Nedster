@@ -195,7 +195,9 @@ Other commands: `nedster doctor`, `nedster permissions`, `nedster soul`, `nedste
 (value and where it came from, e.g. `config get models.coder`), `nedster config path` (user config, project
 config and data dir), `nedster verify-ledger` (checks the old HMAC event chain; the native engine writes no
 events to it). Each takes `--plain`/`--json`. `nedster run` on an interactive terminal shows a live progress
-line (elapsed, step, current tool) on stderr; `--json`, `--jsonl` and `--plain` disable it.
+line (elapsed, step, current tool) and one line per tool call on stderr. It stays on with `--json` (the document
+goes to stdout, so `nedster run --json ... > result.json` in a terminal pane shows live progress); `--jsonl`,
+`--plain` and a non-terminal stderr turn it off.
 
 ### Project instructions
 

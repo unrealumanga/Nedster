@@ -883,24 +883,30 @@ def _lock_run_session(store: Any, session_id: str) -> _SessionHeartbeat | None:
     return _SessionHeartbeat(store, session_id, owner)
 
 
+def _live_progress(args: argparse.Namespace, stream: Any) -> bool:
+    """Show the progress line and tool lines on ``stream`` (stderr): only on a terminal, never with --jsonl/--plain.
+
+    --json is allowed: its document goes to stdout, so a person can watch stderr while an agent reads the file.
+    """
+    return bool(stream.isatty()) and not (getattr(args, "jsonl", False) or getattr(args, "plain", False))
+
+
 async def _run_native(args: argparse.Namespace, config: Any, objective: str, brief_path: str | None) -> int:
     from dataclasses import asdict
     from hashlib import sha256
 
     from ironclad.native import NativeSession
 
-    # Live progress line on interactive terminals.
-    prog = ProgressLine(
-        sys.stderr,
-        enabled=sys.stderr.isatty() and not (args.json or args.jsonl or getattr(args, "plain", False)),
-        ascii_only=getattr(args, "ascii", False),
-    )
+    # Live progress line on interactive terminals. --json keeps it: the document goes to stdout (usually redirected
+    # to a file by the calling agent) while a person watches stderr in a terminal pane. Pipes stay silent.
+    live = _live_progress(args, sys.stderr)
+    prog = ProgressLine(sys.stderr, enabled=live, ascii_only=getattr(args, "ascii", False))
 
     def emit(event: Any) -> None:
         prog.on_event(event)  # always; ProgressLine handles disabled state
         if args.jsonl:
             _emit_json({"kind": event.kind, "session_id": event.session_id, "run_id": event.run_id, "data": dict(event.data)})
-        elif event.kind == "tool.finished" and not args.json:
+        elif event.kind == "tool.finished" and (live or not args.json):
             data = event.data
             msg = f"  {data.get('tool')} -> {data.get('status')} ({data.get('elapsed_ms', 0):.0f} ms)"
             if prog._enabled:
