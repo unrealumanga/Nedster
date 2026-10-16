@@ -5,15 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nedster-agent"
 version = "4.0.0a1"
-description = "Persistent local AI coding agent for Ollama with project RAG, sandboxed tools, web research, and a concise terminal UI"
+description = "Local coding agent for Ollama that saves your Claude Code / Codex tokens: brief in, tested diff out"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "unrealumanga" }]
 keywords = [
-  "ai-agent", "local-ai", "local-llm", "coding-agent", "coding-assistant",
-  "ollama", "ollama-agent", "qwen", "terminal-ui", "cli", "developer-tools", "software-development",
-  "autonomous-agent", "privacy", "self-hosted-ai", "agentic-coding", "tool-use",
+  "coding-agent", "local-llm", "ollama", "claude-code", "codex", "token-saving", "ai-coding-assistant",
+  "agentic-coding", "open-weights", "qwen", "offline-ai", "self-hosted-ai", "developer-tools", "cli", "terminal-ui",
+  "tool-use", "privacy",
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -22,7 +22,13 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
-  "Topic :: Software Development :: Build Tools",
+  "Intended Audience :: Developers",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Software Development",
+  "Topic :: Software Development :: Code Generators",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
   "httpx>=0.27,<1",
@@ -42,6 +48,8 @@ dev = [
 Homepage = "https://github.com/unrealumanga/Nedster"
 Repository = "https://github.com/unrealumanga/Nedster"
 Issues = "https://github.com/unrealumanga/Nedster/issues"
+Documentation = "https://github.com/unrealumanga/Nedster/blob/main/docs/USAGE.md"
+"Use with Claude Code" = "https://github.com/unrealumanga/Nedster#use-it-with-claude-code"
 
 [project.scripts]
 nedster = "nedster_agent.cli:main"
